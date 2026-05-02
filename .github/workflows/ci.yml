@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   ingestion-ui:
-    name: ingestion-ui (lint + build)
+    name: ingestion-ui (test + lint + build)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -30,13 +30,15 @@ jobs:
           cache-dependency-path: apps/ingestion-ui/package-lock.json
       - name: Install
         run: npm ci --include=dev
+      - name: Test
+        run: npm test
       - name: Lint
         run: npm run lint
       - name: Build
         run: npm run build
 
   ingestion-api:
-    name: ingestion-api (build / typecheck)
+    name: ingestion-api (test + build)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -50,5 +52,7 @@ jobs:
           cache-dependency-path: services/ingestion-api/package-lock.json
       - name: Install
         run: npm ci --include=dev
+      - name: Test
+        run: npm test
       - name: Build
         run: npm run build

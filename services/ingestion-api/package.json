@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/server.ts",
+    "test": "node --test test/smoke.test.js",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js"
   },

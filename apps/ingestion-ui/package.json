@@ -6,6 +6,7 @@
   "description": "Phase 1 ingestion MVP UI shell (see contracts/ingestion-v1.openapi.yaml)",
   "scripts": {
     "dev": "vite",
+    "test": "node --test test/smoke.test.js",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview"

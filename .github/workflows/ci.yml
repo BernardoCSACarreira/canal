@@ -15,6 +15,17 @@ permissions:
   contents: read
 
 jobs:
+  contracts:
+    name: contracts (OpenAPI validate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - name: Validate OpenAPI
+        run: npx --yes @apidevtools/swagger-cli@4 validate contracts/ingestion-v1.openapi.yaml
+
   ingestion-ui:
     name: ingestion-ui (test + lint + build)
     runs-on: ubuntu-latest
@@ -25,7 +36,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version-file: .nvmrc
           cache: npm
           cache-dependency-path: apps/ingestion-ui/package-lock.json
       - name: Install
@@ -47,7 +58,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version-file: .nvmrc
           cache: npm
           cache-dependency-path: services/ingestion-api/package-lock.json
       - name: Install

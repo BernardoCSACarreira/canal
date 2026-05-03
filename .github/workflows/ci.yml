@@ -25,7 +25,7 @@ jobs:
     name: Runner / Node smoke
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
@@ -39,7 +39,7 @@ jobs:
     name: Default stack (compose file)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Validate compose.yaml
         run: docker compose -f compose.yaml config --quiet
 
@@ -52,7 +52,7 @@ jobs:
       ingestion_edge_go: ${{ steps.pick.outputs.ingestion_edge_go }}
       ingestion_control_plane: ${{ steps.pick.outputs.ingestion_control_plane }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dorny/paths-filter@v3
         if: github.event_name == 'pull_request'
         id: filter
@@ -112,7 +112,7 @@ jobs:
     if: needs.changes.outputs.contracts == 'true'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
@@ -128,7 +128,7 @@ jobs:
       run:
         working-directory: apps/ingestion-ui
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
@@ -152,7 +152,7 @@ jobs:
       run:
         working-directory: services/ingestion-control-plane
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-python@v5
         with:
           python-version-file: .python-version
@@ -174,7 +174,7 @@ jobs:
       run:
         working-directory: services/ingestion-edge-go
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-go@v5
         with:
           go-version-file: services/ingestion-edge-go/go.mod

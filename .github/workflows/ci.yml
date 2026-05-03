@@ -15,8 +15,50 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    name: path filter
+    runs-on: ubuntu-latest
+    outputs:
+      contracts: ${{ steps.pick.outputs.contracts }}
+      ingestion_ui: ${{ steps.pick.outputs.ingestion_ui }}
+      ingestion_api: ${{ steps.pick.outputs.ingestion_api }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        if: github.event_name == 'pull_request'
+        id: filter
+        with:
+          filters: |
+            contracts:
+              - 'contracts/**'
+              - '.github/workflows/ci.yml'
+              - '.nvmrc'
+            ingestion-ui:
+              - 'apps/ingestion-ui/**'
+              - 'contracts/**'
+              - '.github/workflows/ci.yml'
+              - '.nvmrc'
+            ingestion-api:
+              - 'services/ingestion-api/**'
+              - 'contracts/**'
+              - '.github/workflows/ci.yml'
+              - '.nvmrc'
+      - id: pick
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "contracts=true" >> "$GITHUB_OUTPUT"
+            echo "ingestion_ui=true" >> "$GITHUB_OUTPUT"
+            echo "ingestion_api=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "contracts=${{ steps.filter.outputs.contracts }}" >> "$GITHUB_OUTPUT"
+          echo "ingestion_ui=${{ steps.filter.outputs['ingestion-ui'] }}" >> "$GITHUB_OUTPUT"
+          echo "ingestion_api=${{ steps.filter.outputs['ingestion-api'] }}" >> "$GITHUB_OUTPUT"
+
   contracts:
     name: contracts (OpenAPI validate)
+    needs: [changes]
+    if: needs.changes.outputs.contracts == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,6 +70,8 @@ jobs:
 
   ingestion-ui:
     name: ingestion-ui (test + lint + build)
+    needs: [changes]
+    if: needs.changes.outputs.ingestion_ui == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -50,6 +94,8 @@ jobs:
 
   ingestion-api:
     name: ingestion-api (test + build)
+    needs: [changes]
+    if: needs.changes.outputs.ingestion_api == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:

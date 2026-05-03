@@ -53,8 +53,14 @@ export function OperatorWizardShell({ onExit }: { onExit: () => void }) {
         <div>
           <h1 style={wiz.title}>Guided ingestion</h1>
           <p style={wiz.sub}>
-            Operator wizard shell — tier and pilot-program honesty labels are
-            explicit per path (CAN-28 design handoff + connector-tier UX spec).
+            Tier and pilot-program honesty labels per path (CAN-28). Connector
+            tiers load live Phase 1 control read models on configure (
+            <code style={wiz.subCode}>GET /v1/control/pipeline</code>,{' '}
+            <code style={wiz.subCode}>GET /v1/control/canal/segments</code>
+            ) — if configure still shows the legacy empty-state copy, the browser is
+            serving a stale bundle; hard-refresh and restart{' '}
+            <code style={wiz.subCode}>npm run dev</code> from current{' '}
+            <code style={wiz.subCode}>main</code>.
           </p>
         </div>
         <button type="button" style={wiz.ghostBtn} onClick={onExit}>
@@ -491,6 +497,11 @@ const wiz: Record<string, CSSProperties> = {
   },
   title: { margin: 0, fontSize: '1.5rem', fontWeight: 700 },
   sub: { margin: '0.35rem 0 0', color: 'var(--muted)', fontSize: '0.9rem' },
+  subCode: {
+    fontFamily: 'var(--mono)',
+    fontSize: '0.82em',
+    wordBreak: 'break-word',
+  },
   ghostBtn: {
     padding: '0.45rem 0.75rem',
     borderRadius: 'var(--radius)',

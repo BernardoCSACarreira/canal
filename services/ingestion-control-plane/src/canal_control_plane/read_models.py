@@ -2,7 +2,6 @@
 Operator read models — deterministic Phase 1 scaffolding (OpenAPI-aligned).
 
 Pipeline ordering matches RFC §1.5 (CAN-30 data-architecture rev 3).
-Mirrors services/ingestion-api/src/control/read-models.ts.
 """
 
 from __future__ import annotations

@@ -20,8 +20,6 @@ ingestion-edge-go  —  POST /v1/events            ingestion-control-plane  — 
                   —  GET  /v1/stream (stub / 501)                          —  /v1/adapter-instances …
 ```
 
-**Legacy (single process):** `services/ingestion-api` (TypeScript) may still serve **all** of the above routes behind one origin for transitional dev or parity tests — see §5.
-
 Example JSON for the control read paths: [`control-api-read-models.md`](./control-api-read-models.md).
 
 Downstream buffer, checkpoint, and processing implementations MUST conform to Phase 1 assumptions in [`docs/rfc-phase1-buffer-checkpoint-provider-matrix.md`](../rfc-phase1-buffer-checkpoint-provider-matrix.md) unless a feature flag explicitly selects a future driver.
@@ -61,5 +59,5 @@ Operator surfaces MUST follow tier and honesty rules in [`docs/product/connector
 
 - **Normative contract** remains the OpenAPI file referenced in section 1; **implementation language is not** defined by this doc.
 - **Company policy:** Python for control plane, Go for data plane services, TypeScript **only** for web frontends — see [`language-platform-policy.md`](./language-platform-policy.md).
-- **This repo today:** **Default path** is **`ingestion-edge-go` (data plane)** + **`ingestion-control-plane` (Python control)** + **`ingestion-ui`** with split proxies / compose (see [`diagrams.md`](./diagrams.md) §1). `services/ingestion-api` remains a **Phase 1 TypeScript combined scaffold** under the same time-bounded policy exception — useful for **legacy single-backend dev** or contract parity until it is removed; **do not** treat it as the long-term edge.
+- **This repo today:** **Shipped path** is **`ingestion-edge-go` (data plane)** + **`ingestion-control-plane` (Python control)** + **`ingestion-ui`** with split proxies / compose (see [`diagrams.md`](./diagrams.md) §1).
 - **Merges that expand server-side TypeScript** or change ingestion semantics require the [mainline architecture review](../governance/mainline-merge-architecture-review.md) checklist (CTO + QA + product).

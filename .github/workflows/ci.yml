@@ -49,7 +49,6 @@ jobs:
     outputs:
       contracts: ${{ steps.pick.outputs.contracts }}
       ingestion_ui: ${{ steps.pick.outputs.ingestion_ui }}
-      ingestion_api: ${{ steps.pick.outputs.ingestion_api }}
       ingestion_edge_go: ${{ steps.pick.outputs.ingestion_edge_go }}
       ingestion_control_plane: ${{ steps.pick.outputs.ingestion_control_plane }}
     steps:
@@ -68,10 +67,6 @@ jobs:
               - 'contracts/**'
               - '.github/workflows/ci.yml'
               - '.nvmrc'
-            # Gated (CAN-72): TS scaffold — PRs only when this tree or workflow changes; not contract-only PRs.
-            ingestion_api:
-              - 'services/ingestion-api/**'
-              - '.github/workflows/ci.yml'
             ingestion_edge_go:
               - 'services/ingestion-edge-go/**'
               - 'contracts/**'
@@ -94,7 +89,6 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             echo "contracts=${{ steps.filter.outputs.contracts }}" >> "$GITHUB_OUTPUT"
             echo "ingestion_ui=${{ steps.filter.outputs.ingestion_ui }}" >> "$GITHUB_OUTPUT"
-            echo "ingestion_api=${{ steps.filter.outputs.ingestion_api }}" >> "$GITHUB_OUTPUT"
             echo "ingestion_edge_go=${{ steps.filter.outputs.ingestion_edge_go }}" >> "$GITHUB_OUTPUT"
             echo "ingestion_control_plane=${{ steps.filter.outputs.ingestion_control_plane }}" >> "$GITHUB_OUTPUT"
             exit 0
@@ -102,15 +96,13 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "contracts=true" >> "$GITHUB_OUTPUT"
             echo "ingestion_ui=true" >> "$GITHUB_OUTPUT"
-            echo "ingestion_api=true" >> "$GITHUB_OUTPUT"
             echo "ingestion_edge_go=true" >> "$GITHUB_OUTPUT"
             echo "ingestion_control_plane=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # push / schedule: Go + Python ship path on main; TS ingestion-api runs on PRs touching it (see filters).
+          # push / schedule: Go + Python ship path on main.
           echo "contracts=true" >> "$GITHUB_OUTPUT"
           echo "ingestion_ui=true" >> "$GITHUB_OUTPUT"
-          echo "ingestion_api=false" >> "$GITHUB_OUTPUT"
           echo "ingestion_edge_go=true" >> "$GITHUB_OUTPUT"
           echo "ingestion_control_plane=true" >> "$GITHUB_OUTPUT"
 
@@ -148,28 +140,6 @@ jobs:
         run: npm test
       - name: Lint
         run: npm run lint
-      - name: Build
-        run: npm run build
-
-  ingestion-api:
-    name: ingestion-api (test + build)
-    needs: [changes]
-    if: needs.changes.outputs.ingestion_api == 'true'
-    runs-on: ubuntu-24.04
-    defaults:
-      run:
-        working-directory: services/ingestion-api
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-          cache: npm
-          cache-dependency-path: services/ingestion-api/package-lock.json
-      - name: Install
-        run: npm ci --include=dev
-      - name: Test
-        run: npm test
       - name: Build
         run: npm run build
 

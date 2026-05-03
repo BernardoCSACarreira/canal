@@ -22,7 +22,6 @@ flowchart LR
     UI["ingestion-ui\n(React / Vite)"]
     GoEdge["ingestion-edge-go\n(Go)\ndata plane"]
     CP["ingestion-control-plane\n(Python / FastAPI)\ncontrol plane"]
-    TS["ingestion-api\n(TypeScript)\nlegacy combined"]
   end
 
   Contract["ingestion-v1 OpenAPI\n(single contract)"]
@@ -34,12 +33,9 @@ flowchart LR
 
   GoEdge -.->|"conformance"| Contract
   CP -.->|"conformance"| Contract
-  TS -.->|"legacy single origin"| Contract
-
-  UI -.->|"legacy:\nVITE_API_PROXY_TARGET"| TS
 ```
 
-**Notes:** Default local dev runs **Go + Python** behind the UI proxy (see `apps/ingestion-ui/README.md`). `ingestion-api` remains an optional **single-host** fallback when `VITE_API_PROXY_TARGET` is set; keep TS and Python **read-model responses aligned** per `control-api-read-models.md` while the TS service exists.
+**Notes:** Default local dev runs **Go + Python** behind the UI proxy (see `apps/ingestion-ui/README.md`).
 
 ---
 
@@ -52,7 +48,6 @@ flowchart TB
   subgraph repo["Monorepo"]
     OAS["contracts/\ningestion-v1.openapi.yaml"]
     UI["apps/ingestion-ui"]
-    TSAPI["services/ingestion-api"]
     PY["services/ingestion-control-plane"]
     GO["services/ingestion-edge-go"]
   end
@@ -60,32 +55,29 @@ flowchart TB
   subgraph ci["CI (path-filtered on PR)"]
     V_OAS["OpenAPI validate"]
     V_UI["npm test, lint, build"]
-    V_TS["npm test, build"]
     V_PY["ruff, pytest"]
     V_GO["gofmt, vet, test, docker build"]
   end
 
   OAS --> V_OAS
   UI --> V_UI
-  TSAPI --> V_TS
   PY --> V_PY
   GO --> V_GO
   OAS --> V_UI
-  OAS --> V_TS
   OAS --> V_PY
   OAS --> V_GO
 ```
 
 ---
 
-## 3. Ingestion batch flow (TypeScript edge)
+## 3. Ingestion batch flow (Go data plane)
 
 Logical path for `POST /v1/events` through in-process Phase 1 components.
 
 ```mermaid
 sequenceDiagram
   participant C as Client / connector
-  participant R as Fastify /v1/events
+  participant R as ingestion-edge-go POST /v1/events
   participant V as Batch validator
   participant D as Dedupe (event ids)
   participant B as P1LocalEventBuffer
@@ -107,7 +99,7 @@ sequenceDiagram
 
 ## 4. Operator read paths and adapter instances
 
-What the operator wizard consumes today (**split stack**): control + adapter routes hit **Python**; batch + edge health hit **Go**. Legacy mode keeps all routes on **TS** behind one proxy target.
+What the operator wizard consumes today (**split stack**): control + adapter routes hit **Python**; batch + edge health hit **Go**.
 
 ```mermaid
 flowchart TB
@@ -160,7 +152,7 @@ Buffer segments (`providerProfile: p1-local` in read model) attach after selecte
 
 ## 6. Target language split (policy)
 
-Canonical placement of new work vs the Phase 1 TS exception.
+Canonical placement of new work.
 
 ```mermaid
 flowchart TB
@@ -170,14 +162,9 @@ flowchart TB
     FE["Web UI → TypeScript only"]
   end
 
-  subgraph exception["Time-bounded exception"]
-    TS["ingestion-api TS scaffold\nbeing retired; split stack is default"]
-  end
-
   CP2 --- PY2["ingestion-control-plane"]
   DP --- GO2["ingestion-edge-go\n+ future workers"]
   FE --- UI2["ingestion-ui"]
-  exception --- TS
 ```
 
 ---
@@ -188,3 +175,4 @@ flowchart TB
 | ---------- | ------------------------------------------- |
 | 2026-05-03 | Initial diagrams for CAN-67 (CTO heartbeat) |
 | 2026-05-03 | System context + §4 updated for CAN-69 split-stack default (Go + Python) |
+| 2026-05-03 | Removed legacy TS ingestion-api from diagrams (CAN-73) |

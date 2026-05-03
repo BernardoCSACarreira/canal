@@ -1,8 +1,7 @@
 # Control API — read models (Phase 1)
 
 **Normative schemas:** [`contracts/ingestion-v1.openapi.yaml`](../../contracts/ingestion-v1.openapi.yaml) — tag **Control**, operations `getControlPipeline` and `getControlCanalSegments`.  
-**Python (policy control plane):** `services/ingestion-control-plane/src/canal_control_plane/read_models.py` and `app.py` — same deterministic read models; run on its own port for split-stack dev.  
-**TypeScript (Phase 1 combined scaffold):** `services/ingestion-api/src/control/read-models.ts` and `src/routes/control.ts` — serves these paths only in **legacy single-backend** layouts; **authoritative** implementation for split stack is **Python** above. Keep TS responses aligned with Python until the TS service is removed.
+**Python (control plane):** `services/ingestion-control-plane/src/canal_control_plane/read_models.py` and `app.py` — deterministic read models; run on its own port for split-stack dev.
 
 These endpoints exist so the operator wizard can render the board-approved pipeline and canal buffers without scraping RFC prose. Responses are **deterministic scaffolding** until a persisted connector registry ships.
 

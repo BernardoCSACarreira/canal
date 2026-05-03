@@ -17,16 +17,14 @@ Contract-first boundaries (OpenAPI, protobuf, SQL schemas) are authoritative acr
 
 ---
 
-## 2. Current repository exception (Phase 1 velocity)
+## 2. Server-side TypeScript
 
-The Canal MVP repo currently ships a **small TypeScript** service under `services/ingestion-api` that implements the Phase 1 HTTP contract in [`contracts/ingestion-v1.openapi.yaml`](../../contracts/ingestion-v1.openapi.yaml). That is an **explicit, time-bounded scaffold** so we can validate the contract, UX, and operator flows before investing in a Go rewrite of the edge accept path.
+The former Phase 1 TypeScript combined **ingestion-api** service has been **removed** (CAN-73); edge HTTP is **Go** and operator control is **Python** per section 1.
 
-**Rules for this exception:**
+**Rules:**
 
-- No additional long-lived TypeScript **servers** beyond Phase 1 ingestion + tests without an ADR and CTO + QA + product sign-off per [mainline merge — architecture review](../governance/mainline-merge-architecture-review.md).
+- No new long-lived TypeScript **servers** without an ADR and CTO + QA + product sign-off per [mainline merge — architecture review](../governance/mainline-merge-architecture-review.md).
 - New **non-frontend** features default to Python (control) or Go (data), not Node.
-- Exit criteria for the exception: parity tests against the OpenAPI contract pass in Go (or Python where appropriate for the component), operator flows unchanged, then retire or demote the TS service.
-- **Python control-plane counterpart** for operator read models and adapter-instance registry lives under `services/ingestion-control-plane/` (see [`control-api-read-models.md`](./control-api-read-models.md)); the TS service may still expose the same routes until routing is split — keep responses aligned.
 
 ---
 

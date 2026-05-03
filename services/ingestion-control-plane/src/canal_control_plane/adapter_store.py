@@ -1,4 +1,4 @@
-"""In-memory adapter instances — mirrors ingestion-api adapter-instance-store.ts."""
+"""In-memory adapter instances for Phase 1 operator flows."""
 
 from __future__ import annotations
 

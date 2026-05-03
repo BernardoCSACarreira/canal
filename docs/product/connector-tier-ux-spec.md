@@ -42,7 +42,7 @@ Use these **stable string keys** for i18n bundles, analytics events, and feature
 | `ingestion_path.tier_2_managed` | `ingestion_path.tier_2_managed.honesty` | `2` | Managed real connector |
 | `ingestion_path.tier_3_byo` | `ingestion_path.tier_3_byo.honesty` | `3` | BYO / community connector |
 
-**Backend alignment:** Synthetic path aligns with internal taxonomy `tier-1` (see `services/ingestion-api/src/canal/connector-tier.ts` — `CONNECTOR_TIER_SYNTHETIC`). UI copy must still say **pilot labeling**, not “customer SLO,” on tier 1.
+**Backend alignment:** Synthetic path aligns with internal taxonomy `tier-1` (see `services/ingestion-control-plane/src/canal_control_plane/read_models.py` — placeholder adapter `catalogTier`). UI copy must still say **pilot labeling**, not “customer SLO,” on tier 1.
 
 ### 2.3 Optional cross-key alias (analytics only)
 

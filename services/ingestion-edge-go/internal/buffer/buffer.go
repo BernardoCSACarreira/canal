@@ -21,7 +21,7 @@ type Record struct {
 	Event        IngestEvent `json:"event"`
 }
 
-// P1LocalEventBuffer mirrors services/ingestion-api/src/canal/event-buffer.ts.
+// P1LocalEventBuffer holds accepted Phase 1 batch events in memory (scaffold).
 type P1LocalEventBuffer struct {
 	mu           sync.Mutex
 	nextSequence int

@@ -227,7 +227,7 @@ components:
           enum: [ok]
         service:
           type: string
-          example: ingestion-api
+          example: ingestion-edge-go
         version:
           type: string
           example: "0.1.0"

@@ -17,8 +17,6 @@ npm install --include=dev
 | [`services/ingestion-edge-go`](../../services/ingestion-edge-go) | `8080` | `GET /health`, `POST /v1/events`, `GET /v1/stream` |
 | [`services/ingestion-control-plane`](../../services/ingestion-control-plane) | `8091` (matches Dockerfile `EXPOSE`) | `GET /v1/control/*`, `/v1/adapter-instances*` |
 
-You can swap the Go edge for [`services/ingestion-api`](../../services/ingestion-api) on `:8080` when you are not exercising the Go binary; path routing is the same.
-
 ```bash
 # Terminal A — Go edge
 cd services/ingestion-edge-go && go run ./cmd/ingestion-edge
@@ -37,10 +35,6 @@ Proxy env vars (defaults match split stack; override if your ports differ):
 |----------|---------|
 | `VITE_DATA_PLANE_PROXY_TARGET` | `http://127.0.0.1:8080` |
 | `VITE_CONTROL_PLANE_PROXY_TARGET` | `http://127.0.0.1:8091` |
-
-### Legacy (single combined backend)
-
-Set **`VITE_API_PROXY_TARGET`** to one base URL (for example `services/ingestion-api` on `:8080`). All `/health` and `/v1/*` requests proxy there, and per-path split env vars are ignored.
 
 ## QA (operator wizard)
 

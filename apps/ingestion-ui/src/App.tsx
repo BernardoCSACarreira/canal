@@ -112,8 +112,7 @@ export default function App() {
           Dev server proxies <code>/health</code>, <code>/v1/events</code>, and{' '}
           <code>/v1/stream</code> to the Go edge (default <code>127.0.0.1:8080</code>);{' '}
           <code>/v1/control/*</code> and <code>/v1/adapter-instances</code> to Python
-          control (default <code>127.0.0.1:8091</code>). See README for env overrides or
-          legacy <code>VITE_API_PROXY_TARGET</code>.
+          control (default <code>127.0.0.1:8091</code>). See README for env overrides.
         </p>
       </aside>
       <main style={styles.main}>

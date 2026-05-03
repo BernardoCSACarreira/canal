@@ -1,4 +1,4 @@
-"""Contract-style tests aligned with ingestion-api openapi-paths integration tests."""
+"""Contract-style tests for control-plane OpenAPI paths."""
 
 from __future__ import annotations
 

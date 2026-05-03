@@ -1,8 +1,10 @@
 import type {
+  CanalSegmentsRead,
   ErrorResponse,
   HealthResponse,
   IngestBatchRequest,
   IngestBatchResponse,
+  PipelineSummaryRead,
 } from './types'
 
 async function readJson<T>(res: Response): Promise<T> {
@@ -51,4 +53,26 @@ export async function getStreamProbe(): Promise<{
     body = null
   }
   return { status: res.status, body }
+}
+
+export async function getControlPipeline(): Promise<PipelineSummaryRead> {
+  const res = await fetch('/v1/control/pipeline')
+  const parsed = await readJson<PipelineSummaryRead | ErrorResponse>(res)
+  if (!res.ok) {
+    const err = parsed as ErrorResponse
+    throw new Error(err?.message ?? `GET /v1/control/pipeline failed (${res.status})`)
+  }
+  return parsed as PipelineSummaryRead
+}
+
+export async function getControlCanalSegments(): Promise<CanalSegmentsRead> {
+  const res = await fetch('/v1/control/canal/segments')
+  const parsed = await readJson<CanalSegmentsRead | ErrorResponse>(res)
+  if (!res.ok) {
+    const err = parsed as ErrorResponse
+    throw new Error(
+      err?.message ?? `GET /v1/control/canal/segments failed (${res.status})`,
+    )
+  }
+  return parsed as CanalSegmentsRead
 }

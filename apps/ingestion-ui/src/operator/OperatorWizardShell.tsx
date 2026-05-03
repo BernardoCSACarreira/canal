@@ -1,10 +1,22 @@
-import { useCallback, useMemo, useState, type CSSProperties } from 'react'
-import { postIngestBatch } from '../api/client'
-import type { IngestBatchRequest } from '../api/types'
-import type { IngestionPathTier } from './constants'
+import { useCallback, useEffect, useMemo, useState, type CSSProperties } from 'react'
+import {
+  getControlCanalSegments,
+  getControlPipeline,
+  postIngestBatch,
+} from '../api/client'
+import type { CanalSegmentsRead, IngestBatchRequest, PipelineSummaryRead } from '../api/types'
+import { catalogTierForIngestionPath, type IngestionPathTier } from './constants'
+import { OperatorControlSummary } from './OperatorControlSummary'
 import { SloBadgeStrip, TierBadge } from './TierSloBadges'
 
 type WizardStep = 'path' | 'configure' | 'review'
+
+type WizardDraft = {
+  tier: IngestionPathTier
+  source: string | null
+  eventsJson: string | null
+  control?: { pipeline: PipelineSummaryRead; canal: CanalSegmentsRead }
+}
 
 const defaultEventsJson = `[
   {
@@ -127,6 +139,11 @@ function PathStep({ onPick }: { onPick: (tier: IngestionPathTier) => void }) {
   )
 }
 
+type ControlLoadState =
+  | { status: 'loading' }
+  | { status: 'ok'; pipeline: PipelineSummaryRead; canal: CanalSegmentsRead }
+  | { status: 'error'; message: string }
+
 function ConfigureStep({
   tier,
   onBack,
@@ -138,6 +155,45 @@ function ConfigureStep({
 }) {
   const [source, setSource] = useState('demo-ui')
   const [eventsJson, setEventsJson] = useState(defaultEventsJson)
+  const [control, setControl] = useState<ControlLoadState>({ status: 'loading' })
+  const [reloadToken, setReloadToken] = useState(0)
+
+  useEffect(() => {
+    const ac = new AbortController()
+    setControl({ status: 'loading' })
+    ;(async () => {
+      try {
+        const [pipeline, canal] = await Promise.all([
+          getControlPipeline(),
+          getControlCanalSegments(),
+        ])
+        if (ac.signal.aborted) return
+        setControl({ status: 'ok', pipeline, canal })
+      } catch (e) {
+        if (ac.signal.aborted) return
+        setControl({
+          status: 'error',
+          message: e instanceof Error ? e.message : String(e),
+        })
+      }
+    })()
+    return () => ac.abort()
+  }, [tier, reloadToken])
+
+  const catalogTier = catalogTierForIngestionPath(tier)
+  const controlGateOk = tier === 1 || control.status === 'ok'
+
+  const persistDraft = (partial: Pick<WizardDraft, 'source' | 'eventsJson'>) => {
+    const base: WizardDraft = {
+      tier,
+      source: partial.source ?? null,
+      eventsJson: partial.eventsJson ?? null,
+    }
+    if (control.status === 'ok') {
+      base.control = { pipeline: control.pipeline, canal: control.canal }
+    }
+    sessionStorage.setItem('canal:wizard:draft', JSON.stringify(base))
+  }
 
   if (tier === 1) {
     return (
@@ -146,6 +202,22 @@ function ConfigureStep({
           <h2 style={wiz.h2}>Configure synthetic batch</h2>
           <SloBadgeStrip tier={1} />
         </div>
+        {control.status === 'loading' && (
+          <p style={wiz.muted}>Loading control read models…</p>
+        )}
+        {control.status === 'error' && (
+          <p style={wiz.error}>
+            Control API: {control.message} — you can still send a synthetic batch;
+            review will not include control snapshots.
+          </p>
+        )}
+        {control.status === 'ok' && (
+          <OperatorControlSummary
+            pipeline={control.pipeline}
+            canal={control.canal}
+            highlightCatalogTier={null}
+          />
+        )}
         <label style={wiz.label}>
           Source
           <input
@@ -168,10 +240,7 @@ function ConfigureStep({
           onBack={onBack}
           primaryLabel="Continue to review"
           onPrimary={() => {
-            sessionStorage.setItem(
-              'canal:wizard:draft',
-              JSON.stringify({ tier, source, eventsJson }),
-            )
+            persistDraft({ source, eventsJson })
             onContinue()
           }}
         />
@@ -185,23 +254,40 @@ function ConfigureStep({
         <h2 style={wiz.h2}>Connector setup</h2>
         <SloBadgeStrip tier={tier} />
       </div>
-      <div style={wiz.empty}>
-        <p style={{ margin: 0, fontWeight: 600 }}>Nothing to wire yet</p>
-        <p style={wiz.muted}>
-          This step is a deliberate empty state: credential pickers, schema
-          mapping, and back-pressure controls ship in later slices. Tier labels
-          above stay visible so operators never confuse this with the
-          pilot-labeled synthetic path.
-        </p>
-      </div>
+      <p style={wiz.muted}>
+        Credential pickers and connector runtime wiring ship in later slices. The
+        control plane read models below are live from the ingestion API so
+        operators see the same pipeline topology the backend exposes.
+      </p>
+      {control.status === 'loading' && (
+        <p style={wiz.muted}>Loading control read models…</p>
+      )}
+      {control.status === 'error' && (
+        <div style={wiz.empty}>
+          <p style={{ margin: 0, fontWeight: 600 }}>Could not load control read models</p>
+          <p style={wiz.error}>{control.message}</p>
+          <button
+            type="button"
+            style={wiz.secondaryBtn}
+            onClick={() => setReloadToken((n) => n + 1)}
+          >
+            Retry
+          </button>
+        </div>
+      )}
+      {control.status === 'ok' && (
+        <OperatorControlSummary
+          pipeline={control.pipeline}
+          canal={control.canal}
+          highlightCatalogTier={catalogTier}
+        />
+      )}
       <WizardStepNav
         onBack={onBack}
         primaryLabel="Continue to review"
+        primaryDisabled={!controlGateOk}
         onPrimary={() => {
-          sessionStorage.setItem(
-            'canal:wizard:draft',
-            JSON.stringify({ tier, source: null, eventsJson: null }),
-          )
+          persistDraft({ source: null, eventsJson: null })
           onContinue()
         }}
       />
@@ -220,11 +306,7 @@ function ReviewStep({
     try {
       const raw = sessionStorage.getItem('canal:wizard:draft')
       if (!raw) return null
-      return JSON.parse(raw) as {
-        tier: IngestionPathTier
-        source: string | null
-        eventsJson: string | null
-      }
+      return JSON.parse(raw) as WizardDraft
     } catch {
       return null
     }
@@ -244,12 +326,18 @@ function ReviewStep({
     setError(null)
     setResult(null)
     if (effectiveTier !== 1) {
+      const c = draft?.control
+      if (!c) {
+        setError('Control read models missing — return to configure and wait for the API.')
+        return
+      }
       setResult(
         JSON.stringify(
           {
-            skipped: true,
-            reason:
-              'No batch POST for connector tiers in this shell — ship alongside connector runtime.',
+            wizardPathAcknowledged: true,
+            batchIngestDeferred:
+              'POST /v1/events remains Tier 1 synthetic in this Phase 1 happy path.',
+            controlPlane: c,
           },
           null,
           2,
@@ -281,7 +369,11 @@ function ReviewStep({
     setSubmitting(true)
     try {
       const res = await postIngestBatch(body)
-      setResult(JSON.stringify(res, null, 2))
+      if (draft?.control) {
+        setResult(JSON.stringify({ ingest: res, controlPlane: draft.control }, null, 2))
+      } else {
+        setResult(JSON.stringify(res, null, 2))
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -296,23 +388,34 @@ function ReviewStep({
       {effectiveTier === 1 && (
         <p style={wiz.muted}>
           Sending uses the same Phase 1 <code>/v1/events</code> batch API as the
-          classic shell. Only this tier shows Pilot program labeling; that is
-          not a published customer SLA until CPO/CEO and Legal explicitly ship
-          one.
+          classic shell. When configure loaded control read models, they are
+          echoed below after send. Only this tier shows Pilot program labeling;
+          that is not a published customer SLA until CPO/CEO and Legal explicitly
+          ship one.
         </p>
       )}
       {effectiveTier !== 1 && (
-        <label style={wiz.checkRow}>
-          <input
-            type="checkbox"
-            checked={ackNoSlo}
-            onChange={(e) => setAckNoSlo(e.target.checked)}
-          />
-          <span>
-            I understand this path does not carry pilot program labeling — I am
-            not treating results as pilot-tier diagnostics.
-          </span>
-        </label>
+        <>
+          <p style={wiz.muted}>
+            This path completes the control-plane happy path: acknowledge honesty
+            copy, then persist the snapshot from{' '}
+            <code style={{ fontFamily: 'var(--mono)', fontSize: '0.85em' }}>
+              GET /v1/control/*
+            </code>{' '}
+            captured in configure. No batch POST here in Phase 1.
+          </p>
+          <label style={wiz.checkRow}>
+            <input
+              type="checkbox"
+              checked={ackNoSlo}
+              onChange={(e) => setAckNoSlo(e.target.checked)}
+            />
+            <span>
+              I understand this path does not carry pilot program labeling — I am
+              not treating results as pilot-tier diagnostics.
+            </span>
+          </label>
+        </>
       )}
       {error && <p style={wiz.error}>{error}</p>}
       {result && <pre style={wiz.pre}>{result}</pre>}
@@ -330,7 +433,7 @@ function ReviewStep({
             ? submitting
               ? 'Sending…'
               : 'POST /v1/events'
-            : 'Acknowledge (no POST in shell)'}
+            : 'Acknowledge control snapshot'}
         </button>
       </div>
     </section>
@@ -341,17 +444,24 @@ function WizardStepNav({
   onBack,
   onPrimary,
   primaryLabel,
+  primaryDisabled,
 }: {
   onBack: () => void
   onPrimary: () => void
   primaryLabel: string
+  primaryDisabled?: boolean
 }) {
   return (
     <div style={wiz.navRow}>
       <button type="button" style={wiz.secondaryBtn} onClick={onBack}>
         Back
       </button>
-      <button type="button" style={wiz.primaryBtn} onClick={onPrimary}>
+      <button
+        type="button"
+        style={wiz.primaryBtn}
+        onClick={onPrimary}
+        disabled={primaryDisabled}
+      >
         {primaryLabel}
       </button>
     </div>

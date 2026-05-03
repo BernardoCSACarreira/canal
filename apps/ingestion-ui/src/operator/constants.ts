@@ -2,6 +2,8 @@
  * Commercial / support framing for the classic operator shell (CAN-28).
  * Persist on connector metadata when the API supports it; session-local today.
  */
+import type { CatalogTier } from '../api/types'
+
 export type ConnectorTier = 'pilot' | 'standard' | 'priority_reserved'
 
 /** Stable keys — must match `docs/product/connector-tier-ux-spec.md` §2.1. */
@@ -16,6 +18,13 @@ export const CONNECTOR_TIER_BADGE_KEY: Record<ConnectorTier, string> = {
  * `ConnectorTier`. See `docs/design/CAN-28-operator-ui-phase1.md` for mapping.
  */
 export type IngestionPathTier = 1 | 2 | 3
+
+/** Maps wizard lane to control API `catalogTier` (OpenAPI). */
+export function catalogTierForIngestionPath(tier: IngestionPathTier): CatalogTier {
+  if (tier === 1) return 'tier-1'
+  if (tier === 2) return 'tier-2'
+  return 'tier-3'
+}
 
 /** Stable keys — must match `docs/product/connector-tier-ux-spec.md` §2.2. */
 export const INGESTION_PATH_BADGE_KEY: Record<IngestionPathTier, string> = {

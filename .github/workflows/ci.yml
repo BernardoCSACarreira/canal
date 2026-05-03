@@ -19,82 +19,97 @@ jobs:
     name: Path filter
     runs-on: ubuntu-latest
     outputs:
-      contracts: ${{ steps.filter.outputs.contracts }}
-      ingestion_ui: ${{ steps.filter.outputs.ingestion_ui }}
-      ingestion_api: ${{ steps.filter.outputs.ingestion_api }}
-      shared: ${{ steps.filter.outputs.shared }}
+      contracts: ${{ steps.pick.outputs.contracts }}
+      ingestion_ui: ${{ steps.pick.outputs.ingestion_ui }}
+      ingestion_api: ${{ steps.pick.outputs.ingestion_api }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
+        if: github.event_name == 'pull_request'
         id: filter
         with:
           filters: |
             contracts:
               - 'contracts/**'
+              - '.github/workflows/ci.yml'
+              - '.nvmrc'
             ingestion_ui:
               - 'apps/ingestion-ui/**'
+              - 'contracts/**'
+              - '.github/workflows/ci.yml'
+              - '.nvmrc'
             ingestion_api:
               - 'services/ingestion-api/**'
-            shared:
-              - '.github/**'
+              - 'contracts/**'
+              - '.github/workflows/ci.yml'
               - '.nvmrc'
+      - id: pick
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "contracts=true" >> "$GITHUB_OUTPUT"
+            echo "ingestion_ui=true" >> "$GITHUB_OUTPUT"
+            echo "ingestion_api=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "contracts=${{ steps.filter.outputs.contracts }}" >> "$GITHUB_OUTPUT"
+          echo "ingestion_ui=${{ steps.filter.outputs.ingestion_ui }}" >> "$GITHUB_OUTPUT"
+          echo "ingestion_api=${{ steps.filter.outputs.ingestion_api }}" >> "$GITHUB_OUTPUT"
 
   contracts:
     name: contracts (OpenAPI validate)
-    needs: changes
-    uses: ./.github/workflows/ingestion-ci-reusable.yml
-    with:
-      job_name: contracts (OpenAPI validate)
-      suite: contracts
-      should_execute: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.contracts == 'true' || needs.changes.outputs.shared == 'true' }}
+    needs: [changes]
+    if: needs.changes.outputs.contracts == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - name: Validate OpenAPI
+        run: npx --yes @apidevtools/swagger-cli@4 validate contracts/ingestion-v1.openapi.yaml
 
   ingestion-ui:
     name: ingestion-ui (test + lint + build)
-    needs: changes
-    uses: ./.github/workflows/ingestion-ci-reusable.yml
-    with:
-      job_name: ingestion-ui (test + lint + build)
-      suite: ingestion-ui
-      should_execute: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.ingestion_ui == 'true' || needs.changes.outputs.contracts == 'true' || needs.changes.outputs.shared == 'true' }}
+    needs: [changes]
+    if: needs.changes.outputs.ingestion_ui == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/ingestion-ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: apps/ingestion-ui/package-lock.json
+      - name: Install
+        run: npm ci --include=dev
+      - name: Test
+        run: npm test
+      - name: Lint
+        run: npm run lint
+      - name: Build
+        run: npm run build
 
   ingestion-api:
     name: ingestion-api (test + build)
-    needs: changes
-    uses: ./.github/workflows/ingestion-ci-reusable.yml
-    with:
-      job_name: ingestion-api (test + build)
-      suite: ingestion-api
-      should_execute: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.ingestion_api == 'true' || needs.changes.outputs.contracts == 'true' || needs.changes.outputs.shared == 'true' }}
-
-  ci-ready:
-    name: CI ready (path-scoped)
-    needs: [changes, contracts, ingestion-ui, ingestion-api]
+    needs: [changes]
+    if: needs.changes.outputs.ingestion_api == 'true'
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/ingestion-api
     steps:
-      - name: Summary
-        run: |
-          echo "Path filter outputs: contracts=${{ needs.changes.outputs.contracts }} ingestion_ui=${{ needs.changes.outputs.ingestion_ui }} ingestion_api=${{ needs.changes.outputs.ingestion_api }} shared=${{ needs.changes.outputs.shared }}"
-          echo "All ingestion CI jobs finished successfully."
-
-      # Tier-1 synthetic pipeline stub must stay green on main even when path filters skip the full ingestion-api job.
       - uses: actions/checkout@v4
-        if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
-
       - uses: actions/setup-node@v4
-        if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
         with:
           node-version-file: .nvmrc
           cache: npm
           cache-dependency-path: services/ingestion-api/package-lock.json
-
-      - name: Synthetic pipeline smoke (tier-1 stub)
-        if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
-        working-directory: services/ingestion-api
-        run: |
-          {
-            echo "## Tier-1 synthetic pipeline smoke"
-            echo "Stub path: **generator → in-memory buffer → fake sink**. Test file: \`services/ingestion-api/test/tier1-synthetic-pipeline.test.ts\`."
-            echo "If this step fails, read the logged test title to see whether the orchestrated run or the staged generator/buffer/sink test regressed."
-          } >> "$GITHUB_STEP_SUMMARY"
-          npm ci --include=dev
-          npm run test:synthetic-smoke
+      - name: Install
+        run: npm ci --include=dev
+      - name: Test
+        run: npm test
+      - name: Build
+        run: npm run build

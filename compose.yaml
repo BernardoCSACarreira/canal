@@ -1,13 +1,13 @@
 # Default local stack for Go (ingestion-edge) + Python (control plane).
-# ingestion-edge-go: http://127.0.0.1:8090/health
+# Host ports align with apps/ingestion-ui Vite defaults: data plane :8080, control :8091.
+# ingestion-edge-go: http://127.0.0.1:8080/health
 # ingestion-control-plane: http://127.0.0.1:8091/health
-# TypeScript ingestion-api (not included) stays on 8080 for ingestion-ui proxying.
 services:
   ingestion-edge-go:
     build:
       context: ./services/ingestion-edge-go
     ports:
-      - "8090:8080"
+      - "8080:8080"
     environment:
       PORT: "8080"
 

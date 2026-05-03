@@ -474,6 +474,8 @@ const styles: Record<string, CSSProperties> = {
     display: 'flex',
     flexDirection: 'column',
     gap: '0.35rem',
+    paddingTop: '0.5rem',
+    borderTop: '1px solid var(--border)',
   },
   wizardBtn: {
     textAlign: 'left',

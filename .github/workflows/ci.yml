@@ -175,7 +175,7 @@ jobs:
         working-directory: services/ingestion-edge-go
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: services/ingestion-edge-go/go.mod
       - name: Format (gofmt)

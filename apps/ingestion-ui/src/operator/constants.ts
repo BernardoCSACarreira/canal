@@ -26,6 +26,18 @@ export function catalogTierForIngestionPath(tier: IngestionPathTier): CatalogTie
   return 'tier-3'
 }
 
+/**
+ * Epic B3 catalog honesty keys (tier2_real vs tier1_synthetic) — align with
+ * internal taxonomy naming; not the same strings as OpenAPI `catalogTier`.
+ */
+export type CatalogTierKindKey = 'tier1_synthetic' | 'tier2_real' | 'tier3_byo'
+
+export function catalogTierKindKey(catalogTier: CatalogTier): CatalogTierKindKey {
+  if (catalogTier === 'tier-1') return 'tier1_synthetic'
+  if (catalogTier === 'tier-2') return 'tier2_real'
+  return 'tier3_byo'
+}
+
 /** Stable keys — must match `docs/product/connector-tier-ux-spec.md` §2.2. */
 export const INGESTION_PATH_BADGE_KEY: Record<IngestionPathTier, string> = {
   1: 'ingestion_path.tier_1_synthetic',

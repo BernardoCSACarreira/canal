@@ -72,12 +72,14 @@ describe('Operator wizard control API', () => {
 
     await waitFor(() => {
       expect(screen.getByText(/contract/i)).toBeInTheDocument()
-      expect(screen.getByText(/Managed sink \(test stub\)/i)).toBeInTheDocument()
+      expect(screen.getAllByText(/Managed sink \(test stub\)/i).length).toBeGreaterThanOrEqual(1)
     })
+    expect(document.querySelector('input[data-catalog-kind="tier2_real"]')).toBeChecked()
 
     await user.click(screen.getByRole('button', { name: /continue to review/i }))
 
     expect(screen.getByRole('heading', { name: /^review$/i })).toBeInTheDocument()
+    expect(screen.getByText(/Pilot SLO does not apply/i)).toBeInTheDocument()
 
     await user.click(
       screen.getByRole('checkbox', {
@@ -91,6 +93,6 @@ describe('Operator wizard control API', () => {
       const pre = screen.getByText(/"wizardPathAcknowledged"/i)
       expect(pre).toBeInTheDocument()
     })
-    expect(screen.getByText(/Managed sink \(test stub\)/i)).toBeInTheDocument()
+    expect(screen.getAllByText(/Managed sink \(test stub\)/i).length).toBeGreaterThanOrEqual(1)
   })
 })

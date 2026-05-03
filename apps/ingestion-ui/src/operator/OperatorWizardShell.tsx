@@ -4,8 +4,17 @@ import {
   getControlPipeline,
   postIngestBatch,
 } from '../api/client'
-import type { CanalSegmentsRead, IngestBatchRequest, PipelineSummaryRead } from '../api/types'
-import { catalogTierForIngestionPath, type IngestionPathTier } from './constants'
+import type {
+  AdapterInstancePlaceholder,
+  CanalSegmentsRead,
+  IngestBatchRequest,
+  PipelineSummaryRead,
+} from '../api/types'
+import {
+  catalogTierForIngestionPath,
+  catalogTierKindKey,
+  type IngestionPathTier,
+} from './constants'
 import { OperatorControlSummary } from './OperatorControlSummary'
 import { SloBadgeStrip, TierBadge } from './TierSloBadges'
 
@@ -15,6 +24,8 @@ type WizardDraft = {
   tier: IngestionPathTier
   source: string | null
   eventsJson: string | null
+  /** Selected control read-model adapter; session-local until persistence (CAN-51). */
+  selectedAdapterInstanceId: string | null
   control?: { pipeline: PipelineSummaryRead; canal: CanalSegmentsRead }
 }
 
@@ -163,6 +174,7 @@ function ConfigureStep({
   const [eventsJson, setEventsJson] = useState(defaultEventsJson)
   const [control, setControl] = useState<ControlLoadState>({ status: 'loading' })
   const [reloadToken, setReloadToken] = useState(0)
+  const [selectedAdapterId, setSelectedAdapterId] = useState<string | null>(null)
 
   useEffect(() => {
     const ac = new AbortController()
@@ -188,17 +200,48 @@ function ConfigureStep({
   const catalogTier = catalogTierForIngestionPath(tier)
   const controlGateOk = tier === 1 || control.status === 'ok'
 
-  const persistDraft = (partial: Pick<WizardDraft, 'source' | 'eventsJson'>) => {
+  const filteredAdapters = useMemo((): AdapterInstancePlaceholder[] => {
+    if (control.status !== 'ok') return []
+    return control.pipeline.adapterInstances.filter((a) => a.catalogTier === catalogTier)
+  }, [control, catalogTier])
+
+  const adapterIdsKey = filteredAdapters.map((a) => a.id).join('|')
+
+  useEffect(() => {
+    if (control.status !== 'ok') {
+      setSelectedAdapterId(null)
+      return
+    }
+    const list = control.pipeline.adapterInstances.filter((a) => a.catalogTier === catalogTier)
+    setSelectedAdapterId((prev) => {
+      if (prev && list.some((a) => a.id === prev)) return prev
+      return list[0]?.id ?? null
+    })
+  }, [control, catalogTier, tier, reloadToken, adapterIdsKey])
+
+  const persistDraft = (
+    partial: Pick<WizardDraft, 'source' | 'eventsJson' | 'selectedAdapterInstanceId'>,
+  ) => {
     const base: WizardDraft = {
       tier,
       source: partial.source ?? null,
       eventsJson: partial.eventsJson ?? null,
+      selectedAdapterInstanceId: partial.selectedAdapterInstanceId ?? null,
     }
     if (control.status === 'ok') {
       base.control = { pipeline: control.pipeline, canal: control.canal }
     }
     sessionStorage.setItem('canal:wizard:draft', JSON.stringify(base))
   }
+
+  const configureContinueDisabledTier1 =
+    control.status === 'ok' &&
+    (filteredAdapters.length === 0 || selectedAdapterId === null)
+
+  const configureContinueDisabledTier23 =
+    !controlGateOk ||
+    (control.status === 'ok' &&
+      (filteredAdapters.length === 0 || selectedAdapterId === null))
 
   if (tier === 1) {
     return (
@@ -217,11 +260,18 @@ function ConfigureStep({
           </p>
         )}
         {control.status === 'ok' && (
-          <OperatorControlSummary
-            pipeline={control.pipeline}
-            canal={control.canal}
-            highlightCatalogTier={null}
-          />
+          <>
+            <OperatorControlSummary
+              pipeline={control.pipeline}
+              canal={control.canal}
+              highlightCatalogTier={catalogTier}
+            />
+            <AdapterCatalogPicker
+              adapters={filteredAdapters}
+              value={selectedAdapterId}
+              onChange={setSelectedAdapterId}
+            />
+          </>
         )}
         <label style={wiz.label}>
           Source
@@ -244,8 +294,13 @@ function ConfigureStep({
         <WizardStepNav
           onBack={onBack}
           primaryLabel="Continue to review"
+          primaryDisabled={configureContinueDisabledTier1}
           onPrimary={() => {
-            persistDraft({ source, eventsJson })
+            persistDraft({
+              source,
+              eventsJson,
+              selectedAdapterInstanceId: selectedAdapterId,
+            })
             onContinue()
           }}
         />
@@ -260,9 +315,10 @@ function ConfigureStep({
         <SloBadgeStrip tier={tier} />
       </div>
       <p style={wiz.muted}>
-        Credential pickers and connector runtime wiring ship in later slices. The
-        control plane read models below are live from the ingestion API so
-        operators see the same pipeline topology the backend exposes.
+        Pick a catalog adapter instance for this path (B3). Credential pickers and
+        connector runtime wiring ship in later slices; choice is session-local until
+        adapter persistence lands. The control read models below are live from the
+        ingestion API.
       </p>
       {control.status === 'loading' && (
         <p style={wiz.muted}>Loading control read models…</p>
@@ -284,22 +340,86 @@ function ConfigureStep({
         </div>
       )}
       {control.status === 'ok' && (
-        <OperatorControlSummary
-          pipeline={control.pipeline}
-          canal={control.canal}
-          highlightCatalogTier={catalogTier}
-        />
+        <>
+          <OperatorControlSummary
+            pipeline={control.pipeline}
+            canal={control.canal}
+            highlightCatalogTier={catalogTier}
+          />
+          <AdapterCatalogPicker
+            adapters={filteredAdapters}
+            value={selectedAdapterId}
+            onChange={setSelectedAdapterId}
+          />
+        </>
       )}
       <WizardStepNav
         onBack={onBack}
         primaryLabel="Continue to review"
-        primaryDisabled={!controlGateOk}
+        primaryDisabled={configureContinueDisabledTier23}
         onPrimary={() => {
-          persistDraft({ source: null, eventsJson: null })
+          persistDraft({
+            source: null,
+            eventsJson: null,
+            selectedAdapterInstanceId: selectedAdapterId,
+          })
           onContinue()
         }}
       />
     </section>
+  )
+}
+
+function AdapterCatalogPicker({
+  adapters,
+  value,
+  onChange,
+}: {
+  adapters: AdapterInstancePlaceholder[]
+  value: string | null
+  onChange: (id: string) => void
+}) {
+  if (adapters.length === 0) return null
+  return (
+    <fieldset style={wiz.fs}>
+      <legend style={wiz.fsLegend}>Connector instance (catalog)</legend>
+      <p style={wiz.muted}>
+        OpenAPI <code style={wiz.subCode}>catalogTier</code> maps to B3 keys{' '}
+        <code style={wiz.subCode}>tier1_synthetic</code> vs{' '}
+        <code style={wiz.subCode}>tier2_real</code> (see{' '}
+        <code style={wiz.subCode}>catalogTierKindKey</code>).
+      </p>
+      <div style={wiz.pickerCol}>
+        {adapters.map((a) => {
+          const kind = catalogTierKindKey(a.catalogTier)
+          const sel = value === a.id
+          return (
+            <label
+              key={a.id}
+              style={{
+                ...wiz.pickRow,
+                ...(sel ? { borderColor: 'var(--accent)' } : {}),
+              }}
+            >
+              <input
+                type="radio"
+                name="adapter-catalog"
+                value={a.id}
+                checked={sel}
+                onChange={() => onChange(a.id)}
+                data-catalog-kind={kind}
+              />
+              <span style={wiz.pickBody}>
+                <strong>{a.displayName}</strong>
+                <span style={wiz.pickMeta}>
+                  {a.stageKey} · <code style={wiz.subCode}>{a.catalogTier}</code> · {kind}
+                </span>
+              </span>
+            </label>
+          )
+        })}
+      </div>
+    </fieldset>
   )
 }
 
@@ -321,6 +441,16 @@ function ReviewStep({
   }, [])
 
   const effectiveTier = draft?.tier ?? tier
+
+  const selectedCatalogAdapter = useMemo((): AdapterInstancePlaceholder | null => {
+    if (!draft?.control?.pipeline || !draft.selectedAdapterInstanceId) return null
+    return (
+      draft.control.pipeline.adapterInstances.find((a) => a.id === draft.selectedAdapterInstanceId) ??
+      null
+    )
+  }, [draft])
+
+  const tier2RealAdapterSelected = selectedCatalogAdapter?.catalogTier === 'tier-2'
 
   const [ackNoSlo, setAckNoSlo] = useState(false)
   const [submitting, setSubmitting] = useState(false)
@@ -345,6 +475,8 @@ function ReviewStep({
             wizardPathAcknowledged: true,
             batchIngestDeferred:
               'POST /v1/events remains Tier 1 synthetic in this Phase 1 happy path.',
+            selectedAdapterInstanceId: draft?.selectedAdapterInstanceId ?? null,
+            selectedCatalogAdapter: selectedCatalogAdapter ?? null,
             controlPlane: c,
           },
           null,
@@ -378,7 +510,18 @@ function ReviewStep({
     try {
       const res = await postIngestBatch(body)
       if (draft?.control) {
-        setResult(JSON.stringify({ ingest: res, controlPlane: draft.control }, null, 2))
+        setResult(
+          JSON.stringify(
+            {
+              ingest: res,
+              controlPlane: draft.control,
+              selectedAdapterInstanceId: draft.selectedAdapterInstanceId ?? null,
+              selectedCatalogAdapter: selectedCatalogAdapter ?? null,
+            },
+            null,
+            2,
+          ),
+        )
       } else {
         setResult(JSON.stringify(res, null, 2))
       }
@@ -387,7 +530,7 @@ function ReviewStep({
     } finally {
       setSubmitting(false)
     }
-  }, [ackNoSlo, draft, effectiveTier])
+  }, [ackNoSlo, draft, effectiveTier, selectedCatalogAdapter])
 
   return (
     <section style={wiz.section}>
@@ -412,6 +555,17 @@ function ReviewStep({
             </code>{' '}
             captured in configure. No batch POST here in Phase 1.
           </p>
+          {tier2RealAdapterSelected && (
+            <p
+              style={wiz.tier2Honesty}
+              data-honesty-key="wizard.tier2_real.pilot_slo_disclaimer"
+            >
+              <strong>Pilot SLO does not apply</strong> — the selected connector instance
+              is catalog-classified as managed real (<code style={wiz.subCode}>tier2_real</code>
+              ). No pilot program labeling; reliability follows standard connector operations,
+              not pilot-tier diagnostics.
+            </p>
+          )}
           <label style={wiz.checkRow}>
             <input
               type="checkbox"
@@ -630,6 +784,40 @@ const wiz: Record<string, CSSProperties> = {
     cursor: 'pointer',
   },
   error: { color: 'var(--danger)', margin: 0 },
+  tier2Honesty: {
+    margin: 0,
+    padding: '0.75rem 0.85rem',
+    borderRadius: 'var(--radius)',
+    border: '1px solid var(--border)',
+    background: 'var(--bg)',
+    fontSize: '0.9rem',
+    lineHeight: 1.5,
+  },
+  fs: {
+    margin: 0,
+    padding: '0.65rem 0.85rem',
+    borderRadius: 'var(--radius)',
+    border: '1px solid var(--border)',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '0.55rem',
+  },
+  fsLegend: { fontSize: '0.9rem', fontWeight: 600, padding: '0 0.25rem' },
+  pickerCol: { display: 'flex', flexDirection: 'column', gap: '0.45rem' },
+  pickRow: {
+    display: 'flex',
+    gap: '0.55rem',
+    alignItems: 'flex-start',
+    padding: '0.55rem 0.65rem',
+    borderRadius: 'var(--radius)',
+    borderWidth: 1,
+    borderStyle: 'solid',
+    borderColor: 'var(--border)',
+    cursor: 'pointer',
+    background: 'var(--bg)',
+  },
+  pickBody: { display: 'flex', flexDirection: 'column', gap: '0.2rem' },
+  pickMeta: { fontSize: '0.8rem', color: 'var(--muted)' },
   pre: {
     margin: 0,
     padding: '1rem',

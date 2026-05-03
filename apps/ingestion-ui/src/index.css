@@ -10,6 +10,18 @@
   --ok: #3fb950;
   --warn: #d29922;
   --danger: #f85149;
+  /* Connector tier (CAN-28) — semantic only; components must not hard-code hex */
+  --tier-pilot-fg: #e3b341;
+  --tier-pilot-bg: rgba(210, 153, 34, 0.12);
+  --tier-pilot-border: rgba(210, 153, 34, 0.45);
+  --tier-standard-fg: var(--text);
+  --tier-standard-bg: rgba(230, 237, 243, 0.06);
+  --tier-standard-border: var(--border);
+  --tier-priority-muted-fg: var(--muted);
+  --callout-pilot-bg: rgba(210, 153, 34, 0.08);
+  --callout-pilot-border: var(--tier-pilot-border);
+  --callout-neutral-bg: rgba(88, 166, 255, 0.06);
+  --callout-neutral-border: rgba(88, 166, 255, 0.35);
   --radius: 8px;
   --font: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
   --mono: ui-monospace, 'SF Mono', Consolas, monospace;
@@ -45,4 +57,11 @@ input,
 textarea,
 select {
   font: inherit;
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }

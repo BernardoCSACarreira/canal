@@ -35,6 +35,14 @@ jobs:
           test -f .nvmrc
           node -e "console.log('runner smoke ok')"
 
+  compose-validate:
+    name: Default stack (compose file)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate compose.yaml
+        run: docker compose -f compose.yaml config --quiet
+
   changes:
     name: Path filter
     runs-on: ubuntu-24.04
@@ -60,23 +68,38 @@ jobs:
               - 'contracts/**'
               - '.github/workflows/ci.yml'
               - '.nvmrc'
+            # Gated (CAN-72): TS scaffold — PRs only when this tree or workflow changes; not contract-only PRs.
             ingestion_api:
               - 'services/ingestion-api/**'
-              - 'contracts/**'
               - '.github/workflows/ci.yml'
-              - '.nvmrc'
             ingestion_edge_go:
               - 'services/ingestion-edge-go/**'
               - 'contracts/**'
               - '.github/workflows/ci.yml'
               - '.nvmrc'
+              - 'compose.yaml'
+              - '.python-version'
+              - 'services/ingestion-control-plane/Dockerfile'
+              - 'Makefile'
             ingestion_control_plane:
               - 'services/ingestion-control-plane/**'
               - 'contracts/**'
               - '.github/workflows/ci.yml'
+              - 'compose.yaml'
+              - '.python-version'
+              - 'services/ingestion-edge-go/Dockerfile'
+              - 'Makefile'
       - id: pick
         run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "contracts=${{ steps.filter.outputs.contracts }}" >> "$GITHUB_OUTPUT"
+            echo "ingestion_ui=${{ steps.filter.outputs.ingestion_ui }}" >> "$GITHUB_OUTPUT"
+            echo "ingestion_api=${{ steps.filter.outputs.ingestion_api }}" >> "$GITHUB_OUTPUT"
+            echo "ingestion_edge_go=${{ steps.filter.outputs.ingestion_edge_go }}" >> "$GITHUB_OUTPUT"
+            echo "ingestion_control_plane=${{ steps.filter.outputs.ingestion_control_plane }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "contracts=true" >> "$GITHUB_OUTPUT"
             echo "ingestion_ui=true" >> "$GITHUB_OUTPUT"
             echo "ingestion_api=true" >> "$GITHUB_OUTPUT"
@@ -84,11 +107,12 @@ jobs:
             echo "ingestion_control_plane=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "contracts=${{ steps.filter.outputs.contracts }}" >> "$GITHUB_OUTPUT"
-          echo "ingestion_ui=${{ steps.filter.outputs.ingestion_ui }}" >> "$GITHUB_OUTPUT"
-          echo "ingestion_api=${{ steps.filter.outputs.ingestion_api }}" >> "$GITHUB_OUTPUT"
-          echo "ingestion_edge_go=${{ steps.filter.outputs.ingestion_edge_go }}" >> "$GITHUB_OUTPUT"
-          echo "ingestion_control_plane=${{ steps.filter.outputs.ingestion_control_plane }}" >> "$GITHUB_OUTPUT"
+          # push / schedule: Go + Python ship path on main; TS ingestion-api runs on PRs touching it (see filters).
+          echo "contracts=true" >> "$GITHUB_OUTPUT"
+          echo "ingestion_ui=true" >> "$GITHUB_OUTPUT"
+          echo "ingestion_api=false" >> "$GITHUB_OUTPUT"
+          echo "ingestion_edge_go=true" >> "$GITHUB_OUTPUT"
+          echo "ingestion_control_plane=true" >> "$GITHUB_OUTPUT"
 
   contracts:
     name: contracts (OpenAPI validate)
@@ -161,13 +185,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version-file: .python-version
       - name: Install
         run: pip install -e '.[dev]'
       - name: Ruff
         run: ruff check src tests
       - name: Pytest
         run: pytest
+      - name: Container image
+        run: docker build -t ingestion-control-plane:ci .
 
   ingestion-edge-go:
     name: ingestion-edge-go (test + build)
@@ -181,7 +207,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22.12"
+          go-version-file: services/ingestion-edge-go/go.mod
       - name: Format (gofmt)
         run: test -z "$(gofmt -l .)"
       - name: Vet

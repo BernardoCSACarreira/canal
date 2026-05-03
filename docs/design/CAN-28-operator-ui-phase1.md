@@ -1,5 +1,7 @@
 # CAN-28 — Operator UI: connector tier and Pilot SLO honesty (Phase 1 handoff)
 
+**Normative product input (badge keys, labels, hierarchy):** [docs/product/connector-tier-ux-spec.md](../product/connector-tier-ux-spec.md) — keep this file aligned for a11y, tokens, and code pointers only.
+
 Audience: frontend engineering implementing `@canal/ingestion-ui` and adjacent operator surfaces.  
 Principles: reuse existing tokens in `apps/ingestion-ui/src/index.css`, do not invent a second palette; ship accessible defaults; label pilot limitations in plain language (CPO: trust over marketing).
 

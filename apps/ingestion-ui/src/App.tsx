@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useState, type CSSProperties } from 'react'
 import { getHealth, getStreamProbe, postIngestBatch } from './api/client'
 import type { HealthResponse, IngestBatchRequest } from './api/types'
-import type { ConnectorTier } from './operator/constants'
+import {
+  CONNECTOR_TIER_BADGE_KEY,
+  type ConnectorTier,
+} from './operator/constants'
 import { OperatorWizardShell } from './operator/OperatorWizardShell'
 import {
   clearWizardFromUrl,
@@ -305,9 +308,11 @@ function ConnectorTierFieldset({
           ] as const
         ).map(([id, label, description]) => {
           const disabled = id === 'priority_reserved'
+          const tier = id as ConnectorTier
           return (
             <label
               key={id}
+              data-badge-key={CONNECTOR_TIER_BADGE_KEY[tier]}
               style={{
                 ...styles.tierOption,
                 ...(disabled ? styles.tierOptionDisabled : {}),
@@ -319,7 +324,7 @@ function ConnectorTierFieldset({
                 value={id}
                 checked={value === id}
                 disabled={disabled}
-                onChange={() => onChange(id)}
+                onChange={() => onChange(tier)}
                 style={styles.tierRadio}
               />
               <span style={styles.tierOptionText}>

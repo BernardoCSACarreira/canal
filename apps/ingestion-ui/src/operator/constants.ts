@@ -4,11 +4,32 @@
  */
 export type ConnectorTier = 'pilot' | 'standard' | 'priority_reserved'
 
+/** Stable keys — must match `docs/product/connector-tier-ux-spec.md` §2.1. */
+export const CONNECTOR_TIER_BADGE_KEY: Record<ConnectorTier, string> = {
+  pilot: 'connector_tier.pilot',
+  standard: 'connector_tier.standard',
+  priority_reserved: 'connector_tier.priority_reserved',
+}
+
 /**
  * Guided wizard “ingestion path” lanes — charter UX, not the same enum as
  * `ConnectorTier`. See `docs/design/CAN-28-operator-ui-phase1.md` for mapping.
  */
 export type IngestionPathTier = 1 | 2 | 3
+
+/** Stable keys — must match `docs/product/connector-tier-ux-spec.md` §2.2. */
+export const INGESTION_PATH_BADGE_KEY: Record<IngestionPathTier, string> = {
+  1: 'ingestion_path.tier_1_synthetic',
+  2: 'ingestion_path.tier_2_managed',
+  3: 'ingestion_path.tier_3_byo',
+}
+
+/** Honesty-line keys — must match `docs/product/connector-tier-ux-spec.md` §2.2. */
+export const INGESTION_PATH_HONESTY_KEY: Record<IngestionPathTier, string> = {
+  1: 'ingestion_path.tier_1_synthetic.honesty',
+  2: 'ingestion_path.tier_2_managed.honesty',
+  3: 'ingestion_path.tier_3_byo.honesty',
+}
 
 export const TIER_LABEL: Record<IngestionPathTier, string> = {
   1: 'Tier 1 — synthetic / pilot-labeled path',

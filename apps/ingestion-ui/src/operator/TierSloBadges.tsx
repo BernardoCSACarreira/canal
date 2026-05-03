@@ -1,6 +1,13 @@
 import type { CSSProperties } from 'react'
 import type { IngestionPathTier } from './constants'
-import { SLO_SUMMARY, TIER_LABEL } from './constants'
+import {
+  INGESTION_PATH_BADGE_KEY,
+  INGESTION_PATH_HONESTY_KEY,
+  SLO_SUMMARY,
+  TIER_LABEL,
+} from './constants'
+import { tierUxPrototypeCopy } from './tierUxPrototypeCopy'
+import { isTierUxPrototypeActive } from './tierUxPrototypeGate'
 
 const badgeBase: CSSProperties = {
   display: 'inline-flex',
@@ -15,7 +22,8 @@ const badgeBase: CSSProperties = {
   width: 'fit-content',
 }
 
-const tierStyles: Record<
+/** Default wizard chips (pre–CAN-28 visual sign-off). */
+const tierStylesLegacy: Record<
   IngestionPathTier,
   { border: string; background: string; color: string }
 > = {
@@ -36,8 +44,47 @@ const tierStyles: Record<
   },
 }
 
+/** CAN-28 semantic tokens: path 1 ↔ pilot, 2 ↔ standard, 3 ↔ standard honesty + muted emphasis. */
+const tierStylesPrototype: Record<
+  IngestionPathTier,
+  { border: string; background: string; color: string }
+> = {
+  1: {
+    border: 'var(--tier-pilot-border)',
+    background: 'var(--tier-pilot-bg)',
+    color: 'var(--tier-pilot-fg)',
+  },
+  2: {
+    border: 'var(--tier-standard-border)',
+    background: 'var(--tier-standard-bg)',
+    color: 'var(--tier-standard-fg)',
+  },
+  3: {
+    border: 'var(--border)',
+    background: 'var(--tier-standard-bg)',
+    color: 'var(--tier-priority-muted-fg)',
+  },
+}
+
+function tierBadgeLabel(tier: IngestionPathTier): string {
+  return isTierUxPrototypeActive()
+    ? tierUxPrototypeCopy[tier].badge
+    : TIER_LABEL[tier]
+}
+
+function tierSloLine(tier: IngestionPathTier): string {
+  return isTierUxPrototypeActive()
+    ? tierUxPrototypeCopy[tier].slo
+    : SLO_SUMMARY[tier]
+}
+
+function tierBadgeStyles(tier: IngestionPathTier) {
+  return isTierUxPrototypeActive() ? tierStylesPrototype[tier] : tierStylesLegacy[tier]
+}
+
 export function TierBadge({ tier }: { tier: IngestionPathTier }) {
-  const t = tierStyles[tier]
+  const t = tierBadgeStyles(tier)
+  const proto = isTierUxPrototypeActive()
   return (
     <span
       style={{
@@ -46,16 +93,23 @@ export function TierBadge({ tier }: { tier: IngestionPathTier }) {
         background: t.background,
         color: t.color,
       }}
+      data-badge-key={INGESTION_PATH_BADGE_KEY[tier]}
+      data-tier-ux-prototype={proto ? 'true' : undefined}
     >
-      {TIER_LABEL[tier]}
+      {tierBadgeLabel(tier)}
     </span>
   )
 }
 
 export function SloHonestyLine({ tier }: { tier: IngestionPathTier }) {
+  const proto = isTierUxPrototypeActive()
   return (
-    <p style={{ margin: 0, fontSize: '0.85rem', color: 'var(--muted)' }}>
-      {SLO_SUMMARY[tier]}
+    <p
+      style={{ margin: 0, fontSize: '0.85rem', color: 'var(--muted)' }}
+      data-honesty-key={INGESTION_PATH_HONESTY_KEY[tier]}
+      data-tier-ux-prototype={proto ? 'true' : undefined}
+    >
+      {tierSloLine(tier)}
     </p>
   )
 }

@@ -160,7 +160,6 @@ function ConfigureStep({
 
   useEffect(() => {
     const ac = new AbortController()
-    setControl({ status: 'loading' })
     ;(async () => {
       try {
         const [pipeline, canal] = await Promise.all([
@@ -269,7 +268,10 @@ function ConfigureStep({
           <button
             type="button"
             style={wiz.secondaryBtn}
-            onClick={() => setReloadToken((n) => n + 1)}
+            onClick={() => {
+              setControl({ status: 'loading' })
+              setReloadToken((n) => n + 1)
+            }}
           >
             Retry
           </button>

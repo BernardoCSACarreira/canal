@@ -13,7 +13,9 @@ import (
 
 func main() {
 	addr := ":8080"
-	if v := os.Getenv("PORT"); v != "" {
+	if v := os.Getenv("LISTEN_ADDR"); v != "" {
+		addr = v
+	} else if v := os.Getenv("PORT"); v != "" {
 		addr = ":" + v
 	}
 	d := httpserver.Deps{

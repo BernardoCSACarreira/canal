@@ -27,17 +27,16 @@ cd services/ingestion-edge-go && go run ./cmd/ingestion-edge
 cd services/ingestion-control-plane && pip install -e '.[dev]' && \
   uvicorn canal_control_plane.app:app --host 127.0.0.1 --port 8091 --reload
 
-# Terminal C — UI (send control routes to Python; data plane stays on :8080)
-cd apps/ingestion-ui && npm install && \
-  VITE_CONTROL_PLANE_PROXY_TARGET=http://127.0.0.1:8091 npm run dev
+# Terminal C — UI (defaults: data :8080, control :8091)
+cd apps/ingestion-ui && npm install && npm run dev
 ```
 
-Proxy env vars (omit `VITE_CONTROL_PLANE_PROXY_TARGET` to send **everything** to the data plane — same as a single `ingestion-api` or Go edge on `:8080`):
+Proxy env vars (defaults match split stack; override if your ports differ):
 
 | Variable | Default |
 |----------|---------|
 | `VITE_DATA_PLANE_PROXY_TARGET` | `http://127.0.0.1:8080` |
-| `VITE_CONTROL_PLANE_PROXY_TARGET` | same as data plane |
+| `VITE_CONTROL_PLANE_PROXY_TARGET` | `http://127.0.0.1:8091` |
 
 ### Legacy (single combined backend)
 

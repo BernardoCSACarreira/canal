@@ -9,12 +9,13 @@ const dataPlaneTarget =
   legacyTarget ?? (process.env.VITE_DATA_PLANE_PROXY_TARGET ?? 'http://127.0.0.1:8080')
 /**
  * Python control plane: `GET /v1/control/*`, `/v1/adapter-instances*`.
- * Defaults to the data-plane URL so a single process on :8080 (TS or Go) still works; set
- * `VITE_CONTROL_PLANE_PROXY_TARGET` for split-stack dev (for example Python on :8091).
+ * Defaults to :8091 (matches `ingestion-control-plane` Dockerfile) so split-stack dev works
+ * without extra env. For a **single** combined backend (TS `ingestion-api` or temporary
+ * all-in-one), set `VITE_API_PROXY_TARGET` to that one URL instead.
  */
 const controlPlaneTarget =
   legacyTarget ??
-  (process.env.VITE_CONTROL_PLANE_PROXY_TARGET ?? dataPlaneTarget)
+  (process.env.VITE_CONTROL_PLANE_PROXY_TARGET ?? 'http://127.0.0.1:8091')
 
 export default mergeConfig(
   defineConfig({

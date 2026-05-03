@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState, type CSSProperties } from 'r
 import {
   getControlCanalSegments,
   getControlPipeline,
+  postAdapterInstance,
   postIngestBatch,
 } from '../api/client'
 import type {
@@ -24,8 +25,11 @@ type WizardDraft = {
   tier: IngestionPathTier
   source: string | null
   eventsJson: string | null
-  /** Selected control read-model adapter; session-local until persistence (CAN-51). */
-  selectedAdapterInstanceId: string | null
+  /**
+   * Catalog placeholder id from `GET /v1/control/pipeline` (tier 2/3 configure).
+   * Review calls `POST /v1/adapter-instances` so `catalogTier` is server-enforced (CAN-51).
+   */
+  selectedCatalogAdapterId: string | null
   control?: { pipeline: PipelineSummaryRead; canal: CanalSegmentsRead }
 }
 
@@ -220,13 +224,13 @@ function ConfigureStep({
   }, [control, catalogTier, tier, reloadToken, adapterIdsKey])
 
   const persistDraft = (
-    partial: Pick<WizardDraft, 'source' | 'eventsJson' | 'selectedAdapterInstanceId'>,
+    partial: Pick<WizardDraft, 'source' | 'eventsJson' | 'selectedCatalogAdapterId'>,
   ) => {
     const base: WizardDraft = {
       tier,
       source: partial.source ?? null,
       eventsJson: partial.eventsJson ?? null,
-      selectedAdapterInstanceId: partial.selectedAdapterInstanceId ?? null,
+      selectedCatalogAdapterId: partial.selectedCatalogAdapterId ?? null,
     }
     if (control.status === 'ok') {
       base.control = { pipeline: control.pipeline, canal: control.canal }
@@ -299,7 +303,7 @@ function ConfigureStep({
             persistDraft({
               source,
               eventsJson,
-              selectedAdapterInstanceId: selectedAdapterId,
+              selectedCatalogAdapterId: selectedAdapterId,
             })
             onContinue()
           }}
@@ -315,10 +319,10 @@ function ConfigureStep({
         <SloBadgeStrip tier={tier} />
       </div>
       <p style={wiz.muted}>
-        Pick a catalog adapter instance for this path (B3). Credential pickers and
-        connector runtime wiring ship in later slices; choice is session-local until
-        adapter persistence lands. The control read models below are live from the
-        ingestion API.
+        Pick a catalog adapter for this path (B3 honesty keys). On review, the wizard
+        calls <code style={wiz.subCode}>POST /v1/adapter-instances</code> so{' '}
+        <code style={wiz.subCode}>catalogTier</code> is enforced from the pipeline read
+        model (CAN-51). Credential pickers ship in later slices.
       </p>
       {control.status === 'loading' && (
         <p style={wiz.muted}>Loading control read models…</p>
@@ -361,7 +365,7 @@ function ConfigureStep({
           persistDraft({
             source: null,
             eventsJson: null,
-            selectedAdapterInstanceId: selectedAdapterId,
+            selectedCatalogAdapterId: selectedAdapterId,
           })
           onContinue()
         }}
@@ -443,9 +447,9 @@ function ReviewStep({
   const effectiveTier = draft?.tier ?? tier
 
   const selectedCatalogAdapter = useMemo((): AdapterInstancePlaceholder | null => {
-    if (!draft?.control?.pipeline || !draft.selectedAdapterInstanceId) return null
+    if (!draft?.control?.pipeline || !draft.selectedCatalogAdapterId) return null
     return (
-      draft.control.pipeline.adapterInstances.find((a) => a.id === draft.selectedAdapterInstanceId) ??
+      draft.control.pipeline.adapterInstances.find((a) => a.id === draft.selectedCatalogAdapterId) ??
       null
     )
   }, [draft])
@@ -469,20 +473,34 @@ function ReviewStep({
         setError('Control read models missing — return to configure and wait for the API.')
         return
       }
-      setResult(
-        JSON.stringify(
-          {
-            wizardPathAcknowledged: true,
-            batchIngestDeferred:
-              'POST /v1/events remains Tier 1 synthetic in this Phase 1 happy path.',
-            selectedAdapterInstanceId: draft?.selectedAdapterInstanceId ?? null,
-            selectedCatalogAdapter: selectedCatalogAdapter ?? null,
-            controlPlane: c,
-          },
-          null,
-          2,
-        ),
-      )
+      const catalogId = draft?.selectedCatalogAdapterId
+      if (!catalogId) {
+        setError('No catalog adapter selected — return to configure.')
+        return
+      }
+      setSubmitting(true)
+      try {
+        const adapterInstance = await postAdapterInstance({ catalogAdapterId: catalogId })
+        setResult(
+          JSON.stringify(
+            {
+              wizardPathAcknowledged: true,
+              batchIngestDeferred:
+                'POST /v1/events remains Tier 1 synthetic in this Phase 1 happy path.',
+              selectedCatalogAdapterId: catalogId,
+              selectedCatalogAdapter: selectedCatalogAdapter ?? null,
+              adapterInstance,
+              controlPlane: c,
+            },
+            null,
+            2,
+          ),
+        )
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e))
+      } finally {
+        setSubmitting(false)
+      }
       return
     }
     const source = draft?.source?.trim() || 'unknown'
@@ -515,7 +533,7 @@ function ReviewStep({
             {
               ingest: res,
               controlPlane: draft.control,
-              selectedAdapterInstanceId: draft.selectedAdapterInstanceId ?? null,
+              selectedCatalogAdapterId: draft.selectedCatalogAdapterId ?? null,
               selectedCatalogAdapter: selectedCatalogAdapter ?? null,
             },
             null,
@@ -548,8 +566,9 @@ function ReviewStep({
       {effectiveTier !== 1 && (
         <>
           <p style={wiz.muted}>
-            This path completes the control-plane happy path: acknowledge honesty
-            copy, then persist the snapshot from{' '}
+            This path completes the control-plane happy path: acknowledge honesty copy,
+            then persist via <code style={wiz.subCode}>POST /v1/adapter-instances</code>{' '}
+            plus the snapshot from{' '}
             <code style={{ fontFamily: 'var(--mono)', fontSize: '0.85em' }}>
               GET /v1/control/*
             </code>{' '}

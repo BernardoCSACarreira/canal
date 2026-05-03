@@ -35,14 +35,28 @@ function stubIngestionFetchWithControl() {
   const impl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const raw = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
     const path = new URL(raw, 'http://localhost').pathname
-    if (path === '/v1/control/pipeline' && (!init || init.method === undefined || init.method === 'GET')) {
+    const method = init?.method ?? 'GET'
+    if (path === '/v1/control/pipeline' && method === 'GET') {
       return Response.json(stubPipeline)
     }
-    if (
-      path === '/v1/control/canal/segments' &&
-      (!init || init.method === undefined || init.method === 'GET')
-    ) {
+    if (path === '/v1/control/canal/segments' && method === 'GET') {
       return Response.json(stubCanal)
+    }
+    if (path === '/v1/adapter-instances' && method === 'POST') {
+      const body = JSON.parse(init?.body as string) as { catalogAdapterId: string }
+      return Response.json(
+        {
+          id: '11111111-1111-1111-1111-111111111111',
+          catalogAdapterId: body.catalogAdapterId,
+          catalogTier: 'tier-2',
+          stageKey: 'sink_connector',
+          displayName: 'Managed sink (test stub)',
+          operatorLabel: null,
+          createdAt: '2026-05-03T12:00:00.000Z',
+          updatedAt: '2026-05-03T12:00:00.000Z',
+        },
+        { status: 201 },
+      )
     }
     return new Response('not found', { status: 404 })
   })
@@ -93,6 +107,8 @@ describe('Operator wizard control API', () => {
       const pre = screen.getByText(/"wizardPathAcknowledged"/i)
       expect(pre).toBeInTheDocument()
     })
+    expect(screen.getByText(/"adapterInstance"/i)).toBeInTheDocument()
+    expect(screen.getByText(/11111111-1111-1111-1111-111111111111/i)).toBeInTheDocument()
     expect(screen.getAllByText(/Managed sink \(test stub\)/i).length).toBeGreaterThanOrEqual(1)
   })
 })

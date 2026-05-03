@@ -62,3 +62,30 @@ export type CanalSegmentRead = {
 export type CanalSegmentsRead = {
   segments: CanalSegmentRead[]
 }
+
+/** Persisted operator binding — see `paths./v1/adapter-instances` in OpenAPI (CAN-51). */
+
+export type AdapterInstanceCreateRequest = {
+  catalogAdapterId: string
+  operatorLabel?: string | null
+}
+
+export type AdapterInstancePatchRequest = {
+  catalogAdapterId?: string
+  operatorLabel?: string | null
+}
+
+export type AdapterInstanceRead = {
+  id: string
+  catalogAdapterId: string
+  catalogTier: CatalogTier
+  stageKey: string
+  displayName: string
+  operatorLabel: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export type AdapterInstanceListRead = {
+  items: AdapterInstanceRead[]
+}

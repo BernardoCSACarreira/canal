@@ -125,6 +125,67 @@ test("GET /v1/control/canal/segments returns CanalSegmentsRead shape", async () 
   });
 });
 
+test("adapter instance CRUD: tier comes from catalog; unknown id rejected", async () => {
+  await withApp(async (app) => {
+    const bad = await app.inject({
+      method: "POST",
+      url: "/v1/adapter-instances",
+      headers: { "content-type": "application/json" },
+      payload: { catalogAdapterId: "adapter.unknown" },
+    });
+    assert.equal(bad.statusCode, 400);
+    const badBody = bad.json() as { error: string; message: string };
+    assert.equal(badBody.error, "validation_error");
+    assert.match(badBody.message, /catalog/i);
+
+    const create = await app.inject({
+      method: "POST",
+      url: "/v1/adapter-instances",
+      headers: { "content-type": "application/json" },
+      payload: {
+        catalogAdapterId: "adapter.placeholder.sink_connector",
+        operatorLabel: " QA binding ",
+      },
+    });
+    assert.equal(create.statusCode, 201);
+    const rec = create.json() as {
+      id: string;
+      catalogAdapterId: string;
+      catalogTier: string;
+      stageKey: string;
+      displayName: string;
+      operatorLabel: string | null;
+    };
+    assert.equal(rec.catalogAdapterId, "adapter.placeholder.sink_connector");
+    assert.equal(rec.catalogTier, "tier-2");
+    assert.equal(rec.operatorLabel, "QA binding");
+
+    const list = await app.inject({ method: "GET", url: "/v1/adapter-instances" });
+    assert.equal(list.statusCode, 200);
+    const listBody = list.json() as { items: { id: string; catalogAdapterId: string }[] };
+    assert.equal(listBody.items.length, 1);
+    assert.equal(listBody.items[0].id, rec.id);
+
+    const patch = await app.inject({
+      method: "PATCH",
+      url: `/v1/adapter-instances/${rec.id}`,
+      headers: { "content-type": "application/json" },
+      payload: { catalogAdapterId: "adapter.placeholder.community_sink", operatorLabel: null },
+    });
+    assert.equal(patch.statusCode, 200);
+    const patched = patch.json() as typeof rec;
+    assert.equal(patched.catalogAdapterId, "adapter.placeholder.community_sink");
+    assert.equal(patched.catalogTier, "tier-3");
+    assert.equal(patched.operatorLabel, null);
+
+    const del = await app.inject({ method: "DELETE", url: `/v1/adapter-instances/${rec.id}` });
+    assert.equal(del.statusCode, 204);
+
+    const gone = await app.inject({ method: "GET", url: `/v1/adapter-instances/${rec.id}` });
+    assert.equal(gone.statusCode, 404);
+  });
+});
+
 test("POST /v1/events returns 400 for invalid body", async () => {
   await withApp(async (app) => {
     const cases: { name: string; payload: unknown }[] = [

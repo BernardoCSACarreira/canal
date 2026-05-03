@@ -1,4 +1,8 @@
 import type {
+  AdapterInstanceCreateRequest,
+  AdapterInstanceListRead,
+  AdapterInstancePatchRequest,
+  AdapterInstanceRead,
   CanalSegmentsRead,
   ErrorResponse,
   HealthResponse,
@@ -75,4 +79,57 @@ export async function getControlCanalSegments(): Promise<CanalSegmentsRead> {
     )
   }
   return parsed as CanalSegmentsRead
+}
+
+export async function listAdapterInstances(): Promise<AdapterInstanceListRead> {
+  const res = await fetch('/v1/adapter-instances')
+  const parsed = await readJson<AdapterInstanceListRead | ErrorResponse>(res)
+  if (!res.ok) {
+    const err = parsed as ErrorResponse
+    throw new Error(err?.message ?? `GET /v1/adapter-instances failed (${res.status})`)
+  }
+  return parsed as AdapterInstanceListRead
+}
+
+export async function postAdapterInstance(
+  body: AdapterInstanceCreateRequest,
+): Promise<AdapterInstanceRead> {
+  const res = await fetch('/v1/adapter-instances', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const parsed = await readJson<AdapterInstanceRead | ErrorResponse>(res)
+  if (!res.ok) {
+    const err = parsed as ErrorResponse
+    throw new Error(err?.message ?? `POST /v1/adapter-instances failed (${res.status})`)
+  }
+  return parsed as AdapterInstanceRead
+}
+
+export async function patchAdapterInstance(
+  id: string,
+  body: AdapterInstancePatchRequest,
+): Promise<AdapterInstanceRead> {
+  const res = await fetch(`/v1/adapter-instances/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const parsed = await readJson<AdapterInstanceRead | ErrorResponse>(res)
+  if (!res.ok) {
+    const err = parsed as ErrorResponse
+    throw new Error(err?.message ?? `PATCH /v1/adapter-instances/${id} failed (${res.status})`)
+  }
+  return parsed as AdapterInstanceRead
+}
+
+export async function deleteAdapterInstance(id: string): Promise<void> {
+  const res = await fetch(`/v1/adapter-instances/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  })
+  if (res.status === 204) return
+  const parsed = await readJson<ErrorResponse>(res)
+  const err = parsed
+  throw new Error(err?.message ?? `DELETE /v1/adapter-instances/${id} failed (${res.status})`)
 }

@@ -19,6 +19,7 @@ tags:
   - name: Health
   - name: Ingestion
   - name: Control
+  - name: AdapterInstances
 
 paths:
   /health:
@@ -107,6 +108,113 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CanalSegmentsRead"
+
+  /v1/adapter-instances:
+    get:
+      tags: [AdapterInstances]
+      summary: List persisted operator adapter instance bindings
+      operationId: listAdapterInstances
+      description: |
+        Phase 1 in-memory records. `catalogTier` is always derived from the pipeline
+        read model (`GET /v1/control/pipeline`) for the bound `catalogAdapterId` —
+        clients cannot set tier independently (CAN-51).
+      responses:
+        "200":
+          description: Adapter instances
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdapterInstanceListRead"
+    post:
+      tags: [AdapterInstances]
+      summary: Create an adapter instance bound to a catalog placeholder
+      operationId: createAdapterInstance
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdapterInstanceCreateRequest"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdapterInstanceRead"
+        "400":
+          description: Validation error or unknown catalog adapter id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/adapter-instances/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags: [AdapterInstances]
+      summary: Get one adapter instance
+      operationId: getAdapterInstance
+      responses:
+        "200":
+          description: Found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdapterInstanceRead"
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    patch:
+      tags: [AdapterInstances]
+      summary: Update operator label and/or rebind to another catalog placeholder
+      operationId: patchAdapterInstance
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdapterInstancePatchRequest"
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdapterInstanceRead"
+        "400":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    delete:
+      tags: [AdapterInstances]
+      summary: Delete an adapter instance
+      operationId: deleteAdapterInstance
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
 components:
   schemas:
@@ -270,3 +378,60 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/CanalSegmentRead"
+
+    AdapterInstanceCreateRequest:
+      type: object
+      required: [catalogAdapterId]
+      properties:
+        catalogAdapterId:
+          type: string
+          description: Must match `AdapterInstancePlaceholder.id` from `GET /v1/control/pipeline`.
+        operatorLabel:
+          type: string
+          nullable: true
+          description: Optional operator-facing label (does not change catalog metadata).
+
+    AdapterInstancePatchRequest:
+      type: object
+      properties:
+        catalogAdapterId:
+          type: string
+          description: Rebind to another catalog placeholder; tier updates from catalog automatically.
+        operatorLabel:
+          type: string
+          nullable: true
+
+    AdapterInstanceRead:
+      type: object
+      required:
+        [id, catalogAdapterId, catalogTier, stageKey, displayName, operatorLabel, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        catalogAdapterId:
+          type: string
+        catalogTier:
+          $ref: "#/components/schemas/CatalogTier"
+        stageKey:
+          type: string
+        displayName:
+          type: string
+        operatorLabel:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    AdapterInstanceListRead:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdapterInstanceRead"

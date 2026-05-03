@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import type { P1LocalEventBuffer } from "../canal/event-buffer.js";
 import type { AdapterInstanceStore } from "../control/adapter-instance-store.js";
 import { registerAdapterInstanceRoutes } from "./adapter-instances.js";
 import { registerControlRoutes } from "./control.js";
@@ -7,11 +8,12 @@ import { registerIngestionRoutes } from "./ingestion.js";
 
 export type RegisterRouteDeps = {
   adapterInstanceStore: AdapterInstanceStore;
+  eventBuffer: P1LocalEventBuffer;
 };
 
 export async function registerRoutes(app: FastifyInstance, deps: RegisterRouteDeps): Promise<void> {
   await registerHealthRoutes(app);
-  await registerIngestionRoutes(app);
+  await registerIngestionRoutes(app, { eventBuffer: deps.eventBuffer });
   await registerControlRoutes(app);
   await registerAdapterInstanceRoutes(app, deps.adapterInstanceStore);
 }

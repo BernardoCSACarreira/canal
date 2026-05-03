@@ -81,11 +81,11 @@ export async function registerAdapterInstanceRoutes(
       return reply.code(400).send({ error: "validation_error", message: parsed.message });
     }
     const updated = store.update(req.params.id, parsed);
-    if ("notFound" in updated && updated.notFound) {
-      return reply.code(404).send({ error: "not_found", message: "Adapter instance not found" });
-    }
     if (!updated.ok) {
-      return reply.code(400).send({ error: "validation_error", message: updated.message });
+      if ("message" in updated) {
+        return reply.code(400).send({ error: "validation_error", message: updated.message });
+      }
+      return reply.code(404).send({ error: "not_found", message: "Adapter instance not found" });
     }
     return reply.send(updated.record);
   });

@@ -1,18 +1,9 @@
 import type { FastifyInstance } from "fastify";
-
-type JsonPrimitive = string | number | boolean | null;
-type JsonValue = JsonPrimitive | JsonValue[] | { [k: string]: JsonValue };
-
-type IngestEvent = {
-  id: string;
-  type: string;
-  occurredAt: string;
-  payload?: JsonValue;
-};
+import type { BufferedIngestEvent, P1LocalEventBuffer } from "../canal/event-buffer.js";
 
 type IngestBatchRequest = {
   source: string;
-  events: IngestEvent[];
+  events: BufferedIngestEvent[];
 };
 
 const seenIds = new Set<string>();
@@ -53,7 +44,11 @@ function validateBatch(body: unknown): { ok: true; value: IngestBatchRequest } |
   return { ok: true, value: b as IngestBatchRequest };
 }
 
-export async function registerIngestionRoutes(app: FastifyInstance): Promise<void> {
+export type IngestionRouteDeps = {
+  eventBuffer: P1LocalEventBuffer;
+};
+
+export async function registerIngestionRoutes(app: FastifyInstance, deps: IngestionRouteDeps): Promise<void> {
   app.post<{ Body: unknown }>("/v1/events", async (req, reply) => {
     const parsed = validateBatch(req.body);
     if (!parsed.ok) {
@@ -61,15 +56,19 @@ export async function registerIngestionRoutes(app: FastifyInstance): Promise<voi
     }
     const { source, events } = parsed.value;
     const duplicateIds: string[] = [];
-    let accepted = 0;
+    const acceptedEvents: BufferedIngestEvent[] = [];
     for (const ev of events) {
       if (seenIds.has(ev.id)) {
         duplicateIds.push(ev.id);
         continue;
       }
       seenIds.add(ev.id);
-      accepted += 1;
+      acceptedEvents.push(ev);
     }
+    if (acceptedEvents.length > 0) {
+      deps.eventBuffer.append(source, acceptedEvents);
+    }
+    const accepted = acceptedEvents.length;
     pruneSeenIfNeeded();
     req.log.info({ accepted, duplicateCount: duplicateIds.length, source }, "ingest_batch");
     return reply.code(202).send({ accepted, duplicateIds });

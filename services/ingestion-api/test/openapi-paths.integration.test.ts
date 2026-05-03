@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { FastifyInstance } from "fastify";
+import { P1LocalEventBuffer } from "../src/canal/event-buffer.js";
 import { buildApp } from "../src/app.js";
 
 async function withApp(fn: (app: FastifyInstance) => Promise<void>): Promise<void> {
@@ -60,6 +61,46 @@ test("POST /v1/events accepts batch and returns 202 + IngestBatchResponse", asyn
     assert.equal(body.accepted, 1);
     assert.deepEqual(body.duplicateIds, []);
   });
+});
+
+test("POST /v1/events enqueues accepted rows to P1LocalEventBuffer (dedup skips buffer)", async () => {
+  const eventBuffer = new P1LocalEventBuffer();
+  const idA = `buf-a-${crypto.randomUUID()}`;
+  const idB = `buf-b-${crypto.randomUUID()}`;
+  const app = await buildApp({ eventBuffer });
+  try {
+    const res = await app.inject({
+      method: "POST",
+      url: "/v1/events",
+      headers: { "content-type": "application/json" },
+      payload: {
+        source: "buf-test",
+        events: [validEvent(idA), validEvent(idB)],
+      },
+    });
+    assert.equal(res.statusCode, 202);
+    const rows = eventBuffer.readAfter(0, 10);
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0]!.source, "buf-test");
+    assert.equal(rows[0]!.event.id, idA);
+    assert.equal(rows[1]!.event.id, idB);
+    assert.equal(rows[0]!.sequence + 1, rows[1]!.sequence);
+
+    const dup = await app.inject({
+      method: "POST",
+      url: "/v1/events",
+      headers: { "content-type": "application/json" },
+      payload: {
+        source: "buf-test",
+        events: [validEvent(idA)],
+      },
+    });
+    assert.equal(dup.statusCode, 202);
+    assert.deepEqual((dup.json() as { duplicateIds: string[] }).duplicateIds, [idA]);
+    assert.equal(eventBuffer.readAfter(0, 10).length, 2);
+  } finally {
+    await app.close();
+  }
 });
 
 test("POST /v1/events marks duplicate ids on replay (idempotency)", async () => {

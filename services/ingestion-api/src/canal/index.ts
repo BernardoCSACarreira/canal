@@ -3,6 +3,8 @@ export type { CanalBuffer } from "./buffer-segment.js";
 export { InMemoryCanalBuffer } from "./buffer-segment.js";
 export type { BufferedIngestEvent, BufferedIngestRecord, EventBufferMetrics } from "./event-buffer.js";
 export { P1LocalEventBuffer } from "./event-buffer.js";
+export type { CheckpointCursor, CheckpointStore } from "./checkpoint-store.js";
+export { P1LocalCheckpointStore } from "./checkpoint-store.js";
 export { Tier1SyntheticGenerator } from "./fake-generator.js";
 export { Tier1FakeSink } from "./fake-sink.js";
 export { runTier1SyntheticPipelineStub } from "./synthetic-pipeline.js";

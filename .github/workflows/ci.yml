@@ -75,3 +75,21 @@ jobs:
         run: |
           echo "Path filter outputs: contracts=${{ needs.changes.outputs.contracts }} ingestion_ui=${{ needs.changes.outputs.ingestion_ui }} ingestion_api=${{ needs.changes.outputs.ingestion_api }} shared=${{ needs.changes.outputs.shared }}"
           echo "All ingestion CI jobs finished successfully."
+
+      # Tier-1 synthetic pipeline stub must stay green on main even when path filters skip the full ingestion-api job.
+      - uses: actions/checkout@v4
+        if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+
+      - uses: actions/setup-node@v4
+        if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: services/ingestion-api/package-lock.json
+
+      - name: Synthetic pipeline smoke (tier-1 stub)
+        if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+        working-directory: services/ingestion-api
+        run: |
+          npm ci --include=dev
+          npm run test:synthetic-smoke

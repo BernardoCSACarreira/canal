@@ -9,16 +9,18 @@
 
 ## 1. System boundary
 
+**Default (split stack, policy-aligned):** the HTTP contract is still one OpenAPI file, but **implementations are split** — Go owns the batch edge; Python owns operator control surfaces.
+
 ```
-Client / connector
-    │  HTTPS
-    ▼
-ingestion-api  —  POST /v1/events  (batch accept, 202 + dedupe metadata)
-              —  GET  /health
-              —  GET  /v1/stream   (stub / 501 — not Phase 1 dependency)
-              —  GET  /v1/control/pipeline  (operator read model: stages + adapter placeholders)
-              —  GET  /v1/control/canal/segments  (canal buffer segment list)
+Client / connector                          Operator (browser) / ingestion-ui
+    │  HTTPS                                      │  same-origin fetch (Vite dev: path-aware proxy)
+    ▼                                             ▼
+ingestion-edge-go  —  POST /v1/events            ingestion-control-plane  —  GET /v1/control/pipeline
+                  —  GET  /health                                         —  GET /v1/control/canal/segments
+                  —  GET  /v1/stream (stub / 501)                          —  /v1/adapter-instances …
 ```
+
+**Legacy (single process):** `services/ingestion-api` (TypeScript) may still serve **all** of the above routes behind one origin for transitional dev or parity tests — see §5.
 
 Example JSON for the control read paths: [`control-api-read-models.md`](./control-api-read-models.md).
 
@@ -59,5 +61,5 @@ Operator surfaces MUST follow tier and honesty rules in [`docs/product/connector
 
 - **Normative contract** remains the OpenAPI file referenced in section 1; **implementation language is not** defined by this doc.
 - **Company policy:** Python for control plane, Go for data plane services, TypeScript **only** for web frontends — see [`language-platform-policy.md`](./language-platform-policy.md).
-- **This repo today:** `services/ingestion-api` is a **Phase 1 TypeScript scaffold** under the time-bounded exception documented in that policy; it exists to validate the HTTP contract and operator UX before a production-grade Go edge is introduced.
+- **This repo today:** **Default path** is **`ingestion-edge-go` (data plane)** + **`ingestion-control-plane` (Python control)** + **`ingestion-ui`** with split proxies / compose (see [`diagrams.md`](./diagrams.md) §1). `services/ingestion-api` remains a **Phase 1 TypeScript combined scaffold** under the same time-bounded policy exception — useful for **legacy single-backend dev** or contract parity until it is removed; **do not** treat it as the long-term edge.
 - **Merges that expand server-side TypeScript** or change ingestion semantics require the [mainline architecture review](../governance/mainline-merge-architecture-review.md) checklist (CTO + QA + product).

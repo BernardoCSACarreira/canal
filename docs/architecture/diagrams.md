@@ -19,26 +19,27 @@ flowchart LR
   end
 
   subgraph edge["Edge & UI (this repo)"]
-    API["ingestion-api\n(TypeScript / Fastify)\nPhase 1 scaffold"]
     UI["ingestion-ui\n(React / Vite)"]
-    GoEdge["ingestion-edge-go\n(Go)\nparallel implementation"]
-    CP["ingestion-control-plane\n(Python / FastAPI)\nread models + adapter store"]
+    GoEdge["ingestion-edge-go\n(Go)\ndata plane"]
+    CP["ingestion-control-plane\n(Python / FastAPI)\ncontrol plane"]
+    TS["ingestion-api\n(TypeScript)\nlegacy combined"]
   end
 
   Contract["ingestion-v1 OpenAPI\n(single contract)"]
 
-  Conn -->|"HTTPS POST /v1/events\nGET /health"| API
-  Op -->|"same-origin fetch\n/proxy to API"| UI
-  UI --> API
+  Conn -->|"HTTPS\nPOST /v1/events\nGET /health"| GoEdge
+  Op -->|"dev: path-aware proxy"| UI
+  UI -->|"POST /v1/events\nGET /health\nGET /v1/stream"| GoEdge
+  UI -->|"GET /v1/control/*\nadapter CRUD"| CP
 
-  API -.->|"conformance"| Contract
   GoEdge -.->|"conformance"| Contract
-  CP -.->|"aligned responses"| Contract
+  CP -.->|"conformance"| Contract
+  TS -.->|"legacy single origin"| Contract
 
-  Conn -.->|"future / alt edge"| GoEdge
+  UI -.->|"legacy:\nVITE_API_PROXY_TARGET"| TS
 ```
 
-**Notes:** Default dev experience often colocates UI and API (Vite proxy). Python control plane can run on its own port for split-stack dev; until a gateway splits traffic, TS and Python may expose overlapping routes—responses must stay aligned per `control-api-read-models.md`.
+**Notes:** Default local dev runs **Go + Python** behind the UI proxy (see `apps/ingestion-ui/README.md`). `ingestion-api` remains an optional **single-host** fallback when `VITE_API_PROXY_TARGET` is set; keep TS and Python **read-model responses aligned** per `control-api-read-models.md` while the TS service exists.
 
 ---
 
@@ -106,20 +107,23 @@ sequenceDiagram
 
 ## 4. Operator read paths and adapter instances
 
-What the operator wizard consumes today (TS service registers these routes; Python service mirrors read models and adapter CRUD shape).
+What the operator wizard consumes today (**split stack**): control + adapter routes hit **Python**; batch + edge health hit **Go**. Legacy mode keeps all routes on **TS** behind one proxy target.
 
 ```mermaid
 flowchart TB
   UI["ingestion-ui\nOperatorWizardShell, etc."]
   Conn2["External connectors"]
 
-  subgraph TSAPI["ingestion-api (Fastify)"]
+  subgraph GoEdge["ingestion-edge-go"]
     H["GET /health"]
+    E["POST /v1/events"]
+    ST["GET /v1/stream\nstub"]
+  end
+
+  subgraph CP["ingestion-control-plane"]
     P["GET /v1/control/pipeline"]
     S["GET /v1/control/canal/segments"]
     L["GET/POST/PATCH/DELETE\n/v1/adapter-instances…"]
-    E["POST /v1/events"]
-    ST["GET /v1/stream\nstub / not P1 dependency"]
   end
 
   UI --> H
@@ -167,7 +171,7 @@ flowchart TB
   end
 
   subgraph exception["Time-bounded exception"]
-    TS["ingestion-api TS scaffold\nexit when Go edge + tests reach parity"]
+    TS["ingestion-api TS scaffold\nbeing retired; split stack is default"]
   end
 
   CP2 --- PY2["ingestion-control-plane"]
@@ -183,3 +187,4 @@ flowchart TB
 | Date       | Change                                      |
 | ---------- | ------------------------------------------- |
 | 2026-05-03 | Initial diagrams for CAN-67 (CTO heartbeat) |
+| 2026-05-03 | System context + §4 updated for CAN-69 split-stack default (Go + Python) |

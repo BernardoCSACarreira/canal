@@ -11,11 +11,7 @@ import type {
   IngestBatchRequest,
   PipelineSummaryRead,
 } from '../api/types'
-import {
-  catalogTierForIngestionPath,
-  catalogTierKindKey,
-  type IngestionPathTier,
-} from './constants'
+import { catalogTierForIngestionPath, type IngestionPathTier } from './constants'
 import { OperatorControlSummary } from './OperatorControlSummary'
 import { SloBadgeStrip, TierBadge } from './TierSloBadges'
 
@@ -133,8 +129,8 @@ function PathStep({ onPick }: { onPick: (tier: IngestionPathTier) => void }) {
       <p style={wiz.qaHint}>
         <strong>For QA (B3):</strong> “Tier 2 path” means the middle card below —{' '}
         <strong>Managed real connector</strong> — not a Paperclip ticket link. Step 2{' '}
-        <strong>Configure</strong> then shows the connector list as{' '}
-        <strong>round radio buttons</strong> after the control API loads.
+        <strong>Configure</strong> then shows radios inside the <strong>Adapters</strong> card
+        after the control API loads.
       </p>
       <div style={wiz.cards}>
         <button type="button" style={wiz.card} onClick={() => onPick(1)}>
@@ -265,7 +261,7 @@ function ConfigureStep({
             <p style={wiz.muted}>Loading control read models…</p>
             <p style={wiz.qaHint}>
               When the load finishes, the <strong>connector picker</strong> appears as{' '}
-              <strong>radio buttons</strong> under the pipeline summary (B3).
+              <strong>radio buttons</strong> in the <strong>Adapters</strong> card (B3).
             </p>
           </>
         )}
@@ -277,18 +273,12 @@ function ConfigureStep({
           </p>
         )}
         {control.status === 'ok' && (
-          <>
-            <OperatorControlSummary
-              pipeline={control.pipeline}
-              canal={control.canal}
-              highlightCatalogTier={catalogTier}
-            />
-            <AdapterCatalogPicker
-              adapters={filteredAdapters}
-              value={selectedAdapterId}
-              onChange={setSelectedAdapterId}
-            />
-          </>
+          <OperatorControlSummary
+            pipeline={control.pipeline}
+            canal={control.canal}
+            highlightCatalogTier={catalogTier}
+            adapterPicker={{ value: selectedAdapterId, onChange: setSelectedAdapterId }}
+          />
         )}
         <label style={wiz.label}>
           Source
@@ -342,10 +332,10 @@ function ConfigureStep({
           <p style={wiz.muted}>Loading control read models…</p>
           <p style={wiz.qaHint}>
             <strong>Looking for the B3 picker?</strong> It is a <strong>radio list</strong>{' '}
-            (circular radio controls, not a dial). It appears <strong>below</strong> the
-            pipeline summary once <code style={wiz.subCode}>GET /v1/control/pipeline</code>{' '}
-            succeeds. If this never finishes, check the dev proxy / ingestion API (sidebar
-            hint in classic UI).
+            (circular radio controls, not a dial). It appears in the <strong>Adapters</strong>{' '}
+            card once <code style={wiz.subCode}>GET /v1/control/pipeline</code> succeeds. If
+            this never finishes, check the dev proxy / ingestion API (sidebar hint in classic
+            UI).
           </p>
         </>
       )}
@@ -370,18 +360,12 @@ function ConfigureStep({
         </div>
       )}
       {control.status === 'ok' && (
-        <>
-          <OperatorControlSummary
-            pipeline={control.pipeline}
-            canal={control.canal}
-            highlightCatalogTier={catalogTier}
-          />
-          <AdapterCatalogPicker
-            adapters={filteredAdapters}
-            value={selectedAdapterId}
-            onChange={setSelectedAdapterId}
-          />
-        </>
+        <OperatorControlSummary
+          pipeline={control.pipeline}
+          canal={control.canal}
+          highlightCatalogTier={catalogTier}
+          adapterPicker={{ value: selectedAdapterId, onChange: setSelectedAdapterId }}
+        />
       )}
       <WizardStepNav
         onBack={onBack}
@@ -397,63 +381,6 @@ function ConfigureStep({
         }}
       />
     </section>
-  )
-}
-
-function AdapterCatalogPicker({
-  adapters,
-  value,
-  onChange,
-}: {
-  adapters: AdapterInstancePlaceholder[]
-  value: string | null
-  onChange: (id: string) => void
-}) {
-  if (adapters.length === 0) return null
-  return (
-    <fieldset style={wiz.fs} aria-describedby="connector-picker-desc">
-      <legend style={wiz.fsLegend}>Choose connector instance (radio list)</legend>
-      <h3 id="connector-picker-heading" style={wiz.h3}>
-        Connector picker (B3)
-      </h3>
-      <p id="connector-picker-desc" style={wiz.muted}>
-        OpenAPI <code style={wiz.subCode}>catalogTier</code> maps to B3 keys{' '}
-        <code style={wiz.subCode}>tier1_synthetic</code> vs{' '}
-        <code style={wiz.subCode}>tier2_real</code> (see{' '}
-        <code style={wiz.subCode}>catalogTierKindKey</code>).
-      </p>
-      <div style={wiz.pickerCol} role="radiogroup" aria-labelledby="connector-picker-heading">
-        {adapters.map((a) => {
-          const kind = catalogTierKindKey(a.catalogTier)
-          const sel = value === a.id
-          return (
-            <label
-              key={a.id}
-              style={{
-                ...wiz.pickRow,
-                ...(sel ? { borderColor: 'var(--accent)' } : {}),
-              }}
-            >
-              <input
-                type="radio"
-                name="adapter-catalog"
-                value={a.id}
-                checked={sel}
-                onChange={() => onChange(a.id)}
-                data-catalog-kind={kind}
-                aria-label={`${a.displayName}, catalog ${a.catalogTier}, ${kind}`}
-              />
-              <span style={wiz.pickBody}>
-                <strong>{a.displayName}</strong>
-                <span style={wiz.pickMeta}>
-                  {a.stageKey} · <code style={wiz.subCode}>{a.catalogTier}</code> · {kind}
-                </span>
-              </span>
-            </label>
-          )
-        })}
-      </div>
-    </fieldset>
   )
 }
 
@@ -748,7 +675,6 @@ const wiz: Record<string, CSSProperties> = {
     gap: '1rem',
   },
   h2: { margin: 0, fontSize: '1.15rem' },
-  h3: { margin: 0, fontSize: '1rem', fontWeight: 600 },
   muted: { margin: 0, color: 'var(--muted)', lineHeight: 1.5 },
   qaHint: {
     margin: 0,
@@ -853,31 +779,6 @@ const wiz: Record<string, CSSProperties> = {
     fontSize: '0.9rem',
     lineHeight: 1.5,
   },
-  fs: {
-    margin: 0,
-    padding: '0.65rem 0.85rem',
-    borderRadius: 'var(--radius)',
-    border: '1px solid var(--border)',
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '0.55rem',
-  },
-  fsLegend: { fontSize: '0.9rem', fontWeight: 600, padding: '0 0.25rem' },
-  pickerCol: { display: 'flex', flexDirection: 'column', gap: '0.45rem' },
-  pickRow: {
-    display: 'flex',
-    gap: '0.55rem',
-    alignItems: 'flex-start',
-    padding: '0.55rem 0.65rem',
-    borderRadius: 'var(--radius)',
-    borderWidth: 1,
-    borderStyle: 'solid',
-    borderColor: 'var(--border)',
-    cursor: 'pointer',
-    background: 'var(--bg)',
-  },
-  pickBody: { display: 'flex', flexDirection: 'column', gap: '0.2rem' },
-  pickMeta: { fontSize: '0.8rem', color: 'var(--muted)' },
   pre: {
     margin: 0,
     padding: '1rem',

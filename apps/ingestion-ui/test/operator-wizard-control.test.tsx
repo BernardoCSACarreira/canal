@@ -88,7 +88,7 @@ describe('Operator wizard control API', () => {
       expect(screen.getByText(/contract/i)).toBeInTheDocument()
       expect(screen.getAllByText(/Managed sink \(test stub\)/i).length).toBeGreaterThanOrEqual(1)
     })
-    expect(screen.getByRole('heading', { name: /connector picker \(b3\)/i })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: /adapters \(tier-2\) — pick one/i })).toBeInTheDocument()
     expect(screen.getByRole('radiogroup')).toBeInTheDocument()
     expect(document.querySelector('input[data-catalog-kind="tier2_real"]')).toBeChecked()
 

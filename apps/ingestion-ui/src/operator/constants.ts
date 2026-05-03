@@ -31,15 +31,17 @@ export const INGESTION_PATH_HONESTY_KEY: Record<IngestionPathTier, string> = {
   3: 'ingestion_path.tier_3_byo.honesty',
 }
 
+/** Must match `docs/product/connector-tier-ux-spec.md` §3.2. */
 export const TIER_LABEL: Record<IngestionPathTier, string> = {
-  1: 'Tier 1 — synthetic / pilot-labeled path',
-  2: 'Tier 2 — managed real connector',
-  3: 'Tier 3 — BYO / community connector',
+  1: 'Tier 1 — Synthetic / pilot-labeled',
+  2: 'Tier 2 — Managed real connector',
+  3: 'Tier 3 — BYO / community',
 }
 
+/** Must match `docs/product/connector-tier-ux-spec.md` §3.2. */
 export const SLO_SUMMARY: Record<IngestionPathTier, string> = {
   1:
-    'Pilot program labeling on this synthetic path only — diagnostic, not a contractual SLO.',
+    'Pilot program labeling on this path only — diagnostic, not a contractual SLO.',
   2: 'No pilot labeling — reliability follows standard connector operations.',
   3: 'No pilot labeling — best-effort; availability and latency are not guaranteed.',
 }

@@ -19,6 +19,10 @@ cd apps/ingestion-ui && npm install && npm run dev
 
 The Vite dev server proxies `/health` and `/v1` to `http://127.0.0.1:8080` (override with `VITE_API_PROXY_TARGET`).
 
+## QA (operator wizard)
+
+With the dev server running, open **`/?operatorWizard=1`** (and `VITE_OPERATOR_WIZARD=true` in production builds if the sidebar promo is hidden). Confirm path badges use pilot / standard semantic tokens, honesty lines match `docs/product/connector-tier-ux-spec.md` §3.2, and `data-badge-key` / `data-honesty-key` match §2.2. Exercise the classic shell tier fieldset on **Send batch** and **Live stream** callouts for pilot vs standard.
+
 ## Build
 
 ```bash

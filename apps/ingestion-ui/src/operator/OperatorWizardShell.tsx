@@ -2,7 +2,6 @@ import { useCallback, useMemo, useState, type CSSProperties } from 'react'
 import { postIngestBatch } from '../api/client'
 import type { IngestBatchRequest } from '../api/types'
 import type { IngestionPathTier } from './constants'
-import { isTierUxPrototypeActive } from './tierUxPrototypeGate'
 import { SloBadgeStrip, TierBadge } from './TierSloBadges'
 
 type WizardStep = 'path' | 'configure' | 'review'
@@ -43,18 +42,7 @@ export function OperatorWizardShell({ onExit }: { onExit: () => void }) {
           <h1 style={wiz.title}>Guided ingestion</h1>
           <p style={wiz.sub}>
             Operator wizard shell — tier and pilot-program honesty labels are
-            explicit per path.
-            {isTierUxPrototypeActive() && (
-              <>
-                {' '}
-                <em style={{ color: 'var(--tier-pilot-fg)' }}>
-                  Tier UX prototype on
-                </em>{' '}
-                (<code>?tierUxPrototype=1</code> or{' '}
-                <code>VITE_TIER_UX_PROTOTYPE=true</code>) — not merge-ready until
-                design signs off on CAN-28.
-              </>
-            )}
+            explicit per path (CAN-28 design handoff + connector-tier UX spec).
           </p>
         </div>
         <button type="button" style={wiz.ghostBtn} onClick={onExit}>

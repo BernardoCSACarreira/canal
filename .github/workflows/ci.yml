@@ -1,3 +1,7 @@
+# CI hardening (see CAN-49): pin the hosted runner image so OS upgrades cannot
+# silently change glibc/tooling; keep a tiny always-on smoke job so runner or
+# Node setup regressions fail even when path-filtered jobs are skipped; weekly
+# schedule catches dependency drift on main between PRs.
 name: CI
 
 on:
@@ -6,6 +10,8 @@ on:
   pull_request:
     branches: [main, master]
   workflow_dispatch:
+  schedule:
+    - cron: "0 12 * * 1"
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -15,9 +21,23 @@ permissions:
   contents: read
 
 jobs:
+  runner-smoke:
+    name: Runner / Node smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - name: Verify toolchain
+        run: |
+          node -p "process.version"
+          test -f .nvmrc
+          node -e "console.log('runner smoke ok')"
+
   changes:
     name: Path filter
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       contracts: ${{ steps.pick.outputs.contracts }}
       ingestion_ui: ${{ steps.pick.outputs.ingestion_ui }}
@@ -59,7 +79,7 @@ jobs:
     name: contracts (OpenAPI validate)
     needs: [changes]
     if: needs.changes.outputs.contracts == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -72,7 +92,7 @@ jobs:
     name: ingestion-ui (test + lint + build)
     needs: [changes]
     if: needs.changes.outputs.ingestion_ui == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: apps/ingestion-ui
@@ -96,7 +116,7 @@ jobs:
     name: ingestion-api (test + build)
     needs: [changes]
     if: needs.changes.outputs.ingestion_api == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: services/ingestion-api

@@ -1,6 +1,6 @@
 # Connector tier — UX spec (Phase 1 interim)
 
-**Status:** Interim product spec (CPO). **Design approved** on CAN-28 (Product Design pass).  
+**Status:** Interim product spec (CPO). **Spec approved** by Product Design on CAN-28 (2026-05-03) — badge keys §2 frozen for Phase 1; FE may unblock CAN-27.  
 **Goal:** Unblock frontend on [CAN-27](/CAN/issues/CAN-27) without external Figma.  
 **Related:** [CAN-8](/CAN/issues/CAN-8), [CAN-28](/CAN/issues/CAN-28), charter connector tiers ([CAN-2](/CAN/issues/CAN-2)).  
 **Implementation supplement:** [docs/design/CAN-28-operator-ui-phase1.md](../design/CAN-28-operator-ui-phase1.md) (a11y, token map, code pointers).

@@ -1,6 +1,6 @@
 # @canal/ingestion-ui
 
-Minimal shell for Phase 1 ingestion MVP: health check, batch POST to `/v1/events`, and a documented stub probe for `/v1/stream`. Shapes follow `contracts/ingestion-v1.openapi.yaml`. Operator UX patterns (connector tier, pilot SLO honesty) are specified in [`docs/design/CAN-28-operator-ui-phase1.md`](../../docs/design/CAN-28-operator-ui-phase1.md).
+Minimal shell for Phase 1 ingestion MVP: health check, batch POST to `/v1/events`, and a documented stub probe for `/v1/stream`. Shapes follow `contracts/ingestion-v1.openapi.yaml`. Operator UX: **badge keys + copy + hierarchy** — [`docs/product/connector-tier-ux-spec.md`](../../docs/product/connector-tier-ux-spec.md). Engineering supplement (a11y, tokens) — [`docs/design/CAN-28-operator-ui-phase1.md`](../../docs/design/CAN-28-operator-ui-phase1.md).
 
 ## Develop
 

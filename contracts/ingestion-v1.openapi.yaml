@@ -6,6 +6,11 @@ info:
     HTTP-first ingestion contract for Phase 1 MVP. Streaming delivery (SSE/WebSocket)
     is reserved for a follow-on iteration; `GET /v1/stream` is a documented stub.
 
+    Product pipeline stage names and ordering (including “no indentation semantics”)
+    are frozen in company issue [CAN-30](/CAN/issues/CAN-30) issue document
+    `data-architecture` §2.3 (rev 3); see also RFC
+    `docs/rfc-phase1-buffer-checkpoint-provider-matrix.md` §1.5.
+
 servers:
   - url: http://localhost:8080
     description: Local development

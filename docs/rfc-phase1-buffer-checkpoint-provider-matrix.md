@@ -3,7 +3,7 @@
 **Status:** draft (Phase 1 scope)  
 **Parent:** [CAN-24](/CAN/issues/CAN-24)  
 **Ticket:** [CAN-26](/CAN/issues/CAN-26)  
-**Related:** [CAN-2](/CAN/issues/CAN-2) phasing · [CAN-5](/CAN/issues/CAN-5) charter stack · [CAN-7](/CAN/issues/CAN-7) bus neutrality
+**Related:** [CAN-2](/CAN/issues/CAN-2) phasing · [CAN-5](/CAN/issues/CAN-5) charter stack · [CAN-7](/CAN/issues/CAN-7) bus neutrality · [CAN-30](/CAN/issues/CAN-30) architecture (board-approved) · [CAN-33](/CAN/issues/CAN-33) RFC/OpenAPI alignment
 
 ## 1. Purpose
 
@@ -13,6 +13,23 @@ Define a shared vocabulary and **capability matrix** for two ingestion control-p
 2. **Checkpoint** — where consumer progress is stored for restart, replay, and scale-out coordination.
 
 The matrix lets backend and platform engineers pick implementations (local defaults in Phase 1 vs remote buses later) **without reopening product scope**: rows encode what the product may assume; gaps are explicit non-goals for Phase 1.
+
+## 1.5 Product end-to-end topology (board-approved, CAN-30)
+
+**Ordering rule:** stages are **sequential**. ASCII or markdown **indentation must not** be read as hierarchy; only explicit numbering or arrows define semantics (see [CAN-30](/CAN/issues/CAN-30) issue document `data-architecture`, §2.3, rev 3).
+
+**Numbered pipeline**
+
+1. Source  
+2. Source Connector  
+3. Source Event Buffer  
+4. Source Canonical Event Serializer  
+5. Event Buffer  
+6. Sink Event Serializer  
+7. Sink Event Buffer  
+8. Sink Connector  
+
+**Mapping to this RFC:** **Event Buffer** is the primary **Buffer** in the matrix sense (core durability, backpressure, replay anchor). **Source Event Buffer** and **Sink Event Buffer** are additional buffer surfaces for upstream and downstream resilience. **Checkpoint** consumers are expected for **Event Buffer** readers and optionally for **Sink Event Buffer** consumer groups.
 
 ## 2. Evaluation dimensions
 
@@ -78,3 +95,4 @@ These are engineering choices inside Phase 1 and do not change the **dimensions*
 | Date | Author | Note |
 |------|--------|------|
 | 2026-05-03 | CTO agent | Initial skeleton + matrix per [CAN-26](/CAN/issues/CAN-26) |
+| 2026-05-03 | CTO agent | §1.5 topology crosswalk per board-approved [CAN-30](/CAN/issues/CAN-30) + [CAN-33](/CAN/issues/CAN-33) |

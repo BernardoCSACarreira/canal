@@ -18,6 +18,7 @@ servers:
 tags:
   - name: Health
   - name: Ingestion
+  - name: Control
 
 paths:
   /health:
@@ -73,6 +74,39 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/control/pipeline:
+    get:
+      tags: [Control]
+      summary: Pipeline summary and adapter placeholders for operator UI
+      operationId: getControlPipeline
+      description: |
+        Read model listing the board-approved sequential pipeline (CAN-30 / RFC §1.5) and
+        placeholder adapter instances with **catalog tier** metadata (`tier-1` … `tier-3`
+        charter taxonomy). Deterministic scaffold data until connector registry is wired.
+      responses:
+        "200":
+          description: Current pipeline read model
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PipelineSummaryRead"
+
+  /v1/control/canal/segments:
+    get:
+      tags: [Control]
+      summary: Canal buffer segments aligned to the pipeline topology
+      operationId: getControlCanalSegments
+      description: |
+        Read model of logical **buffer** segments (source / core / sink event buffers)
+        for wizard and operator diagrams. Provider profile is Phase 1 local only.
+      responses:
+        "200":
+          description: Canal segment list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CanalSegmentsRead"
 
 components:
   schemas:
@@ -154,3 +188,85 @@ components:
           type: string
         message:
           type: string
+
+    CatalogTier:
+      type: string
+      description: >
+        Charter / implementation taxonomy for ingestion path (wizard lanes). Distinct from
+        commercial `ConnectorTier` (`pilot` / `standard`). See connector-tier-ux-spec §2.2.
+      enum: [tier-1, tier-2, tier-3]
+
+    PipelineStageRead:
+      type: object
+      required: [ordinal, key, title]
+      properties:
+        ordinal:
+          type: integer
+          minimum: 1
+          maximum: 8
+        key:
+          type: string
+          description: Stable machine key for the stage
+        title:
+          type: string
+          description: Human-readable stage label
+
+    AdapterInstancePlaceholder:
+      type: object
+      required: [id, stageKey, displayName, catalogTier]
+      properties:
+        id:
+          type: string
+        stageKey:
+          type: string
+        displayName:
+          type: string
+        catalogTier:
+          $ref: "#/components/schemas/CatalogTier"
+
+    PipelineSummaryRead:
+      type: object
+      required: [contractVersion, stages, adapterInstances]
+      properties:
+        contractVersion:
+          type: string
+          description: OpenAPI `info.version` this read model is aligned with
+          example: "0.1.0"
+        stages:
+          type: array
+          minItems: 8
+          maxItems: 8
+          items:
+            $ref: "#/components/schemas/PipelineStageRead"
+        adapterInstances:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdapterInstancePlaceholder"
+
+    CanalSegmentRead:
+      type: object
+      required: [id, kind, label, followsStageOrdinal, providerProfile]
+      properties:
+        id:
+          type: string
+        kind:
+          type: string
+          enum: [buffer]
+        label:
+          type: string
+        followsStageOrdinal:
+          type: integer
+          minimum: 1
+          maximum: 8
+        providerProfile:
+          type: string
+          enum: [p1-local]
+
+    CanalSegmentsRead:
+      type: object
+      required: [segments]
+      properties:
+        segments:
+          type: array
+          items:
+            $ref: "#/components/schemas/CanalSegmentRead"

@@ -89,6 +89,42 @@ test("POST /v1/events marks duplicate ids on replay (idempotency)", async () => 
   });
 });
 
+test("GET /v1/control/pipeline returns PipelineSummaryRead shape", async () => {
+  await withApp(async (app) => {
+    const res = await app.inject({ method: "GET", url: "/v1/control/pipeline" });
+    assert.equal(res.statusCode, 200);
+    const body = res.json() as {
+      contractVersion: string;
+      stages: { ordinal: number; key: string; title: string }[];
+      adapterInstances: { id: string; stageKey: string; displayName: string; catalogTier: string }[];
+    };
+    assert.equal(body.contractVersion, "0.1.0");
+    assert.equal(body.stages.length, 8);
+    assert.equal(body.stages[0].key, "source");
+    assert.equal(body.stages[7].key, "sink_connector");
+    assert.ok(body.adapterInstances.length >= 1);
+    const tiers = new Set(body.adapterInstances.map((a) => a.catalogTier));
+    assert.ok(tiers.has("tier-1"));
+    assert.ok(tiers.has("tier-2"));
+    assert.ok(tiers.has("tier-3"));
+  });
+});
+
+test("GET /v1/control/canal/segments returns CanalSegmentsRead shape", async () => {
+  await withApp(async (app) => {
+    const res = await app.inject({ method: "GET", url: "/v1/control/canal/segments" });
+    assert.equal(res.statusCode, 200);
+    const body = res.json() as {
+      segments: { id: string; kind: string; followsStageOrdinal: number; providerProfile: string }[];
+    };
+    assert.equal(body.segments.length, 3);
+    for (const s of body.segments) {
+      assert.equal(s.kind, "buffer");
+      assert.equal(s.providerProfile, "p1-local");
+    }
+  });
+});
+
 test("POST /v1/events returns 400 for invalid body", async () => {
   await withApp(async (app) => {
     const cases: { name: string; payload: unknown }[] = [

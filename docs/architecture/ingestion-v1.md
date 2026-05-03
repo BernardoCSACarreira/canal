@@ -15,7 +15,11 @@ Client / connector
 ingestion-api  —  POST /v1/events  (batch accept, 202 + dedupe metadata)
               —  GET  /health
               —  GET  /v1/stream   (stub / 501 — not Phase 1 dependency)
+              —  GET  /v1/control/pipeline  (operator read model: stages + adapter placeholders)
+              —  GET  /v1/control/canal/segments  (canal buffer segment list)
 ```
+
+Example JSON for the control read paths: [`control-api-read-models.md`](./control-api-read-models.md).
 
 Downstream buffer, checkpoint, and processing implementations MUST conform to Phase 1 assumptions in [`docs/rfc-phase1-buffer-checkpoint-provider-matrix.md`](../rfc-phase1-buffer-checkpoint-provider-matrix.md) unless a feature flag explicitly selects a future driver.
 

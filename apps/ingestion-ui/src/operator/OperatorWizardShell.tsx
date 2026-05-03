@@ -130,6 +130,12 @@ function PathStep({ onPick }: { onPick: (tier: IngestionPathTier) => void }) {
         describes diagnostic expectations, not a contractual latency or
         availability SLO. Tiers 2 and 3 keep standard / best-effort honesty copy.
       </p>
+      <p style={wiz.qaHint}>
+        <strong>For QA (B3):</strong> “Tier 2 path” means the middle card below —{' '}
+        <strong>Managed real connector</strong> — not a Paperclip ticket link. Step 2{' '}
+        <strong>Configure</strong> then shows the connector list as{' '}
+        <strong>round radio buttons</strong> after the control API loads.
+      </p>
       <div style={wiz.cards}>
         <button type="button" style={wiz.card} onClick={() => onPick(1)}>
           <TierBadge tier={1} />
@@ -255,12 +261,19 @@ function ConfigureStep({
           <SloBadgeStrip tier={1} />
         </div>
         {control.status === 'loading' && (
-          <p style={wiz.muted}>Loading control read models…</p>
+          <>
+            <p style={wiz.muted}>Loading control read models…</p>
+            <p style={wiz.qaHint}>
+              When the load finishes, the <strong>connector picker</strong> appears as{' '}
+              <strong>radio buttons</strong> under the pipeline summary (B3).
+            </p>
+          </>
         )}
         {control.status === 'error' && (
           <p style={wiz.error}>
             Control API: {control.message} — you can still send a synthetic batch;
-            review will not include control snapshots.
+            review will not include control snapshots. Without a successful load, the
+            radio connector list stays hidden.
           </p>
         )}
         {control.status === 'ok' && (
@@ -325,12 +338,25 @@ function ConfigureStep({
         model (CAN-51). Credential pickers ship in later slices.
       </p>
       {control.status === 'loading' && (
-        <p style={wiz.muted}>Loading control read models…</p>
+        <>
+          <p style={wiz.muted}>Loading control read models…</p>
+          <p style={wiz.qaHint}>
+            <strong>Looking for the B3 picker?</strong> It is a <strong>radio list</strong>{' '}
+            (circular radio controls, not a dial). It appears <strong>below</strong> the
+            pipeline summary once <code style={wiz.subCode}>GET /v1/control/pipeline</code>{' '}
+            succeeds. If this never finishes, check the dev proxy / ingestion API (sidebar
+            hint in classic UI).
+          </p>
+        </>
       )}
       {control.status === 'error' && (
         <div style={wiz.empty}>
           <p style={{ margin: 0, fontWeight: 600 }}>Could not load control read models</p>
           <p style={wiz.error}>{control.message}</p>
+          <p style={wiz.muted}>
+            The connector radio list is only shown after a successful load. Use Retry, or
+            fix API reachability, then continue.
+          </p>
           <button
             type="button"
             style={wiz.secondaryBtn}
@@ -385,15 +411,18 @@ function AdapterCatalogPicker({
 }) {
   if (adapters.length === 0) return null
   return (
-    <fieldset style={wiz.fs}>
-      <legend style={wiz.fsLegend}>Connector instance (catalog)</legend>
-      <p style={wiz.muted}>
+    <fieldset style={wiz.fs} aria-describedby="connector-picker-desc">
+      <legend style={wiz.fsLegend}>Choose connector instance (radio list)</legend>
+      <h3 id="connector-picker-heading" style={wiz.h3}>
+        Connector picker (B3)
+      </h3>
+      <p id="connector-picker-desc" style={wiz.muted}>
         OpenAPI <code style={wiz.subCode}>catalogTier</code> maps to B3 keys{' '}
         <code style={wiz.subCode}>tier1_synthetic</code> vs{' '}
         <code style={wiz.subCode}>tier2_real</code> (see{' '}
         <code style={wiz.subCode}>catalogTierKindKey</code>).
       </p>
-      <div style={wiz.pickerCol}>
+      <div style={wiz.pickerCol} role="radiogroup" aria-labelledby="connector-picker-heading">
         {adapters.map((a) => {
           const kind = catalogTierKindKey(a.catalogTier)
           const sel = value === a.id
@@ -412,6 +441,7 @@ function AdapterCatalogPicker({
                 checked={sel}
                 onChange={() => onChange(a.id)}
                 data-catalog-kind={kind}
+                aria-label={`${a.displayName}, catalog ${a.catalogTier}, ${kind}`}
               />
               <span style={wiz.pickBody}>
                 <strong>{a.displayName}</strong>
@@ -718,7 +748,18 @@ const wiz: Record<string, CSSProperties> = {
     gap: '1rem',
   },
   h2: { margin: 0, fontSize: '1.15rem' },
+  h3: { margin: 0, fontSize: '1rem', fontWeight: 600 },
   muted: { margin: 0, color: 'var(--muted)', lineHeight: 1.5 },
+  qaHint: {
+    margin: 0,
+    padding: '0.55rem 0.65rem',
+    borderRadius: 'var(--radius)',
+    border: '1px dashed var(--border)',
+    background: 'var(--bg)',
+    fontSize: '0.88rem',
+    lineHeight: 1.45,
+    color: 'var(--text)',
+  },
   cards: {
     display: 'grid',
     gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',

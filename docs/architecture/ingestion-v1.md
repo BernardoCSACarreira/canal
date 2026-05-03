@@ -61,3 +61,15 @@ Operator surfaces MUST follow tier and honesty rules in [`docs/product/connector
 - **Company policy:** Python for control plane, Go for data plane services, TypeScript **only** for web frontends — see [`language-platform-policy.md`](./language-platform-policy.md).
 - **This repo today:** **Shipped path** is **`ingestion-edge-go` (data plane)** + **`ingestion-control-plane` (Python control)** + **`ingestion-ui`** with split proxies / compose (see [`diagrams.md`](./diagrams.md) §1).
 - **Merges that expand server-side TypeScript** or change ingestion semantics require the [mainline architecture review](../governance/mainline-merge-architecture-review.md) checklist (CTO + QA + product).
+
+### Operator UI: Vite + React (not Next.js) for Phase 1
+
+**Decision:** Phase 1 **`ingestion-ui`** is intentionally **Vite + React** (client-rendered SPA), not Next.js.
+
+**Why:**
+
+- The operator surface is a **thin shell** over existing HTTP APIs (`/v1/*`, `/health`) with **no product requirement for SSR/SSG** in Phase 1.
+- **Local split stack** is the default story: Vite’s **path-ordered dev proxy** cleanly forwards control-plane vs data-plane routes to different origins (see `apps/ingestion-ui/vite.config.ts` and `apps/ingestion-ui/README.md`).
+- Next.js would add **routing, deployment, and server-runtime** surface area without MVP ingestion benefit; it also nudges teams toward **server-side TypeScript**, which is constrained by [`language-platform-policy.md`](./language-platform-policy.md).
+
+**Revisit Next.js** if we later need first-class SSR/ISR, marketing pages in the same app, or a unified edge-hosted UI — that would be a deliberate architecture change and should go through the same mainline merge / review path as other stack expansions.

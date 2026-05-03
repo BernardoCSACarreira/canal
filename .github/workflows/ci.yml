@@ -53,7 +53,7 @@ jobs:
       ingestion_control_plane: ${{ steps.pick.outputs.ingestion_control_plane }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@v4
         if: github.event_name == 'pull_request'
         id: filter
         with:

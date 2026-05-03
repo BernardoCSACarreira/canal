@@ -22,6 +22,7 @@ Board and program leadership need a single place that states **what the ingestio
 | [`docs/product/connector-tier-ux-spec.md`](connector-tier-ux-spec.md) | Distinguishes `ConnectorTier` vs `IngestionPathTier` | Proposed follow-on fields (non-blocking) | **Normative for operator-facing honesty** in Phase 1 | Not a lineage catalog |
 | [`docs/design/CAN-28-operator-ui-phase1.md`](../design/CAN-28-operator-ui-phase1.md) | UI tokens and hierarchy | References OpenAPI for “what works” | Reinforces no implied realtime while stream is stub | N/A |
 | [`docs/rfc-phase1-buffer-checkpoint-provider-matrix.md`](../rfc-phase1-buffer-checkpoint-provider-matrix.md) | Buffer / checkpoint interfaces (engineering) | Conformance targets for future drivers | Operational posture (P1-local HA class), not a customer SLA | Replay anchors discussed as **engineering** concern |
+| [`docs/rfc-phase1-tier2-source-adapter.md`](../rfc-phase1-tier2-source-adapter.md) | Tier-2 source connector worker (charter path 2) | Idempotency + backoff + checkpoint advance vs HTTP `202` | Same honesty rules as other charter paths; no extra SLA claims | Failure-mode taxonomy for on-call |
 
 ---
 

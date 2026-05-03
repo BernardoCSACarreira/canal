@@ -3,7 +3,7 @@
 **Status:** draft (Phase 1 scope)  
 **Parent:** [CAN-24](/CAN/issues/CAN-24)  
 **Ticket:** [CAN-26](/CAN/issues/CAN-26)  
-**Related:** [CAN-2](/CAN/issues/CAN-2) phasing · [CAN-5](/CAN/issues/CAN-5) charter stack · [CAN-7](/CAN/issues/CAN-7) bus neutrality · [CAN-30](/CAN/issues/CAN-30) architecture (board-approved) · [CAN-33](/CAN/issues/CAN-33) RFC/OpenAPI alignment
+**Related:** [CAN-2](/CAN/issues/CAN-2) phasing · [CAN-5](/CAN/issues/CAN-5) charter stack · [CAN-7](/CAN/issues/CAN-7) bus neutrality · [CAN-30](/CAN/issues/CAN-30) architecture (board-approved) · [CAN-33](/CAN/issues/CAN-33) RFC/OpenAPI alignment · [CAN-50](/CAN/issues/CAN-50) tier-2 source adapter slice
 
 ## 1. Purpose
 
@@ -90,9 +90,23 @@ Backend MAY assume the following for Phase 1 code paths:
 
 These are engineering choices inside Phase 1 and do not change the **dimensions** above.
 
-## 7. Revision history
+## 7. Tier-2 managed source adapter (charter path 2)
+
+**Charter stack:** [CAN-5](/CAN/issues/CAN-5). **Wizard / honesty:** [`connector-tier-ux-spec.md`](./product/connector-tier-ux-spec.md) §2.2 `ingestion_path.tier_2_managed`.
+
+This row is the **adapter family** pointer for topology stages **Source** and **Source Connector** ([CAN-30](/CAN/issues/CAN-30) §1.5). Buffer and checkpoint matrices in §§3–4 apply to downstream stages; the adapter itself still **uses** a checkpoint store for upstream progress per Phase 1 stance.
+
+| Concern | Phase 1 engineering stance | Normative detail |
+|---------|---------------------------|------------------|
+| **Worker interface** | Poll / push ingress → map to `IngestEvent` → batch `POST /v1/events` | [`rfc-phase1-tier2-source-adapter.md`](./rfc-phase1-tier2-source-adapter.md) §2 |
+| **Idempotency keys** | Stable per-event `id` + batch `source`; retries reuse ids | Same RFC §3 · OpenAPI · [`data-model-ingestion-requirements.md`](./product/data-model-ingestion-requirements.md) §3.2 |
+| **Backoff** | Full jitter exponential; honor `Retry-After`; no spin on permanent 4xx | Same RFC §4 |
+| **Checkpoint interaction** | Advance after durable `202` without unresolved per-event failures; optional fence token | Same RFC §5 · §4 *Checkpoint provider matrix* (P1-local row) |
+
+## 8. Revision history
 
 | Date | Author | Note |
 |------|--------|------|
 | 2026-05-03 | CTO agent | Initial skeleton + matrix per [CAN-26](/CAN/issues/CAN-26) |
 | 2026-05-03 | CTO agent | §1.5 topology crosswalk per board-approved [CAN-30](/CAN/issues/CAN-30) + [CAN-33](/CAN/issues/CAN-33) |
+| 2026-05-03 | Backend | §7 tier-2 source adapter row + link to [CAN-50](/CAN/issues/CAN-50) RFC slice |

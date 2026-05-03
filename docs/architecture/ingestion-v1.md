@@ -23,6 +23,8 @@ Example JSON for the control read paths: [`control-api-read-models.md`](./contro
 
 Downstream buffer, checkpoint, and processing implementations MUST conform to Phase 1 assumptions in [`docs/rfc-phase1-buffer-checkpoint-provider-matrix.md`](../rfc-phase1-buffer-checkpoint-provider-matrix.md) unless a feature flag explicitly selects a future driver.
 
+**Tier-2 managed source connectors** (wizard charter path 2) MUST follow [`docs/rfc-phase1-tier2-source-adapter.md`](../rfc-phase1-tier2-source-adapter.md) for idempotency keys, retry/backoff, and checkpoint advance relative to `POST /v1/events`.
+
 ---
 
 ## 2. Data model at the edge

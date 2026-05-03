@@ -45,3 +45,12 @@ This architecture doc does **not** redefine fields; the OpenAPI schemas are auth
 ## 4. Related UX
 
 Operator surfaces MUST follow tier and honesty rules in [`docs/product/connector-tier-ux-spec.md`](../product/connector-tier-ux-spec.md) and engineering UI notes in [`docs/design/CAN-28-operator-ui-phase1.md`](../design/CAN-28-operator-ui-phase1.md).
+
+---
+
+## 5. Implementation mapping and language boundaries
+
+- **Normative contract** remains the OpenAPI file referenced in section 1; **implementation language is not** defined by this doc.
+- **Company policy:** Python for control plane, Go for data plane services, TypeScript **only** for web frontends — see [`language-platform-policy.md`](./language-platform-policy.md).
+- **This repo today:** `services/ingestion-api` is a **Phase 1 TypeScript scaffold** under the time-bounded exception documented in that policy; it exists to validate the HTTP contract and operator UX before a production-grade Go edge is introduced.
+- **Merges that expand server-side TypeScript** or change ingestion semantics require the [mainline architecture review](../governance/mainline-merge-architecture-review.md) checklist (CTO + QA + product).

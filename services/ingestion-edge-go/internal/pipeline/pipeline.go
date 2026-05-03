@@ -17,16 +17,16 @@ type Placeholder struct {
 
 type Summary struct {
 	ContractVersion  string        `json:"contractVersion"`
-	Stages             []Stage       `json:"stages"`
-	AdapterInstances   []Placeholder `json:"adapterInstances"`
+	Stages           []Stage       `json:"stages"`
+	AdapterInstances []Placeholder `json:"adapterInstances"`
 }
 
 type CanalSegment struct {
-	ID                   string `json:"id"`
-	Kind                 string `json:"kind"`
-	Label                string `json:"label"`
-	FollowsStageOrdinal  int    `json:"followsStageOrdinal"`
-	ProviderProfile      string `json:"providerProfile"`
+	ID                  string `json:"id"`
+	Kind                string `json:"kind"`
+	Label               string `json:"label"`
+	FollowsStageOrdinal int    `json:"followsStageOrdinal"`
+	ProviderProfile     string `json:"providerProfile"`
 }
 
 type CanalSegments struct {
@@ -95,8 +95,8 @@ func PipelineSummary() Summary {
 	ph := make([]Placeholder, len(placeholders))
 	copy(ph, placeholders)
 	return Summary{
-		ContractVersion: "0.1.0",
-		Stages:          out,
+		ContractVersion:  "0.1.0",
+		Stages:           out,
 		AdapterInstances: ph,
 	}
 }

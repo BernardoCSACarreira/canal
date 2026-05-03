@@ -8,10 +8,10 @@ import (
 
 // IngestEvent matches OpenAPI IngestEvent (payload optional, arbitrary JSON).
 type IngestEvent struct {
-	ID          string          `json:"id"`
-	Type        string          `json:"type"`
-	OccurredAt  string          `json:"occurredAt"`
-	Payload     json.RawMessage `json:"payload,omitempty"`
+	ID         string          `json:"id"`
+	Type       string          `json:"type"`
+	OccurredAt string          `json:"occurredAt"`
+	Payload    json.RawMessage `json:"payload,omitempty"`
 }
 
 type Record struct {

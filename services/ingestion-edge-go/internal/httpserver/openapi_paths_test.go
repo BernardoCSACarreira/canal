@@ -212,8 +212,8 @@ func TestControlPipeline(t *testing.T) {
 	}
 	defer res.Body.Close()
 	var body struct {
-		ContractVersion  string `json:"contractVersion"`
-		Stages           []struct {
+		ContractVersion string `json:"contractVersion"`
+		Stages          []struct {
 			Ordinal int    `json:"ordinal"`
 			Key     string `json:"key"`
 			Title   string `json:"title"`

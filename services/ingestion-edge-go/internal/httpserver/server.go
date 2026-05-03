@@ -16,7 +16,7 @@ import (
 const version = "0.1.0"
 
 type ingestBatchRequest struct {
-	Source string            `json:"source"`
+	Source string               `json:"source"`
 	Events []buffer.IngestEvent `json:"events"`
 }
 
@@ -118,7 +118,7 @@ func handleIngest(w http.ResponseWriter, r *http.Request, d Deps) {
 		d.Buffer.Append(req.Source, accepted)
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{
-		"accepted":      len(accepted),
+		"accepted":     len(accepted),
 		"duplicateIds": duplicateIDs,
 	})
 }

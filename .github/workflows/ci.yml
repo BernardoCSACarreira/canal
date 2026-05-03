@@ -182,6 +182,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.22.12"
+      - name: Format (gofmt)
+        run: test -z "$(gofmt -l .)"
       - name: Vet
         run: go vet ./...
       - name: Test

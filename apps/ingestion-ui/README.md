@@ -1,6 +1,6 @@
 # @canal/ingestion-ui
 
-Minimal shell for Phase 1 ingestion MVP: health check, batch POST to `/v1/events`, and a documented stub probe for `/v1/stream`. Shapes follow `contracts/ingestion-v1.openapi.yaml`. Operator UX: **badge keys + copy + hierarchy** — [`docs/product/connector-tier-ux-spec.md`](../../docs/product/connector-tier-ux-spec.md). Engineering supplement (a11y, tokens) — [`docs/design/CAN-28-operator-ui-phase1.md`](../../docs/design/CAN-28-operator-ui-phase1.md).
+Minimal shell for Phase 1 ingestion MVP: health check, batch POST to `/v1/events`, and a documented stub probe for `/v1/stream`. Shapes follow `contracts/ingestion-v1.openapi.yaml`. Operator UX: **badge keys + copy + hierarchy** — [`docs/product/connector-tier-ux-spec.md`](../../docs/product/connector-tier-ux-spec.md). Engineering supplement (a11y, tokens) — [`docs/design/CAN-28-operator-ui-phase1.md`](../../docs/design/CAN-28-operator-ui-phase1.md). Platform UI planning (design system, IA, prioritized backlog) — [`docs/design/CAN-68-platform-ui-deep-plan.md`](../../docs/design/CAN-68-platform-ui-deep-plan.md).
 
 ## Develop
 
@@ -10,14 +10,38 @@ If your npm config sets `omit=dev`, install with dev tools explicitly:
 npm install --include=dev
 ```
 
+### Split stack (Go data plane + Python control plane)
+
+| Backend | Port (default) | Routes |
+|---------|----------------|--------|
+| [`services/ingestion-edge-go`](../../services/ingestion-edge-go) | `8080` | `GET /health`, `POST /v1/events`, `GET /v1/stream` |
+| [`services/ingestion-control-plane`](../../services/ingestion-control-plane) | `8091` (matches Dockerfile `EXPOSE`) | `GET /v1/control/*`, `/v1/adapter-instances*` |
+
+You can swap the Go edge for [`services/ingestion-api`](../../services/ingestion-api) on `:8080` when you are not exercising the Go binary; path routing is the same.
+
 ```bash
-# from repo root
-cd services/ingestion-api && npm install && npm run dev
-# separate terminal
-cd apps/ingestion-ui && npm install && npm run dev
+# Terminal A — Go edge
+cd services/ingestion-edge-go && go run ./cmd/ingestion-edge
+
+# Terminal B — Python control
+cd services/ingestion-control-plane && pip install -e '.[dev]' && \
+  uvicorn canal_control_plane.app:app --host 127.0.0.1 --port 8091 --reload
+
+# Terminal C — UI (send control routes to Python; data plane stays on :8080)
+cd apps/ingestion-ui && npm install && \
+  VITE_CONTROL_PLANE_PROXY_TARGET=http://127.0.0.1:8091 npm run dev
 ```
 
-The Vite dev server proxies `/health` and `/v1` to `http://127.0.0.1:8080` (override with `VITE_API_PROXY_TARGET`).
+Proxy env vars (omit `VITE_CONTROL_PLANE_PROXY_TARGET` to send **everything** to the data plane — same as a single `ingestion-api` or Go edge on `:8080`):
+
+| Variable | Default |
+|----------|---------|
+| `VITE_DATA_PLANE_PROXY_TARGET` | `http://127.0.0.1:8080` |
+| `VITE_CONTROL_PLANE_PROXY_TARGET` | same as data plane |
+
+### Legacy (single combined backend)
+
+Set **`VITE_API_PROXY_TARGET`** to one base URL (for example `services/ingestion-api` on `:8080`). All `/health` and `/v1/*` requests proxy there, and per-path split env vars are ignored.
 
 ## QA (operator wizard)
 

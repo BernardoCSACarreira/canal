@@ -334,8 +334,8 @@ function ConfigureStep({
             <strong>Looking for the B3 picker?</strong> It is a <strong>radio list</strong>{' '}
             (circular radio controls, not a dial). It appears in the <strong>Adapters</strong>{' '}
             card once <code style={wiz.subCode}>GET /v1/control/pipeline</code> succeeds. If
-            this never finishes, check the dev proxy / ingestion API (sidebar hint in classic
-            UI).
+            this never finishes, check the dev proxy targets for Python control (sidebar hint
+            in classic UI).
           </p>
         </>
       )}

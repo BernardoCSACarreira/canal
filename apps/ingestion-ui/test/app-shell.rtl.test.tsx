@@ -10,8 +10,8 @@ function stubIngestionFetch() {
     if (path === '/health' && (!init || init.method === undefined || init.method === 'GET')) {
       return Response.json({
         status: 'ok',
-        service: 'ingestion-api',
-        version: '0.0.0',
+        service: 'ingestion-edge-go',
+        version: '0.1.0',
       })
     }
     if (path === '/v1/events' && init?.method === 'POST') {
@@ -42,17 +42,17 @@ describe('App shell (classic)', () => {
 
     expect(screen.getByRole('heading', { name: /service health/i })).toBeInTheDocument()
     expect(
-      screen.getByText(/press refresh to load health from the ingestion api/i),
+      screen.getByText(/press refresh to load health from the data plane edge/i),
     ).toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: /^refresh$/i }))
 
     await waitFor(() => {
       expect(
-        screen.getByText(/health check succeeded for ingestion-api/i),
+        screen.getByText(/health check succeeded for ingestion-edge-go/i),
       ).toBeInTheDocument()
     })
-    expect(screen.getByText(/"service":\s*"ingestion-api"/)).toBeInTheDocument()
+    expect(screen.getByText(/"service":\s*"ingestion-edge-go"/)).toBeInTheDocument()
   })
 
   it('ingest: POST batch renders accepted payload', async () => {

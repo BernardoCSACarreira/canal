@@ -109,9 +109,11 @@ export default function App() {
           </div>
         )}
         <p style={styles.hint}>
-          Dev server proxies <code>/health</code> and <code>/v1/*</code> to{' '}
-          <code>127.0.0.1:8080</code>. Run{' '}
-          <code>@canal/ingestion-api</code> locally for live responses.
+          Dev server proxies <code>/health</code>, <code>/v1/events</code>, and{' '}
+          <code>/v1/stream</code> to the Go edge (default <code>127.0.0.1:8080</code>);{' '}
+          <code>/v1/control/*</code> and <code>/v1/adapter-instances</code> to Python
+          control (default <code>127.0.0.1:8091</code>). See README for env overrides or
+          legacy <code>VITE_API_PROXY_TARGET</code>.
         </p>
       </aside>
       <main style={styles.main}>
@@ -155,7 +157,7 @@ function OverviewPanel({
       ? `Health check failed: ${error}`
       : health
         ? `Health check succeeded for ${health.service}, status ${health.status}.`
-        : 'Press Refresh to load health from the ingestion API.'
+        : 'Press Refresh to load health from the data plane edge.'
 
   return (
     <section style={styles.panel}>
@@ -179,7 +181,7 @@ function OverviewPanel({
         <pre style={styles.pre}>{JSON.stringify(health, null, 2)}</pre>
       )}
       {!health && !error && !loading && (
-        <p style={styles.muted}>Load health from the ingestion API.</p>
+        <p style={styles.muted}>Load health from the data plane edge.</p>
       )}
     </section>
   )

@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"os"
 
-	"canal.ingestion-edge-go/internal/adapters"
 	"canal.ingestion-edge-go/internal/buffer"
 	"canal.ingestion-edge-go/internal/dedupe"
 	"canal.ingestion-edge-go/internal/httpserver"
@@ -19,9 +18,8 @@ func main() {
 		addr = ":" + v
 	}
 	d := httpserver.Deps{
-		Buffer:   buffer.NewP1Local(),
-		Seen:     dedupe.New(),
-		Adapters: adapters.NewStore(),
+		Buffer: buffer.NewP1Local(),
+		Seen:   dedupe.New(),
 	}
 	srv := &http.Server{
 		Addr:    addr,

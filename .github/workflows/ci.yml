@@ -91,5 +91,10 @@ jobs:
         if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
         working-directory: services/ingestion-api
         run: |
+          {
+            echo "## Tier-1 synthetic pipeline smoke"
+            echo "Stub path: **generator → in-memory buffer → fake sink**. Test file: \`services/ingestion-api/test/tier1-synthetic-pipeline.test.ts\`."
+            echo "If this step fails, read the logged test title to see whether the orchestrated run or the staged generator/buffer/sink test regressed."
+          } >> "$GITHUB_STEP_SUMMARY"
           npm ci --include=dev
           npm run test:synthetic-smoke

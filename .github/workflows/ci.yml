@@ -43,6 +43,7 @@ jobs:
       ingestion_ui: ${{ steps.pick.outputs.ingestion_ui }}
       ingestion_api: ${{ steps.pick.outputs.ingestion_api }}
       ingestion_edge_go: ${{ steps.pick.outputs.ingestion_edge_go }}
+      ingestion_control_plane: ${{ steps.pick.outputs.ingestion_control_plane }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -69,6 +70,10 @@ jobs:
               - 'contracts/**'
               - '.github/workflows/ci.yml'
               - '.nvmrc'
+            ingestion_control_plane:
+              - 'services/ingestion-control-plane/**'
+              - 'contracts/**'
+              - '.github/workflows/ci.yml'
       - id: pick
         run: |
           if [ "${{ github.event_name }}" != "pull_request" ]; then
@@ -76,12 +81,14 @@ jobs:
             echo "ingestion_ui=true" >> "$GITHUB_OUTPUT"
             echo "ingestion_api=true" >> "$GITHUB_OUTPUT"
             echo "ingestion_edge_go=true" >> "$GITHUB_OUTPUT"
+            echo "ingestion_control_plane=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "contracts=${{ steps.filter.outputs.contracts }}" >> "$GITHUB_OUTPUT"
           echo "ingestion_ui=${{ steps.filter.outputs.ingestion_ui }}" >> "$GITHUB_OUTPUT"
           echo "ingestion_api=${{ steps.filter.outputs.ingestion_api }}" >> "$GITHUB_OUTPUT"
           echo "ingestion_edge_go=${{ steps.filter.outputs.ingestion_edge_go }}" >> "$GITHUB_OUTPUT"
+          echo "ingestion_control_plane=${{ steps.filter.outputs.ingestion_control_plane }}" >> "$GITHUB_OUTPUT"
 
   contracts:
     name: contracts (OpenAPI validate)
@@ -141,6 +148,26 @@ jobs:
         run: npm test
       - name: Build
         run: npm run build
+
+  ingestion-control-plane:
+    name: ingestion-control-plane (ruff + pytest)
+    needs: [changes]
+    if: needs.changes.outputs.ingestion_control_plane == 'true'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: services/ingestion-control-plane
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -e '.[dev]'
+      - name: Ruff
+        run: ruff check src tests
+      - name: Pytest
+        run: pytest
 
   ingestion-edge-go:
     name: ingestion-edge-go (test + build)

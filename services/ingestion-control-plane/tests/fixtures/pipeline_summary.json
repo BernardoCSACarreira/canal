@@ -1,0 +1,37 @@
+{
+  "contractVersion": "0.1.0",
+  "stages": [
+    { "ordinal": 1, "key": "source", "title": "Source" },
+    { "ordinal": 2, "key": "source_connector", "title": "Source Connector" },
+    { "ordinal": 3, "key": "source_event_buffer", "title": "Source Event Buffer" },
+    {
+      "ordinal": 4,
+      "key": "source_canonical_event_serializer",
+      "title": "Source Canonical Event Serializer"
+    },
+    { "ordinal": 5, "key": "event_buffer", "title": "Event Buffer" },
+    { "ordinal": 6, "key": "sink_event_serializer", "title": "Sink Event Serializer" },
+    { "ordinal": 7, "key": "sink_event_buffer", "title": "Sink Event Buffer" },
+    { "ordinal": 8, "key": "sink_connector", "title": "Sink Connector" }
+  ],
+  "adapterInstances": [
+    {
+      "id": "adapter.placeholder.source_connector",
+      "stageKey": "source_connector",
+      "displayName": "Source connector (placeholder)",
+      "catalogTier": "tier-1"
+    },
+    {
+      "id": "adapter.placeholder.sink_connector",
+      "stageKey": "sink_connector",
+      "displayName": "Sink connector (placeholder)",
+      "catalogTier": "tier-2"
+    },
+    {
+      "id": "adapter.placeholder.community_sink",
+      "stageKey": "sink_connector",
+      "displayName": "Community sink adapter (placeholder)",
+      "catalogTier": "tier-3"
+    }
+  ]
+}

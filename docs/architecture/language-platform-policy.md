@@ -26,6 +26,7 @@ The Canal MVP repo currently ships a **small TypeScript** service under `service
 - No additional long-lived TypeScript **servers** beyond Phase 1 ingestion + tests without an ADR and CTO + QA + product sign-off per [mainline merge — architecture review](../governance/mainline-merge-architecture-review.md).
 - New **non-frontend** features default to Python (control) or Go (data), not Node.
 - Exit criteria for the exception: parity tests against the OpenAPI contract pass in Go (or Python where appropriate for the component), operator flows unchanged, then retire or demote the TS service.
+- **Python control-plane counterpart** for operator read models and adapter-instance registry lives under `services/ingestion-control-plane/` (see [`control-api-read-models.md`](./control-api-read-models.md)); the TS service may still expose the same routes until routing is split — keep responses aligned.
 
 ---
 

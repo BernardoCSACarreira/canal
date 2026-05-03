@@ -16,7 +16,10 @@ def client() -> TestClient:
 def test_control_plane_returns_404_for_post_v1_events(client: TestClient) -> None:
     r = client.post(
         "/v1/events",
-        json={"source": "x", "events": [{"id": "e1", "type": "t", "occurredAt": "2026-05-03T12:00:00.000Z"}]},
+        json={
+            "source": "x",
+            "events": [{"id": "e1", "type": "t", "occurredAt": "2026-05-03T12:00:00.000Z"}],
+        },
     )
     assert r.status_code == 404
 

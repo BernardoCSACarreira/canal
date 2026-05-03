@@ -237,6 +237,19 @@ func TestControlAndAdapterRoutesNotOnDataPlane(t *testing.T) {
 			if res.StatusCode != http.StatusNotFound {
 				t.Fatalf("want 404, got %d", res.StatusCode)
 			}
+			if ct := res.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+				t.Fatalf("Content-Type %q", ct)
+			}
+			var out struct {
+				Error   string `json:"error"`
+				Message string `json:"message"`
+			}
+			if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+				t.Fatal(err)
+			}
+			if out.Error != "not_found" || out.Message == "" {
+				t.Fatalf("%+v", out)
+			}
 		})
 	}
 }

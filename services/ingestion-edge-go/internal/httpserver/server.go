@@ -45,6 +45,22 @@ func NewHandler(d Deps) http.Handler {
 	mux.HandleFunc("POST /v1/events", func(w http.ResponseWriter, r *http.Request) {
 		handleIngest(w, r, d)
 	})
+	// Control-plane paths are not implemented on the data plane. Register explicit
+	// handlers so misrouted clients get OpenAPI ErrorResponse-shaped JSON instead of
+	// the default mux plaintext 404.
+	controlNotFound := func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"error":   "not_found",
+			"message": splitStackControlHint,
+		})
+	}
+	mux.HandleFunc("GET /v1/control/pipeline", controlNotFound)
+	mux.HandleFunc("GET /v1/control/canal/segments", controlNotFound)
+	mux.HandleFunc("GET /v1/adapter-instances", controlNotFound)
+	mux.HandleFunc("GET /v1/adapter-instances/{id}", controlNotFound)
+	mux.HandleFunc("POST /v1/adapter-instances", controlNotFound)
+	mux.HandleFunc("PATCH /v1/adapter-instances/{id}", controlNotFound)
+	mux.HandleFunc("DELETE /v1/adapter-instances/{id}", controlNotFound)
 	return mux
 }
 

@@ -2,7 +2,8 @@
 
 **Scope:** Phase 1 **HTTP-first** ingestion path for the Canal MVP.  
 **Normative contract:** [`contracts/ingestion-v1.openapi.yaml`](../../contracts/ingestion-v1.openapi.yaml) (validated in CI).  
-**Product requirements (schema, contracts, honesty):** [`docs/product/data-model-ingestion-requirements.md`](../product/data-model-ingestion-requirements.md).
+**Product requirements (schema, contracts, honesty):** [`docs/product/data-model-ingestion-requirements.md`](../product/data-model-ingestion-requirements.md).  
+**Diagrams (Mermaid):** [`diagrams.md`](./diagrams.md) — system context, CI map, ingestion sequence, operator routes, pipeline scaffolding, policy split.
 
 ---
 

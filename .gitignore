@@ -1,0 +1,30 @@
+# binaries
+/bin/
+/dist/
+canal
+*.exe
+
+# go
+*.test
+*.out
+coverage.*
+vendor/
+
+# local state (checkpoints, spools, embedded stores)
+/.canal/
+*.wal
+*.db
+
+# frontend
+node_modules/
+/web/dist/
+
+# env & secrets
+.env
+.env.*
+!.env.example
+
+# editors / os
+.DS_Store
+.idea/
+*.swp

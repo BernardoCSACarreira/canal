@@ -1,0 +1,292 @@
+package telemetry
+
+import (
+	"time"
+
+	"github.com/BernardoCSACarreira/canal/pkg/fault"
+	"github.com/BernardoCSACarreira/canal/pkg/record"
+)
+
+// PipelineStatus is THE read model. One canonical struct, one source of truth, three serialisations:
+// an HTTP snapshot, an SSE stream, and the CLI.
+//
+// The rule that makes it a contract rather than a struct: EVERY UNKNOWN IS A NIL POINTER, never a
+// zero.
+type PipelineStatus struct {
+	Tenant   record.TenantID   `json:"tenant"`
+	Pipeline record.PipelineID `json:"pipeline"`
+
+	// Generation is the stored config revision; ObservedGeneration is the revision actually applied.
+	// Their inequality is what makes "my config change silently did not apply" visible.
+	Generation         uint64 `json:"generation"`
+	ObservedGeneration uint64 `json:"observedGeneration"`
+
+	AsOf time.Time `json:"asOf"`
+
+	// Version is monotonic: it is both the SSE cursor and the ETag.
+	Version uint64 `json:"version"`
+
+	// Complete is false when the aggregator did not hear from every worker. A status document that
+	// silently omits a worker is the same lie as a health check returning 200 for a broken pipeline.
+	Complete bool `json:"complete"`
+
+	// Missing names the worker ids not heard from.
+	Missing []string `json:"missing,omitempty"`
+
+	Phase      Phase       `json:"phase"`
+	Conditions []Condition `json:"conditions"`
+
+	// StoppingSince and DrainDeadline are present only in [PhaseDraining]. Drained and drain-timeout
+	// are DISTINCT events, because the second means records may replay.
+	StoppingSince *time.Time `json:"stoppingSince,omitempty"`
+	DrainDeadline *time.Time `json:"drainDeadline,omitempty"`
+
+	Negotiated Negotiated `json:"negotiated"`
+
+	Throughput Throughput     `json:"throughput"`
+	Nodes      []NodeStatus   `json:"nodes"`
+	Lanes      []LaneStatus   `json:"lanes"`
+	Buffers    []BufferStatus `json:"buffers"`
+	Workers    []WorkerStatus `json:"workers"`
+
+	// LaneCount is how many lanes EXIST; Lanes carries at most one page of them and LanesTruncated
+	// says so. A source with 900 streams or 10^5 scan chunks makes an unpaginated lane array the
+	// largest thing in the document and the slowest thing in the UI, and a silently short array is
+	// the same lie as a status document that omits a worker.
+	LaneCount      int  `json:"laneCount"`
+	LanesTruncated bool `json:"lanesTruncated"`
+
+	// Scan is nil when no scan lane exists, so the UI stops showing a scan bar without anything
+	// switching on a phase.
+	Scan *ScanProgress `json:"scan"`
+
+	RecentEvents []Event    `json:"recentEvents"`
+	LastFault    *FaultInfo `json:"lastFault"`
+
+	// Config is the REDACTED config tree. It is the only form that ever leaves the process.
+	Config map[string]any `json:"config"`
+}
+
+// Throughput is the pipeline-level rate summary. Every field is a pointer because a pipeline that has
+// not run long enough to have a rate must report unknown, not zero.
+type Throughput struct {
+	RecordsPerSecondIn  *float64 `json:"recordsPerSecondIn"`
+	RecordsPerSecondOut *float64 `json:"recordsPerSecondOut"`
+	BytesPerSecondOut   *float64 `json:"bytesPerSecondOut"`
+
+	// ReconcileDelta is records in minus records out for the last checkpoint. A persistent divergence
+	// is the only cheap way to notice a sink that silently drops, and it is CHECKED, not merely
+	// recorded.
+	ReconcileDelta *int64 `json:"reconcileDelta"`
+}
+
+// NodeStatus is the per-node view. Node ids are metric labels, which is what makes a fan-out branch
+// nameable at all.
+type NodeStatus struct {
+	ID    record.NodeID `json:"id"`
+	Kind  string        `json:"kind"`
+	Name  string        `json:"name"`
+	Label string        `json:"label,omitempty"`
+
+	Connected bool `json:"connected"`
+
+	RecordsIn  uint64 `json:"recordsIn"`
+	RecordsOut uint64 `json:"recordsOut"`
+	Faults     uint64 `json:"faults"`
+
+	// Utilization is the fraction of wall time this node spent doing work rather than waiting. It is
+	// the bottleneck finder, and it is nil until enough samples exist.
+	Utilization *float64 `json:"utilization"`
+
+	// BlockedForSeconds is hard blocking: the node could not hand work downstream. A buffer filling is
+	// SOFT and is reported as depth, because "waiting for a buffer" and "blocked on the downstream"
+	// are different diagnoses.
+	BlockedForSeconds *float64 `json:"blockedForSeconds"`
+
+	// BackoffSeconds is cumulative TIME spent backing off, not a retry count: a count says retries
+	// happened, seconds says the pipeline spends most of its life backing off.
+	BackoffSeconds *float64 `json:"backoffSeconds"`
+}
+
+// LaneStatus is the per-lane view, and it is why this design's observability is not a compromise:
+// every field is derived from core-owned ledger and store state plus TWO connector-authored display
+// strings.
+type LaneStatus struct {
+	ID     record.LaneID `json:"id"`
+	Name   string        `json:"name"`
+	Stream string        `json:"stream"`
+
+	// Kind is reporting only. Nothing in the core branches on it.
+	Kind  string `json:"kind"`
+	Group string `json:"group,omitempty"`
+
+	// Label is connector-authored and rendered verbatim.
+	Label string `json:"label"`
+
+	Worker string `json:"worker"`
+	Epoch  uint64 `json:"epoch"`
+
+	// GatedOn is non-empty while this lane is waiting on a lane group, so "why is nothing happening"
+	// answers itself.
+	GatedOn []string `json:"gatedOn,omitempty"`
+
+	// Position is the DURABLE cursor's label, verbatim. Resolved is the delivered prefix's. Two
+	// fields for two facts: the delivered prefix is not progress until it is persisted.
+	Position *string `json:"position"`
+	Resolved *string `json:"resolved"`
+
+	CommittedAt *time.Time `json:"committedAt"`
+
+	// CheckpointAge is the primary alert signal and the one always-available, unfakeable metric that
+	// catches every stall mode.
+	CheckpointAge *float64 `json:"checkpointAgeSeconds"`
+
+	// Idle and IdleSince say that the source has REPORTED this lane quiet through
+	// connector.Heartbeater, as distinct from the lane being stuck.
+	//
+	// Without them, hundreds of healthy quiet streams each reported a forever-rising CheckpointAge —
+	// the design's own primary alert signal — for the sole offence of having nothing to say, and the
+	// only way to keep the signal usable was to stop believing it. An idle lane's CheckpointAge is
+	// still reported truthfully; Idle is what tells the alert rule to ignore it.
+	Idle      bool       `json:"idle"`
+	IdleSince *time.Time `json:"idleSince,omitempty"`
+
+	RecordsRead      uint64 `json:"recordsRead"`
+	RecordsCommitted uint64 `json:"recordsCommitted"`
+	RecordsAbandoned uint64 `json:"recordsAbandoned"`
+
+	InFlight       uint64 `json:"inFlight"`
+	InFlightBudget uint64 `json:"inFlightBudget"`
+
+	// ReplayRecords is the MEASURED worst-case re-read on crash: records admitted since the last
+	// durable safe position. It is computed, never the budget under another name.
+	ReplayRecords uint64 `json:"replayRecords"`
+
+	Blocked          bool     `json:"blocked"`
+	BlockedFor       *float64 `json:"blockedForSeconds"`
+	OldestPendingAge *float64 `json:"oldestPendingAgeSeconds"`
+
+	// Backlog is nil when the source cannot report it. Nil renders as "unknown", never as zero.
+	Backlog *Backlog `json:"backlog"`
+
+	EventTimeLag *float64 `json:"eventTimeLagSeconds"`
+
+	// Progress comes from the position's scalar projection, when the connector supplies one.
+	Progress *float64 `json:"progress"`
+
+	Finished bool `json:"finished"`
+}
+
+// Backlog is the read-model projection of what a source reported.
+//
+// Records and Bytes are POINTERS for the same reason connector.Backlog's are: nil is "the source
+// cannot answer" and 0 is "caught up", and the read model's own rule is that every unknown is a nil
+// pointer and never a zero.
+type Backlog struct {
+	Records *uint64 `json:"records"`
+	Bytes   *uint64 `json:"bytes"`
+
+	// Exact distinguishes a count from an estimate. It is its own field and never a label, because a
+	// label would split the series whenever the source changed strategy.
+	Exact bool      `json:"exact"`
+	AsOf  time.Time `json:"asOf"`
+}
+
+// BufferStatus is the per-buffer-node view.
+type BufferStatus struct {
+	Node record.NodeID `json:"node"`
+	Name string        `json:"name"`
+
+	// Durability is the declared DOMAIN token, so the read model discloses that a node-local buffer
+	// cannot authorise a global commit.
+	Durability string `json:"durability"`
+
+	Records        int   `json:"records"`
+	RecordCapacity int   `json:"recordCapacity"`
+	Bytes          int64 `json:"bytes"`
+	ByteCapacity   int64 `json:"byteCapacity"`
+
+	OldestAgeSeconds *float64 `json:"oldestAgeSeconds"`
+	RefusedTotal     uint64   `json:"refusedTotal"`
+}
+
+// WorkerStatus is one worker's membership and lease state.
+type WorkerStatus struct {
+	ID    string    `json:"id"`
+	Since time.Time `json:"since"`
+
+	// Leader is planning-only. Leadership is NEVER trusted for correctness: the lease epoch is the
+	// fencing token.
+	Leader bool `json:"leader"`
+
+	Lanes        int        `json:"lanes"`
+	LastHeard    time.Time  `json:"lastHeard"`
+	LeaseExpires *time.Time `json:"leaseExpires"`
+}
+
+// ScanProgress summarises every scan lane. It is computed by the core from lane weights and finished
+// counts, for any source, with no connector code.
+type ScanProgress struct {
+	LanesTotal    int `json:"lanesTotal"`
+	LanesFinished int `json:"lanesFinished"`
+
+	// Fraction is nil unless enough lanes declared a weight. A progress bar that guesses is worse than
+	// no progress bar.
+	Fraction *float64 `json:"fraction"`
+
+	StartedAt time.Time  `json:"startedAt"`
+	ETA       *time.Time `json:"eta"`
+}
+
+// Event is the read model's projection of a connector or engine event.
+type Event struct {
+	At       time.Time     `json:"at"`
+	Kind     string        `json:"kind"`
+	Severity string        `json:"severity,omitempty"`
+	Node     record.NodeID `json:"node,omitempty"`
+	Lane     record.LaneID `json:"lane,omitempty"`
+	Stream   string        `json:"stream,omitempty"`
+	Message  string        `json:"message"`
+	Detail   string        `json:"detail,omitempty"`
+}
+
+// FaultInfo is the last fault, rendered for an operator.
+//
+// Class, Blame and User answer "what happened, whose problem is it, and what do I do" — which is the
+// whole of what a status page owes an operator about a failure.
+type FaultInfo struct {
+	At    time.Time `json:"at"`
+	Class string    `json:"class"`
+	Blame string    `json:"blame"`
+	Op    string    `json:"op"`
+
+	Node   record.NodeID `json:"node,omitempty"`
+	Lane   record.LaneID `json:"lane,omitempty"`
+	Stream string        `json:"stream,omitempty"`
+
+	// User is operator-facing and carries no stack trace and no Go type. Dev is for the log.
+	User string `json:"user"`
+	Dev  string `json:"dev,omitempty"`
+
+	Attempts int `json:"attempts"`
+}
+
+// NewFaultInfo projects a fault into the read model, mapping its class and blame to their stable
+// tokens. It lives here so the projection exists exactly once.
+func NewFaultInfo(at time.Time, f *fault.Fault, attempts int) *FaultInfo {
+	if f == nil {
+		return nil
+	}
+	return &FaultInfo{
+		At:       at,
+		Class:    f.Class.String(),
+		Blame:    f.Class.Blames().String(),
+		Op:       f.Op.String(),
+		Node:     f.Node,
+		Lane:     f.Lane,
+		Stream:   string(f.Stream),
+		User:     f.User,
+		Dev:      f.Dev,
+		Attempts: attempts,
+	}
+}

@@ -41,6 +41,7 @@ var declared = map[string][]string{
 	"pkg/telemetry":     {"pkg/connector", "pkg/fault", "pkg/record"},
 	"pkg/spec":          {"pkg/connector", "pkg/fault", "pkg/record", "pkg/registry", "pkg/schema", "pkg/telemetry"},
 	"pkg/store":         {"pkg/connector", "pkg/record", "pkg/spec", "pkg/telemetry"},
+	"pkg/store/wal":     {"pkg/connector", "pkg/fault", "pkg/record", "pkg/store"},
 	"pkg/connectortest": {"pkg/config", "pkg/connector", "pkg/fault", "pkg/record", "pkg/schema"},
 
 	// internal/ — engine machinery. Nothing under pkg/ may import any of it.

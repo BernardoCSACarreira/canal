@@ -446,11 +446,20 @@ prevents special-casing: `go list -deps ./internal/engine` returns exactly `inte
 `pkg/` packages and no connector package at all, so the engine has no name for any connector and a
 switch on connector identity is not expressible in it.
 
-The rest of the boundary is convention, not enforcement, and this document should not pretend otherwise.
-`pkg/spec`, `pkg/store` and `pkg/telemetry` are public import paths; a connector that imported one would
-compile. No connector does, but **no `go vet` analyser and no dependency test exists** — `grep -rn
-"TestDependencyDirection" --include='*.go' .` returns nothing, and the repository has no CI configuration
-at all. Writing that test, and running it in CI, is outstanding work, not a delivered mechanism.
+The rest of the boundary is enforced by a test rather than by the compiler. `pkg/spec`, `pkg/store` and
+`pkg/telemetry` are public import paths, so a connector that imported one would still compile —
+`internal/arch` is what refuses it. `TestDependencyDirection` there parses the real import graph out of
+the real source and compares it against a declared table, failing in BOTH directions: an edge the code
+has and the table does not, and an edge the table has and the code does not. Three siblings extend it —
+no `pkg/` package may import `internal/`, no package may exist without a row in the table, and a
+connector may reach only the six packages named above.
+
+That table and this section are one fact written twice, which is exactly the shape that let this section
+be wrong for the whole of the project's life so far. The test is what keeps them in agreement; change
+one and the other fails.
+
+Still outstanding: there is no `go vet` analyser and **no CI configuration at all**, so the test protects
+anyone who runs `go test ./...` and nobody who does not.
 
 ### Direction is strictly downward, with no cycles
 

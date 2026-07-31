@@ -29,7 +29,7 @@ type Negotiated struct {
 
 	// Why is one sentence per factor: "sink stdout is not idempotent",
 	// "node warehouse: min(requested=exactly_once, achievable=exactly_once)".
-	Why []string `json:"why"`
+	Why []string `json:"why,omitempty"`
 
 	// DurabilityEdge and AckPoint summarise the WEAKEST branch's answer; the per-node values are in
 	// Nodes.
@@ -49,7 +49,7 @@ type Negotiated struct {
 	ReplayBudget int `json:"replay_budget"`
 
 	// Defaults labels every value the core supplied rather than the operator (design rule R10).
-	Defaults []DefaultNote `json:"defaults"`
+	Defaults []DefaultNote `json:"defaults,omitempty"`
 
 	// Downgrades lists operator-acknowledged waivers in force.
 	Downgrades []Downgrade `json:"downgrades,omitempty"`
@@ -72,7 +72,7 @@ type NodeContract struct {
 
 // DefaultNote records one value the operator did not choose, and who chose it.
 type DefaultNote struct {
-	Path  []string `json:"path"`
+	Path  []string `json:"path,omitempty"`
 	Value any      `json:"value"`
 
 	// From is "core default", "sink declared" or "connector spec".
@@ -91,7 +91,7 @@ type Downgrade struct {
 	Effective string `json:"effective"`
 
 	// Missing names the capabilities whose absence caused the downgrade, as their stable tokens.
-	Missing []string `json:"missing"`
+	Missing []string `json:"missing,omitempty"`
 
 	Node record.NodeID `json:"node"`
 

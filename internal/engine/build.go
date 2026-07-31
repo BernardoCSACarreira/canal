@@ -218,6 +218,27 @@ func Build(ctx context.Context, r *registry.Registry, s spec.Spec, d Deps) (*Pip
 			if _, nd := e.Spec.Validate(n.Config); nd.HasErrors() {
 				diags = anchor(diags, n.ID, nd)
 			}
+
+		default:
+			// A kind this loop does not handle must be REFUSED, not skipped.
+			//
+			// Without this arm the switch silently ignored five of the registry's nine kinds. An
+			// encoder, decoder, framer, deframer or compressor placed in the graph passed
+			// validateGraph — the component is registered, so `r.Has` is satisfied — and then fell
+			// through here, so its config was never validated and it was never constructed. The
+			// pipeline built, negotiated a delivery tier and reported success for a graph containing
+			// a node the engine had quietly dropped.
+			//
+			// Codecs are not graph nodes: ADR 0022 makes them stage-standard FIELDS on the node that
+			// needs them, which is why nothing here resolves one. That is a deliberate design
+			// choice, so saying it out loud is the whole fix.
+			//
+			// The arm is also the guard against the next kind added to registry.Kind without a case
+			// here. Silently dropping a node is the worst available behaviour; this makes it a
+			// diagnostic instead.
+			diags = append(diags, nodeDiag(n.ID, config.CodeGraphInvalid,
+				fmt.Sprintf("a %s cannot be a graph node", n.Kind),
+				"codecs are configured as fields on the node that needs them, not as nodes of their own; see ADR 0022"))
 		}
 	}
 

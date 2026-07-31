@@ -125,6 +125,15 @@ type Ledger struct {
 	leaks  []Leak
 	closed bool
 
+	// sending counts the senders that have passed the closed check and may still be about to write
+	// to acks. Close waits on it before closing the channel; without that wait, a sender parked
+	// between the check and the send writes to a closed channel and takes the process down.
+	//
+	// It is incremented under mu, the same mutex that guards closed, so the pair is atomic: a sender
+	// either registers before Close observes the count, or sees closed and never sends at all.
+	sending  sync.WaitGroup
+	stopSend chan struct{}
+
 	stopReaper chan struct{}
 	reaperDone chan struct{}
 }
@@ -141,6 +150,7 @@ func New(cfg Config) *Ledger {
 		groups:     map[record.GroupID]*group{},
 		byRec:      map[record.RecordID]record.GroupID{},
 		acks:       make(chan connector.Ack, 64),
+		stopSend:   make(chan struct{}),
 		stopReaper: make(chan struct{}),
 		reaperDone: make(chan struct{}),
 	}
@@ -167,9 +177,20 @@ func (l *Ledger) Lane(id record.LaneID, ord connector.Ordering, budget int) erro
 		return nil
 	}
 	st := &laneState{id: id, ordering: ord, budget: budget}
-	if ord == connector.OrderingPrefix {
-		st.tracker = NewTracker[record.Position](uint64(budget))
-	}
+
+	// EVERY lane gets a tracker, including a discrete one.
+	//
+	// A discrete lane has no cursor and therefore no prefix to resolve, which is why it used to be
+	// given no tracker at all. But the tracker is two mechanisms in one object — an ordered prefix
+	// resolver AND the in-flight budget — and skipping it to avoid the first also skipped the
+	// second. Nothing then bounded admission on a discrete lane: the compliance audit measured
+	// 200,000 records admitted against a configured budget of 8, because Admit never called Track
+	// and so never blocked.
+	//
+	// A discrete lane uses the budget half only. Its prefix advances are discarded in Settle, since
+	// a position means nothing for a lane whose deliveries are acknowledged individually by handle.
+	st.tracker = NewTracker[record.Position](uint64(budget))
+
 	l.lanes[id] = st
 	return nil
 }
@@ -300,6 +321,25 @@ func (l *Ledger) Admit(ctx context.Context, b *record.Batch) error {
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	// A reused group id is REFUSED, loudly, for the same reason a mislabelled lane is.
+	//
+	// The old code assigned unconditionally. Re-admitting a live group id dropped the previous
+	// group from the map while its ticket stayed in the tracker, so the prefix could never advance
+	// past it and the lane wedged permanently. Nothing detected it: the leak reaper walks l.groups
+	// and the orphan is precisely what is no longer there. That made it the only failure mode in
+	// this package with no signal at all, which is worse than a crash.
+	if _, dup := l.groups[b.Group()]; dup {
+		if !ticket.IsZero() {
+			// Abandon the ticket this call just took, so the refusal does not itself leak the thing
+			// it exists to prevent leaking.
+			tracker.Abandon(ticket)
+		}
+		return fault.Contract(fault.OpBuffer, fmt.Errorf(
+			"ledger: group %q is already in flight; a group id identifies one batch for its whole life and is never reused",
+			b.Group()))
+	}
+
 	g.ticket = ticket
 	l.groups[b.Group()] = g
 	for _, r := range b.Records {
@@ -401,7 +441,10 @@ func (l *Ledger) Settle(outs []Outcome) {
 			} else {
 				pos, moved = st.tracker.Release(g.ticket, 1)
 			}
-			if moved {
+			// A discrete lane's tracker exists for the budget alone. Its prefix is meaningless —
+			// deliveries are acknowledged individually by handle — so the advance is discharged and
+			// discarded rather than published as a resolved position nothing should read.
+			if moved && st.ordering != connector.OrderingDiscrete {
 				advances = append(advances, advance{lane: g.lane, pos: pos})
 			}
 		}
@@ -572,15 +615,30 @@ func (l *Ledger) emitDiscrete() {
 }
 
 func (l *Ledger) send(a connector.Ack) {
+	// Registering as a sender and reading closed happen under one lock. Doing them separately is
+	// what made this a send-on-closed-channel panic: the old code released the mutex after reading
+	// closed, and Close could then set the flag and close the channel before the send ran. The
+	// window is exactly the one build.go reserves for late acks during shutdown, so it was reachable
+	// on every drain, not only under load.
 	l.mu.Lock()
-	closed := l.closed
-	l.mu.Unlock()
-	if closed {
+	if l.closed {
+		l.mu.Unlock()
 		return
 	}
+	l.sending.Add(1)
+	l.mu.Unlock()
+	defer l.sending.Done()
+
 	// The channel is core-internal and never crosses the plugin boundary, so a channel is fine here. It
 	// is buffered; a full buffer means the commit pump is wedged, which the pump's own metric reports.
-	l.acks <- a
+	//
+	// stopSend releases a sender parked on a full buffer so that Close cannot deadlock waiting for it.
+	// Dropping the acknowledgement is the safe direction: an ack not delivered means the source is
+	// never told to advance, so the records are re-read after restart rather than skipped.
+	select {
+	case l.acks <- a:
+	case <-l.stopSend:
+	}
 }
 
 // Acks is the stream the engine pumps into Source.Commit.
@@ -791,6 +849,11 @@ func (l *Ledger) Close() error {
 
 	close(l.stopReaper)
 	<-l.reaperDone
+
+	// Release any sender parked on a full buffer, then wait until every sender that passed the
+	// closed check has finished. Only then is closing acks safe.
+	close(l.stopSend)
+	l.sending.Wait()
 	close(l.acks)
 	return nil
 }

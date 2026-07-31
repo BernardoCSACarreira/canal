@@ -354,26 +354,34 @@ proposals and [docs/decisions/reviews/](docs/decisions/reviews/) the twelve revi
 
 ## What's next
 
-From section (a) of the compliance audit — the items that are defects in *delivered* code, all of which
-the engine executes on its first run, so fixing them later costs more than fixing them now:
+All ten defects the compliance audit found in *delivered* code are fixed, each pinned by a test that
+was first verified to fail against the original bug:
 
-1. `applyWaivers` reads the wrong fields, so one signed waiver downgrades every capability and guarantee
-   error on a node.
-2. A `Ledger.send` / `Ledger.Close` race — a confirmed send-on-closed-channel panic in the exact shutdown
-   window the engine reserves for late acks.
-3. Ledger group-id reuse silently orphans a tracker ticket, stalling the prefix forever with no detector.
-4. `StoreCaps.Supports` never reads `Durability`, so a non-durable store passes `exactly_once`.
-5. Two unbounded backpressure paths, including discrete-ordered lanes that get no tracker at all.
-6. Decide the enum wire form — eight capability fields serialise as base64 today, in both shipped
-   descriptors.
-7. `omitempty` on eight slice fields that currently marshal to `null`.
-8. Close `Build`'s validation holes: no `default` arm on the node switch, no codec resolution.
-9. `stdoutsink`'s `Sync` guard returns `Indeterminate` for a pipe, `/dev/null` and a tty.
-10. Write the `TestDependencyDirection` that would keep §3 honest permanently. §3 and §22 have been
-    rewritten against the code, but nothing mechanical stops either drifting again.
+| Was | Now |
+|---|---|
+| One signed waiver downgraded every capability and guarantee error on every node, including the data-loss guard | A waiver matches on exact node scope and must name the capability it waives; no wildcard |
+| `Ledger.send` raced `Close` — send on a closed channel, in the shutdown window the engine reserves for late acks | Senders register under the mutex that guards the flag, and `Close` waits for them |
+| Re-admitting a live group id orphaned a tracker ticket and wedged the lane forever, with no detector | Refused as a contract fault, and the ticket it took is released |
+| `StoreCaps.Supports` never read `Durability`, so an in-memory store passed `exactly_once` | Tiers above at-least-once require a durability domain that outlives the process |
+| Two unbounded backpressure paths: idle positions grew a node each (419.6 MiB at 5M), discrete lanes had no budget at all (200,000 admitted against 8) | Idle positions coalesce — 1M now costs 2 nodes; discrete lanes get a tracker and block at their budget |
+| Enums marshalled as ordinals, and as **base64** inside a slice: both shipped descriptors emitted `"lane_kinds":"AQ=="` | All 31 closed enums marshal as their stable token via `MarshalText`, and round-trip |
+| A `Descriptor` could not be decoded from its own encoding | `Support` and `CapSource` gained the missing `UnmarshalText` |
+| Eleven collection fields marshalled to `null` | `omitempty`, plus a reflection test that finds the next one |
+| `Build`'s node switch silently dropped five of nine kinds | A `default` arm refuses them and says why |
+| `stdoutsink` returned `Indeterminate` for a pipe, `/dev/null` or a tty | The unsupported-fsync errnos are tolerated, measured per platform |
+| §3 claimed a `TestDependencyDirection` that had never been written | `internal/arch` parses the real import graph and fails in both directions |
 
-**Then build the engine** — the audit estimates roughly 750 lines: a bbolt-backed `StateStore`, an ndjson
+Test packages went from 9 to 16, and `pkg/` has its first tests. `go build`, `go vet`, `gofmt` and
+`go test -race ./...` are clean.
+
+**Next is the engine** — the audit estimates roughly 750 lines: a durable `StateStore`, an ndjson
 encoder, the node loops and commit pump whose shapes are already fixed in
 [`internal/engine/build.go`](internal/engine/build.go)'s `Run` TODO, a `main`, and one `kill -9` test.
 That is R3's milestone, and it is the only thing that turns the guards in this repository from designs
 into facts.
+
+Still open, and tracked where they belong rather than here: the twelve decisions in
+[`_completeness-audit.md`](docs/decisions/_completeness-audit.md) that cost a breaking change if
+deferred, and the remaining findings in
+[`_rule-compliance.md`](docs/decisions/_rule-compliance.md). There is no CI configuration, so every
+test above protects only someone who runs it.

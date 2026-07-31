@@ -15,9 +15,31 @@ import (
 	"github.com/BernardoCSACarreira/canal/pkg/fault"
 	"github.com/BernardoCSACarreira/canal/pkg/registry"
 	"github.com/BernardoCSACarreira/canal/pkg/spec"
+	"github.com/BernardoCSACarreira/canal/pkg/store"
 )
 
 func deps() engine.Deps { return engine.Deps{State: memstore.New()} }
+
+// durableState is memstore with one lie removed: it declares a node-scoped durability domain.
+//
+// memstore is honest scaffolding — it reports DurabilityNone because it is a map. store.StoreCaps
+// now refuses any tier above at-least-once on such a store, since the dedupe additions and pending
+// committables ARE what those tiers are made of and they cannot live only in RAM. A test about the
+// GUARANTEE LADDER therefore needs a store that claims to be durable, or it is testing the store
+// rather than the ladder.
+type durableState struct{ *memstore.StateStore }
+
+func (durableState) Capabilities() store.StoreCaps {
+	return store.StoreCaps{
+		AtomicMultiKey: true,
+		CAS:            true,
+		EpochFencing:   true,
+		Durability:     connector.DurabilityNode,
+		FlushIsDurable: true,
+	}
+}
+
+func durableDeps() engine.Deps { return engine.Deps{State: durableState{memstore.New()}} }
 
 // fanOut is the commissioned topology: one source, three sinks with three different guarantees and
 // three different speeds, plus a dead-letter destination on the best-effort branch's failed edge.
@@ -242,7 +264,7 @@ func TestNegotiatedGuaranteeCannotReachExactlyOnce(t *testing.T) {
 			Write:  connector.DestAppend,
 		}},
 	}
-	p, neg, d := engine.Build(context.Background(), Reg, s, deps())
+	p, neg, d := engine.Build(context.Background(), Reg, s, durableDeps())
 	dump(t, d)
 	if d.HasErrors() {
 		t.Fatal("a single-sink exactly-once pipeline against a Committer sink should build")

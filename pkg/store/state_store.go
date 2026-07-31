@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"iter"
 
 	"github.com/BernardoCSACarreira/canal/pkg/connector"
@@ -64,6 +65,26 @@ func (c StoreCaps) Supports(g connector.Guarantee) (bool, string) {
 	}
 	if !c.CAS || !c.EpochFencing {
 		return false, "the configured state store has no compare-and-set or no epoch fencing, so two workers could both write one lane's progress"
+	}
+
+	// Durability is the DOMAIN a write survives in, and it is a SEPARATE question from FlushIsDurable,
+	// which only says the write is durable by the time Set returns. A store can answer FlushIsDurable
+	// truthfully and still hold everything in RAM — which is what the in-memory example store does.
+	// Because this check did not exist, that store passed exactly_once.
+	//
+	// The requirement is deliberately confined to the tiers that need it. At-most-once promises
+	// nothing. At-least-once survives a volatile position honestly: losing it means re-reading from
+	// the last durable point, or from the beginning, which produces duplicates and not loss — and
+	// duplicates are what at-least-once already permits.
+	//
+	// Above at-least-once the calculus inverts. Both effectively-once and exactly-once are collapse
+	// mechanisms: the dedupe additions and the pending committables ARE the guarantee. If they do not
+	// outlive the process, a restart re-emits with no memory of what already landed, and the tier is
+	// a claim rather than a mechanism. See ADR 0024.
+	if g > connector.AtLeastOnce && c.Durability < connector.DurabilityNode {
+		return false, fmt.Sprintf(
+			"the configured state store's durability domain is %s, so the dedupe state and pending committables that %s depends on do not survive a restart",
+			c.Durability, g)
 	}
 	if g > connector.AtLeastOnce && !c.AtomicMultiKey {
 		return false, "the configured state store cannot write several keys atomically, so a checkpoint could be torn between its cursors and its committables"

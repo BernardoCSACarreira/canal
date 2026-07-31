@@ -34,7 +34,7 @@ type PipelineStatus struct {
 	Missing []string `json:"missing,omitempty"`
 
 	Phase      Phase       `json:"phase"`
-	Conditions []Condition `json:"conditions"`
+	Conditions []Condition `json:"conditions,omitempty"`
 
 	// StoppingSince and DrainDeadline are present only in [PhaseDraining]. Drained and drain-timeout
 	// are DISTINCT events, because the second means records may replay.
@@ -44,10 +44,10 @@ type PipelineStatus struct {
 	Negotiated Negotiated `json:"negotiated"`
 
 	Throughput Throughput     `json:"throughput"`
-	Nodes      []NodeStatus   `json:"nodes"`
-	Lanes      []LaneStatus   `json:"lanes"`
-	Buffers    []BufferStatus `json:"buffers"`
-	Workers    []WorkerStatus `json:"workers"`
+	Nodes      []NodeStatus   `json:"nodes,omitempty"`
+	Lanes      []LaneStatus   `json:"lanes,omitempty"`
+	Buffers    []BufferStatus `json:"buffers,omitempty"`
+	Workers    []WorkerStatus `json:"workers,omitempty"`
 
 	// LaneCount is how many lanes EXIST; Lanes carries at most one page of them and LanesTruncated
 	// says so. A source with 900 streams or 10^5 scan chunks makes an unpaginated lane array the
@@ -60,11 +60,11 @@ type PipelineStatus struct {
 	// switching on a phase.
 	Scan *ScanProgress `json:"scan"`
 
-	RecentEvents []Event    `json:"recentEvents"`
+	RecentEvents []Event    `json:"recentEvents,omitempty"`
 	LastFault    *FaultInfo `json:"lastFault"`
 
 	// Config is the REDACTED config tree. It is the only form that ever leaves the process.
-	Config map[string]any `json:"config"`
+	Config map[string]any `json:"config,omitempty"`
 }
 
 // Throughput is the pipeline-level rate summary. Every field is a pointer because a pipeline that has

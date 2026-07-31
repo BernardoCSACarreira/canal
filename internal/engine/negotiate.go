@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/BernardoCSACarreira/canal/pkg/config"
 	"github.com/BernardoCSACarreira/canal/pkg/connector"
@@ -301,6 +302,54 @@ func negotiate(s *spec.Spec, res resolved, sc store.StoreCaps, d config.Diagnost
 // honest refusal blocks submission, and it is recorded with actor, time and reason for the pipeline's
 // whole life. A waiver matching nothing becomes its own warning, so a stale one is visible rather
 // than load-bearing.
+// waiverCovers reports whether one operator-signed waiver actually covers one refusal.
+//
+// This predicate is the whole of the fix for the audit's fatal R4 finding. The old matcher tested
+// only three things — that the waiver was signed, that it gave a reason, and that its Node was
+// either empty or equal — so an empty Node acted as a WILDCARD and any single signed waiver
+// downgraded every capability and guarantee error on every node in the pipeline, including ADR
+// 0006's ack-before-persist guard. Signing off "the queue sink cannot upsert" silently also signed
+// off "this pipeline will lose data".
+//
+// Three conditions now hold, and the first two are what close that hole:
+//
+//  1. SCOPE IS EXACT. A waiver anchored to a node covers only that node; a pipeline-scoped waiver
+//     (empty Node) covers only pipeline-scoped refusals. There is no wildcard.
+//  2. IT MUST NAME WHAT IT WAIVES. Missing lists capability tokens (ADR 0024: "capability NAMES,
+//     never iota ids"). A capability refusal carries Iface, the Go interface that would fix it, so
+//     the waiver has to name that interface. A waiver cannot cover a refusal it does not mention.
+//  3. IT MUST BE SIGNED AND EXPLAINED, as before.
+//
+// A waiver is a TIER decision — ADR 0024 exists so an operator with an append-only sink can run at
+// a lower tier knowingly. It is not a data-loss decision, and the refusals that mean "this
+// configuration loses records" are not on the ladder it can move you down.
+func waiverCovers(w telemetry.Downgrade, dg config.Diagnostic) bool {
+	if w.AcknowledgedBy == "" || w.Reason == "" {
+		return false // an unsigned or unexplained waiver waives nothing
+	}
+	if len(w.Missing) == 0 {
+		return false // and neither does one that does not say what it is waiving
+	}
+	if w.Node != dg.Node {
+		return false // exact scope: no wildcard, in either direction
+	}
+
+	// A capability refusal names the interface that would fix it. The waiver must name it too.
+	if dg.Code == config.CodeCapability {
+		if dg.Iface == "" {
+			// No machine-readable identity to match against, so this refusal is not waivable. It
+			// fails closed deliberately: the alternative is matching on prose, and a waiver that
+			// matches on a message string stops matching the day the message is reworded.
+			return false
+		}
+		return slices.Contains(w.Missing, dg.Iface)
+	}
+
+	// A guarantee refusal is the tier itself. The waiver must be the one for this move, which means
+	// naming both ends of it.
+	return w.Requested != "" && w.Effective != ""
+}
+
 func applyWaivers(s *spec.Spec, d config.Diagnostics) config.Diagnostics {
 	if len(s.Downgrades) == 0 {
 		return d
@@ -314,11 +363,8 @@ func applyWaivers(s *spec.Spec, d config.Diagnostics) config.Diagnostics {
 			continue
 		}
 		for j, w := range s.Downgrades {
-			if w.Node != "" && w.Node != d[i].Node {
+			if !waiverCovers(w, d[i]) {
 				continue
-			}
-			if w.AcknowledgedBy == "" || w.Reason == "" {
-				continue // an unsigned or unexplained waiver waives nothing
 			}
 			d[i].Severity = config.SeverityWarning
 			d[i].Hint = "running under an operator-signed waiver: " + w.Reason + " — " + d[i].Hint
@@ -328,6 +374,12 @@ func applyWaivers(s *spec.Spec, d config.Diagnostics) config.Diagnostics {
 	}
 	for j, w := range s.Downgrades {
 		switch {
+		case len(w.Missing) == 0:
+			d = append(d, config.Diagnostic{
+				Node: w.Node, Severity: config.SeverityError, Code: config.CodeGuarantee,
+				Message: "a downgrade waiver must name the capabilities whose absence it is waiving",
+				Hint:    "list them in Missing, as their stable tokens; a waiver that names nothing cannot be checked against anything and would silence every refusal on the node",
+			})
 		case w.AcknowledgedBy == "" || w.Reason == "":
 			d = append(d, config.Diagnostic{
 				Node: w.Node, Severity: config.SeverityError, Code: config.CodeGuarantee,

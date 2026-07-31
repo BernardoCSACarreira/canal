@@ -144,6 +144,30 @@ func (t *Tracker[P]) TrackResolved(payload P) (P, bool) {
 	if t.closed {
 		return zero, false
 	}
+
+	// COALESCE a run of already-resolved positions at the tail instead of growing the list.
+	//
+	// This is the fix for the unbounded path the compliance audit measured at 419.6 MiB for five
+	// million nodes. TrackResolved contributes zero weight by design — that is what lets a thousand
+	// quiet streams emit a position every second without consuming budget — but the budget is
+	// weight-based, so nothing bounded the NODE COUNT. A lane whose prefix is stuck behind one
+	// unsettled record accumulates a node per idle poll, forever, and the memory is invisible to
+	// every backpressure signal the package has.
+	//
+	// Merging is sound because the two nodes are adjacent and both resolved: advanceLocked walks
+	// them in one pass and stops at the later payload either way, so the earlier position is never
+	// observable as the prefix maximum. Overwriting the tail's payload gives the identical answer in
+	// O(1) space.
+	//
+	// Only a zero-weight resolved tail is merged. A released TRACKED node is also resolved, but it
+	// carries weight and reference bookkeeping that other callers still reason about, so it is left
+	// alone.
+	if n := t.tail; n != nil && n.resolved && n.weight == 0 && n.refs == 0 {
+		n.payload = payload
+		n.at = time.Now()
+		return t.advanceLocked()
+	}
+
 	t.appendLocked(&node{payload: payload, at: time.Now(), resolved: true})
 	return t.advanceLocked()
 }

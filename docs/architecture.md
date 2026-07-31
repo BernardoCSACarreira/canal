@@ -458,8 +458,10 @@ That table and this section are one fact written twice, which is exactly the sha
 be wrong for the whole of the project's life so far. The test is what keeps them in agreement; change
 one and the other fails.
 
-Still outstanding: there is no `go vet` analyser and **no CI configuration at all**, so the test protects
-anyone who runs `go test ./...` and nobody who does not.
+`.github/workflows/ci.yml` runs it, along with `gofmt`, `go vet`, `go build`, `go test` and
+`go test -race`, on Linux and macOS, plus a five-target cross-compile matrix and a check that the
+module still has zero third-party dependencies. Still outstanding: there is no `go vet` analyser
+specific to the connector boundary — the boundary is asserted by the test rather than by the tool.
 
 ### Direction is strictly downward, with no cycles
 

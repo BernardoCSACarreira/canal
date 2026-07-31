@@ -1,0 +1,198 @@
+name: CI
+
+# The compliance audit's standing finding was "no CI configuration at all", so every guard in this
+# repository protected only whoever remembered to run it. These jobs are that gap closed.
+#
+# Two principles shape what is here:
+#
+#   1. Anything checkable in Go is a Go test, not a step in this file. `internal/arch` holds the
+#      dependency-direction, connector-boundary, link and mermaid-well-formedness checks, so a
+#      contributor sees them locally from `go test ./...` and CI simply runs the same thing. A gate
+#      that only exists in YAML is a gate you cannot reproduce.
+#   2. What remains here is what genuinely needs an environment: several platforms, several
+#      architectures, and a browser.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A new push supersedes an in-flight run for the same ref; main is never cancelled.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both, deliberately. internal/example/stdoutsink asserts which fsync errnos mean "this
+        # descriptor cannot be synced", and those differ per platform: /dev/null answers ENODEV and
+        # a pipe answers EBADF on darwin, where Linux answers EINVAL for both. That set was measured
+        # on one machine, so it needs the other to stay honest.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Read the version from go.mod rather than pinning it twice. R9's rule is that one concept
+          # gets one spelling, and a Go version hard-coded here would drift from go.mod exactly the
+          # way the old contract version drifted across its five copies.
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files are not gofmt-clean:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: build
+        run: go build ./...
+
+      - name: test
+        run: go test ./...
+
+      - name: test -race
+        # The race detector is not optional for this repository. Ledger.send racing Ledger.Close was
+        # a real send-on-closed-channel panic in the shutdown window the engine reserves for late
+        # acks, and it shipped for as long as nothing ran this.
+        run: go test -race ./...
+
+  cross:
+    name: cross-compile
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: windows, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+        # "Two deployment shapes from one binary" is a stated goal, and the sink example reaches for
+        # syscall errnos, which is exactly the kind of code that compiles on the author's laptop and
+        # nowhere else.
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build ./...
+
+  deps:
+    name: zero dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: no third-party modules
+        # "No third-party dependencies" is a property the README advertises. Advertised properties
+        # decay unless something enforces them, which is R8's whole point.
+        run: |
+          deps=$(go list -m all | tail -n +2)
+          if [ -n "$deps" ]; then
+            echo "::error::the module has acquired third-party dependencies:"
+            echo "$deps"
+            exit 1
+          fi
+          echo "zero third-party modules, as advertised"
+
+      - name: go.mod is tidy
+        run: |
+          cp go.mod go.mod.bak
+          [ -f go.sum ] && cp go.sum go.sum.bak
+          go mod tidy
+          if ! diff -q go.mod go.mod.bak >/dev/null; then
+            echo "::error::go mod tidy changed go.mod; commit the result"
+            diff -u go.mod.bak go.mod || true
+            exit 1
+          fi
+
+  diagrams:
+    name: mermaid renders
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: render every diagram
+        # The structural checks — fences balanced, diagram type known, no pinned colours — are Go
+        # tests in internal/arch and run everywhere. This job is the part that needs a browser:
+        # whether mermaid can actually parse each diagram. Sixty of them landed in one change, and a
+        # diagram that fails to parse is invisible until somebody opens the page on GitHub.
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/diagrams
+          while IFS= read -r file; do
+            # The output name carries the source path, because awk's counter restarts on every
+            # invocation: a shared NNN prefix silently let README's three diagrams overwrite the
+            # architecture document's first three, and 60 extracted as 57.
+            slug=$(printf '%s' "$file" | sed 's|^\./||; s|[/.]|_|g')
+            awk -v out=/tmp/diagrams -v slug="$slug" '
+              /^```mermaid[ \t]*$/ { inblk=1; f=sprintf("%s/%s-%03d.mmd", out, slug, ++c); next }
+              inblk && /^```[ \t]*$/ { inblk=0; close(f); next }
+              inblk { print > f }
+            ' "$file"
+          done < <(find . -name '*.md' -not -path './.git/*')
+
+          shopt -s nullglob
+          files=(/tmp/diagrams/*.mmd)
+
+          # Cross-check the extractor against a plain fence count. This is the check that would have
+          # caught the overwrite bug above, where 60 diagrams silently became 57 — an extractor that
+          # quietly drops work reports a green build for diagrams it never looked at.
+          fences=$(find . -name '*.md' -not -path './.git/*' -exec grep -c '^```mermaid$' {} + \
+                   | awk -F: '{s+=$2} END {print s+0}')
+          echo "extracted ${#files[@]} diagrams; ${fences} mermaid fences in the tree"
+          if [ "${#files[@]}" -ne "$fences" ]; then
+            echo "::error::extracted ${#files[@]} diagrams but found $fences fences; the extractor is dropping some"
+            exit 1
+          fi
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::no diagrams were extracted; the extractor is broken, not the docs"
+            exit 1
+          fi
+
+          failed=0
+          for f in "${files[@]}"; do
+            if ! npx --yes @mermaid-js/mermaid-cli@11 -i "$f" -o "${f%.mmd}.svg" >/dev/null 2>/tmp/err; then
+              echo "::error::$f does not render:"
+              sed -n '1,15p' /tmp/err
+              head -5 "$f"
+              failed=$((failed+1))
+            fi
+          done
+          if [ $failed -gt 0 ]; then
+            echo "::error::$failed of ${#files[@]} diagrams failed to render"
+            exit 1
+          fi
+          echo "all ${#files[@]} diagrams render"

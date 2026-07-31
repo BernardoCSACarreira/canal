@@ -19,9 +19,15 @@ anywhere in the engine.
 | A binary | **does not exist.** There is no `main` package, so there is nothing to `kill -9`. |
 | Codecs, buffers, transforms, a frontend, an API | **do not exist.** The interfaces for them do. |
 
-`go build ./...`, `go vet ./...` and `gofmt -l .` are clean. `go test ./...` passes: 42 test functions
-across 9 packages, all of them under `internal/`. **`pkg/` has no unit tests** — it is asserted against
-today only by the stress corpus and by the compiler.
+`go build ./...`, `go vet ./...`, `gofmt -l .` and `go test -race ./...` are clean: 68 test functions
+across 16 packages, 3 of them under `pkg/`. [CI](.github/workflows/ci.yml) runs all of that on Linux and
+macOS, cross-compiles for five targets, verifies the module still has zero third-party dependencies, and
+renders every mermaid diagram in the repository.
+
+`pkg/` is still thinly tested — the enum wire form, the read-model shape and the descriptor round trip
+have tests because defects were found there; the rest is asserted only by the stress corpus and the
+compiler. `internal/arch` holds the structural tests: the dependency graph, the connector import
+boundary, and every relative link and diagram fence in the docs.
 
 Design rule [R3](docs/design-rules.md) says one end-to-end path comes before any breadth, and the
 project's own compliance audit records R3 as **violated**. That audit
@@ -383,5 +389,4 @@ into facts.
 Still open, and tracked where they belong rather than here: the twelve decisions in
 [`_completeness-audit.md`](docs/decisions/_completeness-audit.md) that cost a breaking change if
 deferred, and the remaining findings in
-[`_rule-compliance.md`](docs/decisions/_rule-compliance.md). There is no CI configuration, so every
-test above protects only someone who runs it.
+[`_rule-compliance.md`](docs/decisions/_rule-compliance.md).

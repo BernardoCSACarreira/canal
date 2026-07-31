@@ -1,8 +1,26 @@
 # Rule-compliance audit — the delivered interface set against `docs/design-rules.md`
 
-**Status: DRAFT.** Not normative (design rule R12). This document makes no decision. It reports
-verdicts and evidence, and proposes a priority order. Anything adopted from here must move into
-`docs/architecture.md` or a numbered ADR to become binding.
+**Status: DRAFT, and a DATED SNAPSHOT.** Not normative (design rule R12). This document makes no
+decision. It reports verdicts and evidence, and proposes a priority order. Anything adopted from here
+must move into `docs/architecture.md` or a numbered ADR to become binding.
+
+> **What has changed since this audit ran at commit `a83f88e`.** The verdicts below are left exactly
+> as they were found, because an audit rewritten to match later work stops being evidence of
+> anything. Four of its findings have since been addressed:
+>
+> - **R3 (violated)** — `Pipeline.Run` is implemented (`internal/engine/run.go`), `cmd/canal` exists,
+>   and `cmd/canal/main_test.go` `SIGKILL`s the real binary three times against a 300,000-line input
+>   and asserts no record is skipped.
+> - **"no durable store exists"** — `pkg/store/wal` is a real `store.StateStore`: CRC32C framing,
+>   fsync before `Set` returns, per-key CAS and epoch fencing, and a torn tail truncated rather than
+>   refused.
+> - **"no encoder, framer or compressor implementation exists"** — `pkg/codec` ships `raw`, `json`
+>   and `newline`, and `internal/engine/codec.go` resolves them from the node's codec block.
+> - **The ten delivered-code defects** in the sections below were each fixed with a test first proven
+>   to catch the bug; they are listed in the README's before/after table.
+>
+> Everything else it found — no `store.Coordinator`, no transforms or buffers, no retry routing, the
+> thin `pkg/` test coverage — is still open.
 
 **Scope.** `pkg/` (the connector-author-facing interface set), `internal/` (engine, ledger, the two
 example connectors, the eight hostile stress connectors), `docs/architecture.md` (declared NORMATIVE),

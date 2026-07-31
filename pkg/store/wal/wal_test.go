@@ -469,3 +469,21 @@ func TestOpenRejectsANewerFormat(t *testing.T) {
 		t.Fatal("Open accepted a format version it does not understand")
 	}
 }
+
+// TestCapabilitiesNeedNoOpenStore pins [Caps] to the method that reports it.
+//
+// The two exist separately so a tool can ask what a WAL-backed deployment would negotiate without
+// opening — and therefore exclusively locking — a directory a running pipeline may hold. That is
+// only safe while they answer identically, and a capability set that drifts between the two would
+// have `canal check` reporting a contract `canal run` does not honour.
+func TestCapabilitiesNeedNoOpenStore(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("opening: %v", err)
+	}
+	defer s.Close()
+
+	if got, want := s.Capabilities(), Caps(); got != want {
+		t.Errorf("an opened store reports %+v but Caps reports %+v", got, want)
+	}
+}

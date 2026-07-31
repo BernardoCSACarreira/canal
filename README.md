@@ -8,33 +8,43 @@ anywhere in the engine.
 
 ## Status — read this before anything else
 
-**The interface set is real. The engine is not built.** Nothing has ever moved a record.
+**One end-to-end path runs, and it survives `kill -9`.** A record moves from a file to a sink, its
+position is durable, and killing the process mid-run loses nothing. Everything wider than that path
+is still interfaces.
+
+```bash
+go run ./cmd/canal check --spec your-pipeline.json
+```
 
 | | |
 |---|---|
-| `pkg/` — the connector-author surface | **real, compiling, documented.** 76 files, 12,108 lines. |
-| `internal/engine`, `internal/ledger` | **partly real.** 2,474 lines. `Build` resolves, validates and negotiates a delivery guarantee. `Pipeline.Run` is a one-line error return. |
-| `internal/stress` — eight hostile connectors | **real.** 18,285 lines, kept as an interface-shape regression suite; the audit found five of the eight genuinely catch drift today. |
-| Durable state store | **does not exist.** The only `store.StateStore` in the tree is [`internal/example/memstore`](internal/example/memstore/store.go), an in-memory map that labels itself as scaffolding. |
-| A binary | **does not exist.** There is no `main` package, so there is nothing to `kill -9`. |
-| Codecs, buffers, transforms, a frontend, an API | **do not exist.** The interfaces for them do. |
+| `pkg/` — the connector-author surface | **real, compiling, documented.** 89 files, 14,074 lines. |
+| `internal/engine`, `internal/ledger` | **real for one shape.** 4,154 lines. `Build` resolves, validates and negotiates; `Run` reads, admits, writes, settles, flushes and commits. Single worker, no transforms, no buffers. |
+| `cmd/canal` | **real.** `run` and `check`, 483 lines of wiring and no policy. |
+| Durable state store | **real.** [`pkg/store/wal`](pkg/store/wal) is a hand-rolled write-ahead log: CRC32C framing, fsync before return, a torn tail truncated rather than refused, and a flock the kernel drops when the holder dies. |
+| Codecs | **three.** `raw` and `json` encoders, a `newline` framer. json+newline is ndjson; raw+newline is a log tail. |
+| `internal/stress` — eight hostile connectors | **real.** 15,670 lines, kept as an interface-shape regression suite; the audit found five of the eight genuinely catch drift today. |
+| Buffers, transforms, multi-worker, a frontend, an API | **do not exist.** The interfaces for them do, and the negotiation refuses a pipeline that asks for one. |
 
-`go build ./...`, `go vet ./...`, `gofmt -l .` and `go test -race ./...` are clean: 68 test functions
-across 16 packages, 3 of them under `pkg/`. [CI](.github/workflows/ci.yml) runs all of that on Linux and
-macOS, cross-compiles for five targets, and verifies the module still has zero third-party
+`go build ./...`, `go vet ./...`, `gofmt -l .` and `go test -race ./...` are clean: 105 test functions
+across 18 packages, 41 of them under `pkg/`. [CI](.github/workflows/ci.yml) runs all of that on Linux
+and macOS, cross-compiles for five targets, and verifies the module still has zero third-party
 dependencies.
 
-`pkg/` is still thinly tested — the enum wire form, the read-model shape and the descriptor round trip
-have tests because defects were found there; the rest is asserted only by the stress corpus and the
-compiler. `internal/arch` holds the structural tests: the dependency graph, the connector import
-boundary, and every relative link and diagram fence in the docs.
+Design rule [R3](docs/design-rules.md) — one end-to-end path before any breadth — is **closed**.
+[`cmd/canal/main_test.go`](cmd/canal/main_test.go) starts the real binary against a 300,000-line
+input, `SIGKILL`s it three times mid-run, and asserts that no record is ever skipped: not at a
+restart seam, not anywhere in the output. Duplicates are permitted and counted, because the
+negotiated tier is at-least-once and pretending otherwise would be the lie the whole design exists
+to avoid. Both of that test's assertions were confirmed against deliberately injected defects; the
+one class of defect it provably does **not** catch is named in its doc comment.
 
-Design rule [R3](docs/design-rules.md) says one end-to-end path comes before any breadth, and the
-project's own compliance audit records R3 as **violated**. That audit
-([`docs/decisions/_rule-compliance.md`](docs/decisions/_rule-compliance.md)) ran 19 adversarial checks
-against the delivered code and returned **4 violated, 9 partially violated, 6 satisfied-with-caveats,
-0 clean**. It is linked here rather than buried because a reader who finds the gap themselves has no
-reason to trust anything else in the repository.
+The project's own compliance audit
+([`docs/decisions/_rule-compliance.md`](docs/decisions/_rule-compliance.md)) ran 19 adversarial
+checks against the delivered code and returned **4 violated, 9 partially violated, 6
+satisfied-with-caveats, 0 clean**. It is a dated snapshot taken before the engine ran — R3 and the
+state-store findings are addressed above — and it is linked here rather than buried because a reader
+who finds a gap themselves has no reason to trust anything else in the repository.
 
 ## Goals — the end state
 
@@ -83,21 +93,22 @@ Rectangles are interfaces a connector author implements
 [`transform.go`](pkg/connector/transform.go), [`buffer.go`](pkg/connector/buffer.go),
 [`codec.go`](pkg/connector/codec.go)); rounded boxes are core machinery
 ([`internal/ledger/ledger.go`](internal/ledger/ledger.go),
-[`pkg/store/state_store.go`](pkg/store/state_store.go)). **Every arrow is dotted because every arrow is
-work `internal/engine.Pipeline.Run` would do, and `Run` is a stub**
-([`internal/engine/build.go:321`](internal/engine/build.go)). The only registration calls in the whole tree
-are `registry.AddSource` and `registry.AddSink` — no transform, buffer, encoder, framer or compressor
-exists — so stage 2 is interfaces only.
+[`pkg/store/state_store.go`](pkg/store/state_store.go)). Stages 1, 3 and 4 run today, in
+[`internal/engine/run.go`](internal/engine/run.go). Stage 2 is **half real**: encoders, framers and
+compressors are resolved from the node's codec block
+([`internal/engine/codec.go`](internal/engine/codec.go)) and three are registered, but no transform
+or buffer is registered anywhere in the tree, so those two are interfaces with no instances and the
+negotiation refuses a pipeline that asks for one.
 
 ### The commit protocol
 
-The one thing worth understanding before reading any code. It is specified in full and implemented in
-half.
+The one thing worth understanding before reading any code. All three phases run; the epoch fencing
+in phase three is written but has only one worker to fence, so it is not yet load-bearing.
 
 ```mermaid
 sequenceDiagram
     participant Src as connector.Source
-    participant Eng as engine.Pipeline.Run — NOT BUILT
+    participant Eng as engine.Pipeline.Run
     participant Led as ledger.Ledger
     participant Snk as connector.Sink
     participant St as store.StateStore
@@ -116,9 +127,10 @@ sequenceDiagram
     Note over Eng,St: Phase three must never precede the flush. A source that prunes on commit<br/>would free upstream log canal has no durable record of. See ADR 0006.
 ```
 
-`Admit`, `Settle` and `Flushable` exist and are tested only indirectly
-([`internal/ledger/ledger.go`](internal/ledger/ledger.go)); the driver that would call them in this order
-does not, and no `StateStore` in the tree is actually durable. The ordering rule is
+`Admit`, `Settle` and `Flushable` are in
+[`internal/ledger/ledger.go`](internal/ledger/ledger.go); the driver that calls them in this order is
+[`internal/engine/run.go`](internal/engine/run.go), and the `StateStore` underneath is
+[`pkg/store/wal`](pkg/store/wal), which fsyncs before `Set` returns. The ordering rule is
 [ADR 0006](docs/decisions/0006-three-phase-commit.md) and the narrative version is the package comment in
 [`internal/engine/doc.go`](internal/engine/doc.go). A sink is never shown progress at all — it signals
 durability by returning a clean `WriteResult`, which is why a new sink cannot get progress wrong.
@@ -176,7 +188,8 @@ extensibility claim checkable, because a connector cannot reach an engine type e
 > [`_rule-compliance.md`](docs/decisions/_rule-compliance.md) still describes §3 that way. That table has
 > since been replaced with a graph regenerated from `go list`, and the four claimed-and-absent edges are
 > now drawn explicitly as absent. Nothing yet stops it drifting again: the
-> `TestDependencyDirection` that §3 once claimed to have still does not exist.
+> `TestDependencyDirection` that §3 once claimed to have now exists, in
+> [`internal/arch`](internal/arch/deps_test.go), and fails in both directions.
 
 The tree as it actually is:
 
@@ -196,7 +209,8 @@ pkg/                    the connector-author surface — the public contract
                         break every connector's test suite
 
 internal/               engine machinery and connectors; unreachable from outside the module
-  engine/               Build, negotiation, the graph, checkpoint plumbing, Run (a stub)
+  engine/               Build, negotiation, the graph, codec resolution, checkpoint plumbing,
+                        and Run: read, admit, write, settle, flush, commit
   ledger/               Tracker[P], Ledger, Disposition, LaneStats, the leak reaper
   example/              linefile source, stdoutsink sink, memstore StateStore (scaffolding)
   stress/               eight deliberately hostile connectors, kept as a regression suite
@@ -380,11 +394,16 @@ was first verified to fail against the original bug:
 Test packages went from 9 to 16, and `pkg/` has its first tests. `go build`, `go vet`, `gofmt` and
 `go test -race ./...` are clean.
 
-**Next is the engine** — the audit estimates roughly 750 lines: a durable `StateStore`, an ndjson
-encoder, the node loops and commit pump whose shapes are already fixed in
-[`internal/engine/build.go`](internal/engine/build.go)'s `Run` TODO, a `main`, and one `kill -9` test.
-That is R3's milestone, and it is the only thing that turns the guards in this repository from designs
-into facts.
+**That list is done, and so is the engine that followed it.** The durable `StateStore`
+([`pkg/store/wal`](pkg/store/wal)), the codecs ([`pkg/codec`](pkg/codec)), the node loops and commit
+pump ([`internal/engine/run.go`](internal/engine/run.go)), the binary
+([`cmd/canal`](cmd/canal)) and the `kill -9` test ([`cmd/canal/main_test.go`](cmd/canal/main_test.go))
+all exist. R3's milestone is met: the guards in this repository are facts about a running process
+rather than designs.
+
+**Next** is what the single-worker label in [`internal/engine/runtime.go`](internal/engine/runtime.go)
+holds open — a `store.Coordinator`, leases and real epoch fencing — plus transforms and buffers, and
+tests for the fault-classification and abandon paths that nothing exercises yet.
 
 Still open, and tracked where they belong rather than here: the twelve decisions in
 [`_completeness-audit.md`](docs/decisions/_completeness-audit.md) that cost a breaking change if

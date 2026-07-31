@@ -1,7 +1,10 @@
 # binaries
 /bin/
 /dist/
-canal
+# Anchored, because a bare "canal" matches at ANY depth and Go's own layout puts the source of the
+# binary in cmd/canal — an unanchored pattern silently excluded the whole package from a commit.
+# `go build ./cmd/canal` from the repo root writes exactly this path and nothing else does.
+/canal
 *.exe
 
 # go

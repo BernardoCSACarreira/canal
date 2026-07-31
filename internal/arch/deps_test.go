@@ -32,12 +32,15 @@ const modulePath = "github.com/BernardoCSACarreira/canal"
 // cannot drift from the code again in either direction.
 var declared = map[string][]string{
 	// pkg/ — the published surface. Strictly downward, schema at the bottom.
-	"pkg/schema":        {},
-	"pkg/record":        {"pkg/schema"},
-	"pkg/fault":         {"pkg/record"},
-	"pkg/config":        {"pkg/fault", "pkg/record"},
-	"pkg/connector":     {"pkg/config", "pkg/fault", "pkg/record", "pkg/schema"},
-	"pkg/registry":      {"pkg/config", "pkg/connector"},
+	"pkg/schema":    {},
+	"pkg/record":    {"pkg/schema"},
+	"pkg/fault":     {"pkg/record"},
+	"pkg/config":    {"pkg/fault", "pkg/record"},
+	"pkg/connector": {"pkg/config", "pkg/fault", "pkg/record", "pkg/schema"},
+	"pkg/registry":  {"pkg/config", "pkg/connector"},
+	// pkg/codec imports exactly what a third-party codec would, which is the same six-package
+	// boundary a connector is held to. That is the point: nothing here is privileged.
+	"pkg/codec":         {"pkg/config", "pkg/connector", "pkg/fault", "pkg/record", "pkg/registry"},
 	"pkg/telemetry":     {"pkg/connector", "pkg/fault", "pkg/record"},
 	"pkg/spec":          {"pkg/connector", "pkg/fault", "pkg/record", "pkg/registry", "pkg/schema", "pkg/telemetry"},
 	"pkg/store":         {"pkg/connector", "pkg/record", "pkg/spec", "pkg/telemetry"},

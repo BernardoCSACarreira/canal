@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"time"
 
 	"github.com/BernardoCSACarreira/canal/internal/ledger"
@@ -84,6 +86,10 @@ type Pipeline struct {
 	sources map[record.NodeID]*registry.ResolvedSource
 	sinks   map[record.NodeID]*registry.ResolvedSink
 
+	// codecs holds the encode/frame/compress chain of every byte sink, resolved at build time. A
+	// structured sink maps to nil.
+	codecs map[record.NodeID]*codecChain
+
 	ledger *ledger.Ledger
 
 	// negotiated is kept so the read model can serve what the operator GOT rather than what they asked
@@ -131,6 +137,7 @@ func Build(ctx context.Context, r *registry.Registry, s spec.Spec, d Deps) (*Pip
 		sources: map[record.NodeID]*registry.ResolvedSource{},
 		sinks:   map[record.NodeID]*registry.ResolvedSink{},
 		buffers: map[record.NodeID]connector.BufferCaps{},
+		codecs:  map[record.NodeID]*codecChain{},
 	}
 	var built []closer
 
@@ -199,6 +206,15 @@ func Build(ctx context.Context, r *registry.Registry, s spec.Spec, d Deps) (*Pip
 					"remove the codec block; a structured sink is handed records, not bytes"))
 			}
 
+			chain, made, notes, cd := resolveCodec(ctx, r, n.ID, cfg, rk)
+			built = append(built, made...)
+			defaults = append(defaults, notes...)
+			diags = append(diags, cd...)
+			if cd.HasErrors() {
+				continue
+			}
+			res.codecs[n.ID] = chain
+
 		case registry.KindBuffer:
 			e, ok := r.Buffer(n.Name)
 			if !ok {
@@ -258,6 +274,14 @@ func Build(ctx context.Context, r *registry.Registry, s spec.Spec, d Deps) (*Pip
 		return fail()
 	}
 
+	// The wire format each sink will produce is disclosed alongside the guarantee, because it is a
+	// thing the operator GOT rather than asked for: an unnamed encoder defaults to json, which
+	// base64-encodes a byte payload. Sorted, because iterating a map here is how DurabilityEdge
+	// once became nondeterministic.
+	for _, id := range slices.Sorted(maps.Keys(res.codecs)) {
+		neg.Why = append(neg.Why, fmt.Sprintf("sink %s writes %s", id, res.codecs[id].describe()))
+	}
+
 	budget := s.LaneBudget
 	if budget <= 0 {
 		budget = 1000
@@ -271,6 +295,7 @@ func Build(ctx context.Context, r *registry.Registry, s spec.Spec, d Deps) (*Pip
 		deps:    deps,
 		sources: res.sources,
 		sinks:   res.sinks,
+		codecs:  res.codecs,
 		ledger: ledger.New(ledger.Config{
 			Tenant:        s.Tenant,
 			Pipeline:      s.ID,

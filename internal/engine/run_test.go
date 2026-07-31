@@ -21,6 +21,10 @@ import (
 	"github.com/BernardoCSACarreira/canal/pkg/store/wal"
 
 	_ "github.com/BernardoCSACarreira/canal/internal/example/linefile"
+
+	// A byte sink needs an encoder, and this build refuses one that has none registered. Linking
+	// the shipped codecs is the same choice a deployment makes; see cmd/canal.
+	_ "github.com/BernardoCSACarreira/canal/pkg/codec"
 )
 
 // These are the first tests in the repository that RUN a pipeline. Every assertion before them was
@@ -106,7 +110,14 @@ func pipelineSpec(sinkName, path string) spec.Spec {
 		Graph: []spec.Node{
 			{ID: "in", Kind: registry.KindSource, Name: "line_file",
 				Config: map[string]any{"path": path}},
+			// raw + newline is a log tail: the payload passes through untouched and each record
+			// is terminated. Naming it matters — the unnamed default is json, which would base64
+			// a byte payload, and the json encoder refuses a record with no structured value
+			// rather than doing something surprising with it.
 			{ID: "out", Kind: registry.KindSink, Name: sinkName,
+				Config: map[string]any{
+					"codec": map[string]any{"encoder": "raw", "framer": "newline"},
+				},
 				Inputs: []spec.Edge{{From: "in"}}},
 		},
 		Streams: []spec.StreamConfig{{

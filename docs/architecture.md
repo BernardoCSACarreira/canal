@@ -12,9 +12,71 @@ rejected. `docs/research/` is evidence, not authority.
 target, not an illustration. Where a signature here differs from anything in a proposal, the
 difference is deliberate and the reason is in the defect ledger (§24) or an ADR.
 
+```mermaid
+flowchart TB
+    subgraph BUILT["BUILT — 106 files compile, go vet and gofmt clean"]
+        direction TB
+        P1["pkg/connector — Source, Sink, Transform, Buffer,<br/>Encoder / Framer / Compressor, LaneCtl, every *Caps"]
+        P2["pkg/record, pkg/schema, pkg/fault, pkg/config,<br/>pkg/spec, pkg/registry, pkg/telemetry"]
+        P3["pkg/store — the four store INTERFACES, nothing else"]
+        P4["internal/ledger — Ledger and Tracker, a real algorithm.<br/>No test file of its own: exercised only by<br/>internal/stress/parallel-snapshot/proof_test.go"]
+        BLD["internal/engine.Build + negotiate<br/>pure function of config, no I/O"]
+        P5["internal/stress — 8 hostile connectors, 8 passing test packages<br/>internal/example — linefile, stdoutsink, memstore"]
+    end
+
+    subgraph MISSING["NOT BUILT — no record has ever moved through canal"]
+        direction TB
+        RUN["engine.Pipeline.Run<br/>a one-line error return: no node loops,<br/>no commit pump, no drain, no shutdown"]
+        DUR["no DURABLE store.StateStore<br/>only internal/example/memstore, DurabilityNone"]
+        BIN["no package main and no cmd directory<br/>there is no binary"]
+        IMPL["no Encoder, Framer, Compressor, Buffer or Transform<br/>implementation exists anywhere in the module"]
+    end
+
+    BLD -->|"returns a *Pipeline holding only sources, sinks<br/>and a ledger that is never given a lane"| RUN
+```
+
+**Read this before anything else in the document.** The interface set is the deliverable of this
+stage: everything below the fold describes a runtime that does not exist yet — `Pipeline.Run` is
+`return fmt.Errorf(...)` at `internal/engine/build.go:322`, and `Build` in the same file constructs
+only source and sink components, validating buffer, transform and codec config without instantiating
+anything.
+
 ---
 
 ## 1. The spine, in one page
+
+```mermaid
+flowchart TB
+    R["Source.Read(ctx, dst *record.Batch)"]
+    AD["Ledger.Admit(ctx, b)<br/>core stamps the sequence, opens the group,<br/>BLOCKS while the lane budget is full"]
+    TR["Transform.Apply(in, from, out)<br/>N-to-0, N-to-N, N-to-M"]
+    BUF["Buffer.Put / Buffer.Get"]
+    BA["connector.Batcher + connector.Splitter"]
+    W["Sink.Write(ctx, req)"]
+    WR["connector.WriteResult<br/>Written / Failed / Deferred / Duplicates"]
+    SETTLE(["Ledger.Settle — see the next diagram"])
+
+    subgraph CODEC["codec stages, registered per SINK NODE — never named by a connector"]
+        direction LR
+        EN["Encoder.Encode"] -.-> FR["Framer.Frame"] -.-> CO["Compressor.Compress"]
+    end
+
+    R -.->|"record.Batch, dst.Lane preset by the allocator"| AD
+    AD -.->|"batch now carries GroupID and Position.Seq"| TR
+    TR -.-> BUF -.-> BA -.-> EN
+    CO -.->|"connector.Request: Body, Records []record.Ref, Schema"| W
+    W -.-> WR -.-> SETTLE
+
+    classDef impl stroke-width:3px
+    class AD,BA,SETTLE impl
+```
+
+The data path, in stage order taken from `internal/engine/doc.go` (read, admit, transform, buffer,
+batch, encode, write). **Every arrow is dotted because no arrow exists**: these are calls
+`Pipeline.Run` would make and `Pipeline.Run` is unimplemented. Thick-bordered boxes are the only ones
+backed by running code today — `internal/ledger/ledger.go` and `pkg/connector/batcher.go`; the rest
+are interfaces in `pkg/connector` (`source.go`, `transform.go`, `buffer.go`, `codec.go`, `sink.go`)
+with no caller and, for the three codec stages, no implementation either.
 
 canal moves records from sources to sinks. Exactly one concept carries the weight:
 
@@ -22,6 +84,38 @@ canal moves records from sources to sinks. Exactly one concept carries the weigh
 > independently-assignable progress domain inside a source. It is simultaneously the unit of
 > parallelism, the unit of resume, the ordering scope, the assignment and lease subject, the
 > in-flight accounting scope, and the progress-reporting scope.
+
+```mermaid
+flowchart LR
+    L["connector.LaneSpec<br/>announced once, then reused VERBATIM as the<br/>construction payload, the resume payload<br/>and the row in the assignment table"]
+
+    subgraph CORE["owned by the CORE — a connector can never see these"]
+        direction TB
+        J2["2 — RESUME<br/>LaneAssignment.Cursor<br/>engine.LaneState.Spec plus .Cursor"]
+        J4["4 — ASSIGNMENT AND LEASE<br/>record.LaneID, LaneAssignment.Epoch<br/>store.LaneRow, store.Assignment, store.Lease"]
+        J5["5 — IN-FLIGHT ACCOUNTING<br/>LaneSpec.Budget, LaneCtl.Admission<br/>Ledger.Admit blocks when the budget is full"]
+        J6["6 — PROGRESS SCOPE<br/>ledger.LaneStats: Resolved, Committed, ReplayRecords<br/>LaneSpec.Weight and .Kind are REPORTING ONLY"]
+    end
+
+    subgraph DECL["declared by the SOURCE"]
+        direction TB
+        J1["1 — PARALLELISM<br/>LaneCtl.Announce / AnnounceMany<br/>capped by SourceCaps.MaxLanes"]
+        J3["3 — ORDERING SCOPE<br/>LaneSpec.Ordering: OrderingPrefix or OrderingDiscrete<br/>no order is defined ACROSS lanes"]
+    end
+
+    L --> J1
+    L --> J3
+    L --> J2
+    L --> J4
+    L --> J5
+    L --> J6
+```
+
+One `connector.LaneSpec` (`pkg/connector/lane.go`) does all six jobs at once, which is why there is
+no separate task, partition or shard concept to keep in sync — the structural answer to R1's
+dual-representation defect. The source declares only jobs 1 and 3; the other four are core-owned
+(`pkg/connector/lanectl.go`, `pkg/store/coordinator.go`, `internal/ledger/ledger.go`,
+`internal/engine/checkpoint.go`) and none of that machinery has a runtime driving it yet.
 
 Everything the end-state goals list falls out of that one concept plus five rules.
 
@@ -47,6 +141,36 @@ graph and cannot answer "where are we"; Kafka Connect has an offset store and ca
 has both because the ack is a *method over bytes* and the resolver is *core-owned*.
 
 **Rule 2 — commit is three-phase, and the third phase is fenced.**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant K as Sink
+    participant E as engine commit pump — NOT BUILT
+    participant L as ledger.Ledger
+    participant S as store.StateStore
+    participant Src as Source
+
+    K-->>E: WriteResult with Written, Failed, Deferred
+    E->>L: Settle([]ledger.Outcome)
+    Note over L: the group refcount reaches zero and<br/>Tracker advances the contiguous prefix
+    E->>L: Flushable()
+    L-->>E: per-lane last SAFE position at or before the resolved prefix
+    Note over E,S: PHASE TWO
+    E->>S: Set(engine.Checkpoint) — lanes, committables,<br/>writer state and schema epoch in ONE atomic record
+    S-->>E: written AND flushed
+    E->>L: Committed(m)
+    L-->>E: Acks() yields connector.Ack with Through, Records, Abandoned
+    Note over E,Src: PHASE THREE — never for a revoked lane
+    E->>Src: Commit(ctx, Ack)
+```
+
+The ordering that makes a pruning upstream safe: `Ledger.Flushable` hands out positions and emits
+nothing, and only `Ledger.Committed` — called after the store write is flushed — puts an ack on the
+channel `Ledger.Acks` returns (`internal/ledger/ledger.go`, `Flushable` and `Committed`). The four
+ledger calls here are implemented code; the participant that sequences them — the engine commit
+pump — is the part that does not exist.
+
 `sink durable` → `canal's own position write is durably flushed` → `only then is the source told it may
 advance`. Conduit shipped the two-phase version and it was a confirmed sev-0: for a source whose
 upstream *prunes* on commit (a Postgres replication slot advancing `confirmed_flush_lsn` frees WAL for
@@ -91,6 +215,34 @@ implements:
 `AtMostOnce` exists as an explicitly-chosen downgrade (settle on hand-over), never as a silent
 degradation.
 
+### Diagram index
+
+Fifty-seven diagrams, every one drawn from the `.go` files rather than from the prose around it.
+Dotted edges and "NOT BUILT" boxes are load-bearing: they mark the parts of this document that
+describe an engine which does not run yet.
+
+| Section | Diagrams |
+|---|---|
+| [preamble](#canal--architecture) | what is built, and what is not |
+| [§1 The spine, in one page](#1-the-spine-in-one-page) | the data path, stage by stage · the six jobs of one `LaneSpec` · three-phase commit, fenced |
+| [§3 Package layout and dependency direction](#3-package-layout-and-dependency-direction) | the real import graph · what a connector may import · real edges vs the four claimed-and-absent ones |
+| [§4 The record model](#4-the-record-model-r2--decided-first) | the record envelope, as types · durable vs in-flight identifiers · `Origin`'s two writable layers · where each `Origin` field comes from · the carrier: `Batch`, `Position`, `Allocator` |
+| [§5 `fault`](#5-fault--classification-and-the-failure-shape-written-with-the-success-shape-r7) | class to behaviour · `Terminal()` and `Counted()` · the per-record retry state machine |
+| [§6 Lanes](#6-lanes--the-spine-as-a-type) | the lane lifecycle |
+| [§7 `Source`](#7-source--four-methods-frozen) | four methods, two goroutines · `SourceRuntime` vs `SinkRuntime` · one lane per `Read` vs many per `ReadLanes` |
+| [§8 `Sink`](#8-sink--three-methods-frozen-progress-blind) | the sink lifecycle, and `Write`'s three answers · the four quadrants of `Write` · checkpoint and recovery ordering · `WriteResult`'s four dispositions |
+| [§10 Capabilities](#10-capabilities--declared-data-plus-optional-interfaces) | declared data vs optional interface · source optional interfaces · sink optional interfaces, and the guarantee ceiling · the runtimes, and where the core grows · registration's two cross-checks · `Resolve`, and negotiation |
+| [§11 `spec`](#11-spec--topology-as-data-r1) | fan-in, fan-out, dead-letter edge · graph validation |
+| [§12 `ledger`](#12-ledger--the-ack-graph-the-commit-protocol-and-the-answer-to-the-hard-question) | the ack graph · the tracker's contiguous prefix · the commit protocol, end to end · what must hold before `Source.Commit` |
+| [§13 The checkpoint: one durable record, opaque payloads, a typed header](#13-the-checkpoint-one-durable-record-opaque-payloads-a-typed-header) | one durable checkpoint record |
+| [§15 `config`](#15-config--one-declaration-five-consumers-and-the-frontend-contract) | one `config.Spec`, five consumers · two-tier validation, and `Build` |
+| [§16 `telemetry`](#16-telemetry--metric-names-the-closed-label-set-and-the-read-model) | the `PipelineStatus` read model · which core field drives each widget |
+| [§17 `store`](#17-store--the-standalone--enterprise-seam) | the four store interfaces · lease, epoch and fencing |
+| [§18 Flow control and buffering](#18-flow-control-and-buffering) | bounded by construction · a push source's admission check · buffer refusal and `WhenFull` |
+| [§19 The out-of-process seam](#19-the-out-of-process-seam--what-makes-constraint-3-free-later) | one `Source` interface, satisfied twice · what survives the wire, and what does not |
+| [§21 Walkthroughs](#21-walkthroughs) | scan-then-stream, crashing mid-scan · why restart neither rescans nor loses |
+| [§22 The connector-author guide](#22-the-connector-author-guide) | the two interfaces a minimal sink needs · the import boundary · four questions a source author answers · two questions a sink author answers · the six registration lints · the lifecycle you are writing against · optional source capabilities, and what each unlocks · optional sink capabilities, and what each unlocks |
+
 ---
 
 ## 2. Vocabulary (R9: one concept, one word, no cross-maps)
@@ -124,87 +276,356 @@ value and the i18n key suffix. There is no second vocabulary and no display map.
 
 ## 3. Package layout and dependency direction
 
+```mermaid
+flowchart TB
+  subgraph PKGS["pkg/ — the published surface"]
+    STORE["pkg/store<br/>ConfigStore, StateStore, Coordinator"]
+    SPEC["pkg/spec<br/>Spec, Node, Edge, DriftPolicy"]
+    REG["pkg/registry<br/>Registry, Kind, Descriptor"]
+    TEL["pkg/telemetry<br/>Metrics, PipelineStatus"]
+    CONN["pkg/connector<br/>Source, Sink, Buffer, Transform, caps"]
+    CFG["pkg/config<br/>Spec, Field, Predicate, Diagnostics"]
+    FLT["pkg/fault<br/>Class, Fault, RetryPolicy"]
+    REC["pkg/record<br/>Record, Batch, Position, Payload"]
+    SCH["pkg/schema<br/>Schema, Ref, ChangeKind"]
+  end
+
+  subgraph INTERNAL["internal/ — engine machinery, no exported API"]
+    ENG["internal/engine<br/>Build, Pipeline<br/>Pipeline.Run not implemented"]
+    LED["internal/ledger<br/>Tracker, Ticket, Ledger"]
+  end
+
+  ENG --> LED
+  ENG ==>|"imports every package in this box"| PKGS
+  LED --> CONN
+  LED --> FLT
+  LED --> REC
+
+  STORE --> SPEC
+  STORE --> TEL
+  STORE --> CONN
+  STORE --> REC
+
+  SPEC --> REG
+  SPEC --> TEL
+  SPEC --> CONN
+  SPEC --> FLT
+  SPEC --> REC
+  SPEC --> SCH
+
+  REG --> CONN
+  REG --> CFG
+
+  TEL --> CONN
+  TEL --> FLT
+  TEL --> REC
+
+  CONN --> CFG
+  CONN --> FLT
+  CONN --> REC
+  CONN --> SCH
+
+  CFG --> FLT
+  CFG --> REC
+
+  FLT --> REC
+  REC --> SCH
 ```
-canal/
-├── record/       envelope: Record, Batch, Allocator, Payload, Meta, Change, Position, Origin, Blob
-│                 imports: stdlib, schema
-├── schema/       canonical type set, Schema, Change, ChangeKind, Ref, fingerprinting
-│                 imports: stdlib
-├── fault/        Class, Op, Fault, RecordFault, RetryPolicy, Backoff
-│                 imports: record
-├── config/       Spec, Field, Predicate, Config, Diagnostics, JSON Schema, composite fields
-│                 imports: fault, schema
-├── connector/    Source, Sink, Buffer, Transform, codecs, all *Caps, LaneSpec, LaneCtl,
-│   │             StateHandle, the *Runtime interfaces, Resolve, Batcher, Splitter, AutoPersist
-│   │             imports: record, fault, schema, config
-│   └── conformance/   the connector test kit and the chaos driver contract
-│                 imports: connector, record, fault, schema, config
-├── spec/         pipeline Spec, Node, Edge, Guarantee, DriftPolicy — topology as data
-│                 imports: config, fault
-├── ledger/       Tracker[P], Ticket, Ledger, Disposition, LaneStats, the leak reaper
-│                 imports: record, fault, connector
-├── telemetry/    metric names, closed label vocabulary, Metrics impl, PipelineStatus read model
-│                 imports: record, fault, schema
-├── registry/     Registry value type, Default, *Def structs, Descriptor, Register*, resolve
-│                 imports: connector, config, spec
-├── store/        ConfigStore, StateStore, Coordinator, StatusStore — the deployment seam
-│   │             imports: record, spec, telemetry
-│   ├── single/   one-process implementations (bbolt + in-memory coordinator)
-│   └── postgres/ coordinated implementations
-├── engine/       Build, Pipeline, node loops, retry, DLQ routing, backpressure, drift, negotiation,
-│   │             the plugin sandbox, the commit pump, checkpoint assembly
-│   │             imports: all of the above
-│   └── remote/   gRPC implementations of connector.Source / Sink / Buffer (§19). Not built in v1.
-├── codecs/       json, ndjson, csv, avro, protobuf, raw; newline/length/character framers; gzip/zstd
-│                 imports: record, fault, config, connector, registry
-├── buffers/      memory/, wal/
-│                 imports: record, fault, config, connector, registry
-├── transforms/   filter, map, route, expand, flatten, redact
-│                 imports: record, fault, config, connector, registry
-├── connectors/   THIRD-PARTY-SHAPED. Nothing here is privileged. file/, http/, stdio/, generate/
-│                 imports: record, fault, schema, config, connector, registry
-├── api/          HTTP + SSE: descriptors, spec export, validate, choices, status, offsets, tap
-│                 imports: engine, registry, telemetry, store, spec
-├── ui/           TypeScript. Browser only (R11).
-└── cmd/canal/    run | serve | validate | discover | status | offsets | conform
+
+Every arrow is a direct import verified with `go list ./pkg/... ./internal/...`: `pkg/schema` is the
+only leaf, nothing under `pkg/` imports anything under `internal/`, and `internal/engine` imports all
+nine packages in the box plus `internal/ledger` — its `Pipeline.Run` is still a stub that returns an
+error (`internal/engine/build.go:321`), so none of these edges have yet carried a record. `pkg/connectortest`
+is the tenth `pkg/` package and is omitted here; it appears in the connector-boundary diagram below.
+
 ```
+github.com/BernardoCSACarreira/canal
+├── pkg/                 the published surface — everything a connector author may import
+│   ├── schema/          Schema, Field, Type, Logical, Ref, Change, ChangeKind, Converter, fingerprinting
+│   │                    imports: stdlib only. The only leaf package in the module.
+│   ├── record/          Record, Batch, Allocator, Payload, Value, Meta, Change, Position, Origin, Blob,
+│   │                    and the id types (TenantID, PipelineID, NodeID, StreamName, LaneID, GroupID)
+│   │                    imports: schema
+│   ├── fault/           Fault, Class, Blame, Op, RetryPolicy, Backoff, Terminal, Indeterminacy, RecordFault
+│   │                    imports: record
+│   ├── config/          Spec, Field, Variant, Predicate, Config, Diagnostics, and the composite
+│   │                    extractors BatchPolicy, CodecRef, BufferRef
+│   │                    imports: fault, record
+│   ├── connector/       Source, Sink, Buffer, Transform, the codec interfaces (Encoder, Decoder, Framer,
+│   │                    Deframer, Compressor), every *Caps, LaneSpec, LaneCtl, StateHandle, the five
+│   │                    *Runtime interfaces, and the helpers AutoPersist, Batcher, Splitter
+│   │                    imports: config, fault, record, schema
+│   ├── registry/        Registry, Kind, Descriptor, the *Def structs, AddSource..AddCompressor, and
+│   │                    ResolveSource / ResolveSink / ResolveTransform — the single type-assertion site
+│   │                    imports: config, connector
+│   ├── telemetry/       metric names, the closed label vocabulary, Metrics, PipelineStatus, NodeStatus,
+│   │                    LaneStatus, Negotiated, Downgrade, Condition
+│   │                    imports: connector, fault, record
+│   ├── spec/            Spec, Node, Edge, DriftPolicy, ClockPolicy, StreamConfig, DedupeConfig — topology
+│   │                    as data, the thing a config store holds and the engine builds from
+│   │                    imports: connector, fault, record, registry, schema, telemetry
+│   ├── store/           ConfigStore, StateStore, Coordinator, StatusStore, Space, Key, LaneRow, Lease —
+│   │                    the standalone ↔ coordinated deployment seam. Interfaces only; the sole
+│   │                    implementation in the repo is the in-memory internal/example/memstore.
+│   │                    imports: connector, record, spec, telemetry
+│   └── connectortest/   Base, and inert embeddable stubs for the three runtimes, LaneCtl and StateHandle,
+│                        so adding a runtime method does not break every connector's tests
+│                        imports: config, connector, fault, record, schema
+└── internal/            not importable from any other module (Go's internal rule)
+    ├── ledger/          Tracker[P], Ticket, Ledger, Disposition, Outcome, LaneStats, Leak, the leak reaper
+    │                    imports: connector, fault, record
+    ├── engine/          Build, Deps, Pipeline, Checkpoint, Header, LaneState.
+    │                    Pipeline.Run is a stub returning "not implemented yet" — no record has moved
+    │                    through the engine, and there is no durable StateStore.
+    │                    imports: internal/ledger, and every pkg/ package except connectortest
+    ├── example/         linefile (a source), stdoutsink (a sink), memstore (an in-memory store.StateStore)
+    └── stress/          eight deliberately hostile connectors kept as a regression suite:
+                         enterprise-scale, fanout-pipeline, multi-stream-source, no-cursor-source,
+                         parallel-snapshot, push-source, schema-drift, txn-sink
+```
+
+That is the whole module. There is no `cmd/`, no `api/`, no `ui/`, and no `codecs/`, `buffers/`,
+`transforms/` or `connectors/` directory: no binary exists, the HTTP surface and the built-in stage
+libraries are unwritten, and `store/` has no bbolt or Postgres implementation. Everything above compiles,
+`go vet` is clean and nine test packages pass, but the deliverable so far is the interface set, not a
+running program.
 
 ### The one statement that matters
 
-**A connector package imports exactly six canal packages: `record`, `fault`, `schema`, `config`,
-`connector`, `registry`.** It cannot import `engine`, `ledger`, `store`, `telemetry`, `spec` or `api`.
-A `go vet` analyser plus a dependency test enforces this in CI, and the enforcement is the *reason* the
-core cannot grow a switch on connector identity: the core's types are not reachable from a connector at
-all.
+```mermaid
+flowchart TB
+  CONNPKG["a connector package<br/>internal/example/linefile, internal/stress/txn-sink,<br/>or any package in any other module"]
+
+  subgraph ALLOWED["what a connector imports — 4 to 6 packages, all ten in-repo connectors checked"]
+    A1["pkg/connector<br/>Source, Sink, LaneSpec, caps"]
+    A2["pkg/registry<br/>Register, Kind, Def"]
+    A3["pkg/config<br/>Spec, Field, Config"]
+    A4["pkg/fault<br/>Fault, Class, Retryable"]
+    A5["pkg/record<br/>Record, Batch, Position"]
+    A6["pkg/schema<br/>only if it declares schemas"]
+  end
+
+  subgraph TESTKIT["test files only"]
+    CT["pkg/connectortest<br/>inert SourceRuntime, LaneCtl, StateHandle stubs"]
+  end
+
+  subgraph CORESIDE["also under pkg/ — core-facing, imported by zero connectors"]
+    N1["pkg/spec"]
+    N2["pkg/store"]
+    N3["pkg/telemetry"]
+  end
+
+  subgraph UNREACHABLE["internal/ — the engine, and the reason no switch on connector identity can exist"]
+    I1["internal/engine<br/>Build, Pipeline"]
+    I2["internal/ledger<br/>Tracker, Ledger"]
+  end
+
+  CONNPKG ==>|"imports"| ALLOWED
+  CONNPKG -. "imported from _test.go only" .-> CT
+  CONNPKG -. "no connector imports these; convention only, nothing enforces it" .-> CORESIDE
+  CONNPKG -. "Go's internal rule refuses this import from any other module" .-x UNREACHABLE
+```
+
+A connector imports four to six canal packages — `internal/example/stdoutsink` four, `internal/example/linefile`
+five, the schema-declaring stress connectors six — and none of the ten in-repo connectors imports
+`internal/`; symmetrically `go list -deps ./internal/engine` contains no connector package, which is
+the structural reason the core cannot switch on connector identity. Only the `internal/` half of that
+wall is enforced (by the Go compiler); `pkg/spec`, `pkg/store` and `pkg/telemetry` are public import
+paths that a connector could import today, and the test that would forbid it is not written.
+
+**A connector package imports four to six canal packages, all of them under `pkg/`:
+`connector`, `registry`, `config` and `fault` always; `record` unless it never touches a record body;
+`schema` when it declares a schema.** Measured across the ten connectors in the repo:
+`internal/example/stdoutsink` imports four; `internal/example/linefile` and the stress connectors
+`no-cursor-source`, `parallel-snapshot`, `push-source` and `txn-sink` import five; `enterprise-scale`,
+`fanout-pipeline`, `multi-stream-source` and `schema-drift` import six.
+
+A connector cannot import `internal/engine` or `internal/ledger` from another module — the Go compiler
+refuses it, which needs no test and cannot be forgotten. The reverse direction is the one that actually
+prevents special-casing: `go list -deps ./internal/engine` returns exactly `internal/ledger` plus nine
+`pkg/` packages and no connector package at all, so the engine has no name for any connector and a
+switch on connector identity is not expressible in it.
+
+The rest of the boundary is convention, not enforcement, and this document should not pretend otherwise.
+`pkg/spec`, `pkg/store` and `pkg/telemetry` are public import paths; a connector that imported one would
+compile. No connector does, but **no `go vet` analyser and no dependency test exists** — `grep -rn
+"TestDependencyDirection" --include='*.go' .` returns nothing, and the repository has no CI configuration
+at all. Writing that test, and running it in CI, is outstanding work, not a delivered mechanism.
 
 ### Direction is strictly downward, with no cycles
 
-The three cycles the judges found in the proposals are gone, and here is exactly how:
+```mermaid
+flowchart TB
+  STORE["pkg/store"]
+  SPEC["pkg/spec"]
+  REG["pkg/registry"]
+  TEL["pkg/telemetry"]
+  CONN["pkg/connector"]
+  CFG["pkg/config"]
+  REC["pkg/record"]
+  SCH["pkg/schema"]
 
-- **`config` never returns a `connector` type.** Composite extractors return types owned by `config`
-  (`config.BatchPolicy`, `config.CodecRef`, `config.BufferRef`) or by `fault`
-  (`fault.RetryPolicy`). The engine turns a `config.CodecRef` into a live codec chain; `config` does
-  not know that codecs are objects.
-- **`store` never imports `engine`.** `ConfigStore` deals in `spec.Spec`, which lives in its own leaf
-  package. `Coordinator` deals in `store.LaneRow`, whose lane spec is a `record.Blob` — bytes in, bytes
-  out — so no `store` implementation ever serialises a domain type and `LaneSpec`'s encoding stays
-  versioned by the engine.
-- **`fault` does not import a package that imports `fault`.** `fault` imports `record` only.
-  `record` imports `schema` and stdlib only. A record's attached fault is stored as a plain `error` in
-  an unexported field, read through `Record.Failed() (error, bool)`, so `record` never names
-  `fault.Fault`.
-- **`ledger` imports `connector`; `connector` never imports `ledger`.** `connector` defines the
-  vocabulary (`Ordering`, `Ack`); `ledger` implements the algorithm over it.
-- **`telemetry` does not import `ledger`.** The engine maps `ledger.LaneStats` onto
-  `telemetry.LaneStatus`. Two structs, one direction, no cycle, and the read model stays free to have a
-  JSON contract the ledger does not constrain.
+  SPEC ---->|"registry.Kind"| REG
+  SPEC -->|"telemetry.Downgrade"| TEL
+  STORE -->|"connector.Durability"| CONN
+  TEL -->|"connector.Guarantee"| CONN
+  CFG -->|"record.Record"| REC
 
-A test named `TestDependencyDirection` walks the module graph and fails on any edge not in the table
-above. That test is the R8 mechanism for R11's boundary and for constraint #4's "zero core edits" claim.
+  REG -. "claimed, absent: adding it closes a cycle" .-> SPEC
+  SPEC -. "claimed, absent" .-> CFG
+  TEL -. "claimed, absent" .-> SCH
+  CFG -. "claimed, absent" .-> SCH
+```
+
+Solid arrows are real imports, labelled with the identifier that creates each one
+(`pkg/spec/node.go:17`, `pkg/spec/spec.go:55`, `pkg/store/state_store.go:51`,
+`pkg/telemetry/negotiated.go:20`, `pkg/config/predicate.go:87`); dotted arrows are four edges the
+superseded §3 table declared that do not exist in the code. The `registry` → `spec` edge is the
+dangerous one: the real edge runs the other way, so implementing the table as written would create an
+import cycle.
+
+The graph above is acyclic, and `go build ./...` proves it (Go rejects import cycles outright). What the
+compiler does not tell you is *why* each edge points the way it does:
+
+- **`pkg/schema` is the only leaf.** It imports stdlib alone, and every other package's dependency path
+  bottoms out there.
+- **`config` never returns a `connector` type.** The composite extractors return types owned by `config`
+  (`config.BatchPolicy`, `config.CodecRef`, `config.BufferRef`) or by `fault` (`fault.RetryPolicy`).
+  `config` imports `fault` and `record` — the latter because `Predicate.EvalRecord` walks a
+  `*record.Record` (`pkg/config/predicate.go:87`) — and it imports neither `schema` nor `connector`.
+- **`record` never names `fault.Fault`.** An attached fault is stored as a plain `error` in an unexported
+  field and read through `Record.Failed() (error, bool)` (`pkg/record/record.go:105`), so the edge runs
+  `fault` → `record` and only that way.
+- **`spec` imports `registry`, never the reverse.** `spec.Node.Kind` is a `registry.Kind`
+  (`pkg/spec/node.go:17`). `registry` imports `config` and `connector`, so an edge from `registry` to
+  `spec` would close a cycle; do not add one.
+- **`spec` imports `telemetry`.** `spec.Spec.Downgrades` is a `[]telemetry.Downgrade`
+  (`pkg/spec/spec.go:55`), which is what makes a negotiated downgrade visible in the stored spec.
+  `telemetry` in turn imports `connector` for `connector.Guarantee` (`pkg/telemetry/negotiated.go:20`)
+  and does not import `ledger` or `spec`.
+- **`store` never imports `engine`.** `ConfigStore` deals in `spec.Spec`; `Coordinator` deals in
+  `store.LaneRow`, whose lane spec is a `record.Blob` — bytes in, bytes out. `store` does import
+  `connector`, for `connector.Durability` and `connector.Guarantee` in `StoreCaps`
+  (`pkg/store/state_store.go:51`).
+- **`ledger` imports `connector`; `connector` cannot import `ledger`.** `connector` owns the vocabulary
+  (`Ordering`, `Ack`), `ledger` implements the algorithm over it, and since `ledger` is under `internal/`
+  the edge is structurally unable to reverse.
+- **Nothing under `pkg/` imports anything under `internal/`.**
+
+To check any of this, run:
+
+```
+go list -f '{{.ImportPath}} -> {{join .Imports " "}}' ./pkg/... ./internal/...
+```
+
+That command, not this list, is the authority; the list is a summary of what it printed.
 
 ---
 
 ## 4. The record model (R2 — decided first)
+
+```mermaid
+classDiagram
+    direction LR
+
+    class Record {
+        -origin Origin
+        +Dest StreamName
+        +EventTime time.Time
+        +Payload Payload
+        +Meta Meta
+        +Change *Change
+        +Schema *schema.Ref
+        -handle []byte
+        -fault error
+        +Origin() Origin
+        +SetKey(k []byte)
+        +SetUpstream(u []byte)
+        +SetHandle(h []byte)
+        +MarkFailed(err error)
+        +Ref() Ref
+    }
+
+    class Origin {
+        +Tenant TenantID
+        +Pipeline PipelineID
+        +Node NodeID
+        +Lane LaneID
+        +Stream StreamName
+        +Group GroupID
+        +ID RecordID
+        +Key []byte
+        +Upstream []byte
+        +ReadAt time.Time
+        +Parent RecordID
+        +Parents []RecordID
+        +Root RecordID
+        -refs uint32
+        +Refs() uint32
+    }
+
+    class Payload {
+        -b []byte
+        -v Value
+        -has uint8
+        +Bytes() ([]byte, bool)
+        +Structured() (Value, bool)
+        +StructuredMut() (Value, bool)
+        +Clone() Payload
+    }
+
+    class Meta {
+        -kv []metaEntry
+        -secrets []secretEntry
+        -changes []FieldChange
+        +Get(ns, key string)
+        +Set(ns, key string, v Value) error
+        +SetSecret(key, v string)
+        +NoteChange(fc FieldChange)
+        +Clone() Meta
+    }
+
+    class Change {
+        +Version uint16
+        +Op Op
+        +Keys [][]string
+        +Before *Payload
+        +After *Payload
+        +BeforeComplete Completeness
+        +AfterComplete Completeness
+        +TxID string
+        +CommitTime time.Time
+    }
+
+    class Value {
+        <<interface>>
+        -isValue()
+        +Kind() Kind
+    }
+
+    class Ref {
+        +ID RecordID
+        +Group GroupID
+        +Lane LaneID
+        +Stream StreamName
+        +Key []byte
+    }
+
+    Record *-- Origin : value, unexported field
+    Record *-- Payload : value
+    Record *-- Meta : value
+    Record o-- Change : pointer, nil without a change facet
+    Payload o-- Value : nil-able interface
+    Meta o-- Value : one per metaEntry
+    Change *-- Payload : Before / After images
+    Record ..> Ref : "Ref() copies ID, Group, Lane, Key + Dest"
+```
+
+`-` is an unexported field, `+` an exported one; a filled diamond is held by value and a hollow one by
+pointer. Everything is defined in `pkg/record/record.go`, `origin.go`, `payload.go`, `meta.go`,
+`change.go` and `value.go` — note that `Record` carries five fields the section's ASCII tree omits
+(`Dest`, `EventTime`, `Schema`, `handle`, `fault`) and that `Payload`, `Meta` and `Origin` expose *no*
+exported fields you can reach without going through a method or through `Origin()`'s value copy.
 
 The abandoned attempt named a stage `source_canonical_event_serializer` and never defined the canonical
 form, so an HTTP DTO became the internal type by default. Here the envelope is decided first, is
@@ -221,6 +642,41 @@ Record
 ```
 
 ### 4.1 Identifiers
+
+```mermaid
+flowchart TB
+    subgraph STAMP["stamped by pkg/record, never by a connector"]
+        AF["Batch.Add / Batch.AddFor<br/>ID = alloc.nextRecordID, Root = ID, refs = 1"]
+        DER["Batch.Derive<br/>fresh ID, Parent = in.ID, Root preserved, refs = 1"]
+        MRG["Batch.Merge<br/>fresh ID, Parents = all, refs = sum of parents"]
+    end
+
+    AF --> RID["Origin.ID — RecordID"]
+    DER --> RID
+    MRG --> RID
+    AF --> ROOT["Origin.Root — RecordID of the admitted ancestor"]
+    DER --> ROOT
+
+    SH["Record.SetHandle(h []byte)"] --> H["Record.handle []byte<br/>OrderingDiscrete lanes only"]
+
+    RID --> LED["ledger: group.refs, byRec, landed"]
+    RID --> RF["fault.RecordFault.ID<br/>connector.WriteResult.Failed"]
+    RID --> DLQ["dead-letter provenance<br/>for a human, not a key"]
+    H --> LEDH["ledger group.handles<br/>keyed by Origin.ID"]
+    LEDH --> ACK["connector.Ack.Handles<br/>connector.Ack.AbandonedHandles"]
+
+    SEQ["Position.Seq uint64<br/>assigned by ledger.Admit via Batch.SetSeq"] --> NEVER
+
+    RID --> NEVER["NEVER persisted.<br/>Durable identity is Origin.Key plus the lane cursor."]
+    ROOT --> NEVER
+    H -.->|"the source's own token, opaque to canal"| ACK
+```
+
+The in-flight identities — `RecordID`, `Root`, `Position.Seq` and the delivery handle — are
+generation-local and appear in no persisted key; `pkg/record/ids.go:69-83` states the rule and
+`internal/ledger/ledger.go:193-240` is the only code that reads them today. The handle is the source's
+own token, set through `SetHandle` in `pkg/record/record.go:64` and handed straight back in
+`connector.Ack`, so it is not an identity canal assigns at all.
 
 ```go
 // Package record defines canal's canonical in-flight record model. It is the
@@ -516,6 +972,49 @@ func Fraction(lo, o, hi Position) (float64, bool)
 
 ### 4.4 Origin — provenance that a transform structurally cannot corrupt
 
+```mermaid
+flowchart LR
+    subgraph SRC["written by the source only, inside Read"]
+        SU["Record.SetUpstream(u []byte)"]
+        SK["Record.SetKey(k []byte)"]
+    end
+
+    subgraph L1["layer 1 — the vendor's own id"]
+        UP["Origin.Upstream []byte<br/>carried verbatim"]
+    end
+    subgraph L2["layer 2 — canal's canonical identity"]
+        KEY["Origin.Key []byte<br/>derivation documented in registry Notes"]
+    end
+    subgraph L3["layer 3 — per-request guard"]
+        IK["connector.Request.IdempotencyKey string<br/>engine-derived (no deriving code exists)"]
+    end
+
+    SU --> UP
+    SK --> KEY
+
+    UP --> DU["spec.DedupeUpstream"]
+    KEY --> DK["spec.DedupeKey"]
+    DU --> DKF["store.DedupeKey<br/>tenant / pipeline / node / stream / layer / identity"]
+    DK --> DKF
+    DKF -.-> DEDUPE["engine dedupe: look up, write, then mark seen<br/>(not built)"]
+
+    KEY --> REF["record.Ref.Key"]
+    REF --> REQ["connector.Request.Records []record.Ref<br/>and WriteResult keyed back on Ref.ID"]
+    KEY --> UPSERT["sink upsert / SinkCaps.RequiresKey"]
+    KEY -.-> IK
+
+    GATE["SourceCaps.StableKeys"] -.->|"registry/add.go:50 panics if Notes empty"| KEY
+    GATE -.->|"negotiate.go:92 clamps EffectivelyOnce"| DEDUPE
+    GATE -.->|"negotiate.go:168 refuses RequiresKey"| UPSERT
+```
+
+The two durable identity layers are the *only* writable part of `Origin` (ADR 0025; `SetKey` and
+`SetUpstream` at `pkg/record/record.go:82,92`), and every consumer of identity reaches them through
+those two setters — the layer names and their consumers live in `pkg/spec/spec.go:202-210`,
+`pkg/store/key.go:87` and `pkg/connector/sink.go:189-193`. Dotted edges are declared but unbuilt: no
+code derives `Request.IdempotencyKey` and no dedupe implementation exists, only the capability gates in
+`internal/engine/negotiate.go`.
+
 ```go
 // Origin is a record's immutable provenance. It is stamped once, by an
 // Allocator, inside this package, and there is no exported mutator.
@@ -781,6 +1280,41 @@ func (c Completeness) String() string
 
 ### 4.8 Record, Batch and the Allocator
 
+```mermaid
+flowchart TB
+    LS["source, in Open: rt.Lanes().Announce<br/>connector.LaneSpec{Name, Stream, Ordering, ...}"]
+    DLI["record.DeriveLaneID(tenant, pipeline, node, LaneSpec.Name)<br/>-- percent-escaped, stable across restarts"]
+    NA["record.NewAllocator(t, p, n, lane, stream, firstID, firstGroup)<br/>one per lane per generation -- NO CALLER EXISTS YET"]
+    NB["record.NewBatch(alloc, capHint)<br/>Batch.Lane = alloc.lane, Batch.group = alloc.NextGroup()"]
+    RD["Source.Read(ctx, dst *record.Batch)<br/>dst.Reset() opens the next settlement group"]
+
+    ADD["dst.Add()<br/>stream = alloc.stream"]
+    ADDFOR["dst.AddFor(stream)<br/>one lane, many streams -- a shared log"]
+
+    STAMP["Origin stamped, once, inside pkg/record:<br/>Tenant, Pipeline, Node, Lane from the Allocator<br/>Stream from Add / AddFor, Group from Batch.group<br/>ID = Root = alloc.nextRecordID(), ReadAt = time.Now(), refs = 1<br/>Record.Dest = Stream"]
+
+    FILL["the source fills the rest:<br/>r.Payload, r.EventTime, r.Meta"]
+    IDENT["ADR 0025 writable seam:<br/>r.SetKey -> Origin.Key<br/>r.SetUpstream -> Origin.Upstream<br/>r.SetHandle -> Record.handle"]
+    POS["the source closes the batch:<br/>dst.Position, dst.EndOfLane"]
+    ADM["ledger.Ledger.Admit(b)<br/>refuses Origin.Lane != Batch.Lane, then b.SetSeq(seq)"]
+
+    LS --> DLI --> NA -.-> NB -.-> RD
+    RD --> ADD
+    RD --> ADDFOR
+    ADD --> STAMP
+    ADDFOR --> STAMP
+    STAMP --> FILL --> IDENT --> POS
+    POS -.-> ADM
+    IDENT -.->|"source-only window: NOT enforced anywhere"| ADM
+```
+
+`Origin.Lane` and `Origin.Stream` come from the `Allocator` the engine built from the source's own
+`LaneSpec`, never from a setter, while `Origin.Key` is set by the source inside `Read`
+(`pkg/record/batch.go:36-46,164-210`, `pkg/record/record.go:82`). Dotted edges are unbuilt: nothing in
+`internal/engine` calls `record.NewAllocator` or `record.NewBatch`, `Pipeline.Run` is a one-line error
+(`internal/engine/build.go:321`), and the "engine rejects a key set later" rule has no enforcement site
+in the module.
+
 ```go
 // Record is the envelope.
 type Record struct {
@@ -828,7 +1362,7 @@ func (r *Record) Handle() []byte
 // Stream, Group, ID, Root, refs — remain unwritable, which is what keeps settlement
 // identity uncorruptible by a transform while making StableKeys, RequiresKey, both
 // dedupe layers, Request.IdempotencyKey and Ref.Key reachable at all. Six of the
-// eight hostile connectors were blocked here, all six FATALLY; see §30.
+// eight hostile connectors were blocked here, all six FATALLY; see §29.
 func (r *Record) SetKey(k []byte)
 func (r *Record) SetUpstream(u []byte)
 
@@ -970,9 +1504,126 @@ func (b *Batch) All() iter.Seq[*Record]
    that all four proposals contained.
 4. **`refs` on the origin.** One unexported counter makes fan-out, filter, 1→N and N→1 correct with
    zero core code paths per topology, and makes early settlement structurally impossible.
+
+```mermaid
+classDiagram
+    direction LR
+
+    class Batch {
+        +Records []*Record
+        +Lane LaneID
+        +Position Position
+        +EndOfLane bool
+        -alloc *Allocator
+        -group GroupID
+        -cap int
+        -bytes int64
+        +Add() *Record
+        +AddFor(stream StreamName) *Record
+        +Derive(in *Record) *Record
+        +Merge(parents ...*Record) *Record
+        +Reset()
+        +Group() GroupID
+        +SetGroup(g GroupID)
+        +SetSeq(seq uint64)
+    }
+
+    class Allocator {
+        -tenant TenantID
+        -pipeline PipelineID
+        -node NodeID
+        -lane LaneID
+        -stream StreamName
+        -nextID RecordID
+        -nextGroup GroupID
+        +NextGroup() GroupID
+        +Lane() LaneID
+        -nextRecordID() RecordID
+    }
+
+    class Position {
+        +Seq uint64
+        +Token Blob
+        +Order []byte
+        +Scalar *float64
+        +Label string
+        +Safe bool
+        +At time.Time
+        +Compare(q Position) (int, bool)
+        +IsZero() bool
+    }
+
+    class Blob {
+        +Version uint32
+        +Bytes []byte
+        +IsZero() bool
+        +Clone() Blob
+    }
+
+    class Record {
+        -origin Origin
+        +Payload Payload
+    }
+
+    Batch o-- Allocator : "pointer, unexported. NewBatch copies alloc.lane into Batch.Lane"
+    Batch o-- Record : "pointers, hard-capped at cap"
+    Batch *-- Position : "value, one per batch, prefix lanes only"
+    Position *-- Blob : "Token, opaque, never parsed by the core"
+    Allocator ..> Record : "AddFor stamps Origin, then appends"
+```
+
+The carrier: a `Batch` holds record *pointers* but its `Position` by value, and the `Allocator` it
+points at is the sole holder of the constant provenance (`pkg/record/batch.go:19-28,71-112`,
+`position.go:15-85`, `ids.go:104-121`). Two exported methods absent from the Go listing above this
+diagram are shown here because they exist and are reachable from a connector: `Batch.SetSeq` and
+`Batch.SetGroup` (`batch.go:359,363`).
+
 ---
 
 ## 5. `fault` — classification, and the failure shape written with the success shape (R7)
+
+```mermaid
+flowchart TD
+    ERR["error returned by any connector call"] --> CLS{"fault.ClassOf(err)<br/>outermost wins"}
+
+    CLS -->|"Unclassified"| UNC
+    CLS -->|"TransientUpstream<br/>TransientInternal"| RETRY
+    CLS -->|"Throttled"| TH
+    CLS -->|"Indeterminate"| IDEM{"SinkCaps.Idempotent"}
+    CLS -->|"PermanentMapping"| DLQ
+    CLS -->|"PermanentUpstream<br/>PermanentInternal<br/>PermanentContract"| STOP
+    CLS -->|"DuplicateIdempotent"| DUP
+    CLS -->|"ClockSkew"| CSK
+    CLS -->|"Fenced"| FEN
+    CLS -->|"NotConnected"| NC
+    CLS -->|"EndOfInput"| EOI
+
+    IDEM -->|"true"| RETRY
+    IDEM -->|"false"| OI{"RetryPolicy.OnIndeterminate"}
+    OI -->|"IndeterminateRetry"| RETRY
+    OI -->|"IndeterminateDeadLetter"| DLQ
+    OI -->|"IndeterminateStall"| STALL
+
+    subgraph NB["engine response — NOT BUILT: internal/engine.Pipeline.Run returns 'not implemented yet'"]
+        RETRY["retry with backoff<br/>Counted() true — spends an attempt"]
+        TH["wait fault.RetryAfterOf(err)<br/>Counted() false — spends NO attempt"]
+        DLQ["dead-letter this record<br/>pipeline stays healthy"]
+        STOP["Terminal() true — no retry attempted"]
+        STALL["settle nothing, block the lane<br/>raise CondDegraded naming the record"]
+        DUP["settle ledger.Duplicate — a SUCCESS"]
+        CSK["configured clamp, reject or pass"]
+        FEN["revoke this record.LaneID only<br/>sibling lanes keep running"]
+        NC["call Open again, with backoff"]
+        EOI["clean completion, not a failure"]
+        UNC["treated as PermanentInternal<br/>increments telemetry.MUnclassified"]
+    end
+```
+
+A connector states only the `Class`, a fact; every branch to the right of it is behaviour the engine
+*computes* from `(class, capabilities, policy)` — the classes are defined in `pkg/fault/class.go` and
+the dispositions in `pkg/fault/retry.go`. Everything inside the boxed region is documented intent
+only: `internal/engine/build.go:321` `Pipeline.Run` is a one-line error return, so no fault has ever
+been routed by this tree.
 
 ```go
 // Package fault defines canal's closed error-classification set, the per-record
@@ -1233,6 +1884,28 @@ var ErrDeclined = New(PermanentContract, OpValidate, errDeclined)
 
 ### 5.1 The retry-safety obligation
 
+```mermaid
+flowchart LR
+    C["fault.Class<br/>closed set, 14 members"] --> T{"Class.Terminal()"}
+
+    T -->|"true"| G1["PermanentUpstream<br/>PermanentInternal<br/>PermanentMapping<br/>PermanentContract"]
+    T -->|"false"| N{"Class.Counted()"}
+
+    N -->|"true"| G2["TransientUpstream<br/>TransientInternal<br/>Indeterminate<br/>DuplicateIdempotent<br/>ClockSkew<br/>Fenced<br/>Unclassified"]
+    N -->|"false"| G3["Throttled<br/>NotConnected<br/>EndOfInput"]
+
+    G1 --> D1["retrying can never help<br/>straight to RetryPolicy.Terminal"]
+    G2 --> D2["a retry SPENDS an attempt<br/>bounded by RetryPolicy.MaxAttempts"]
+    G3 --> D3["spends NO attempt<br/>bounded only by Backoff.MaxElapsed"]
+```
+
+The obligation above decides *which* class an author picks; these two pure predicates —
+`Class.Terminal()` and `Class.Counted()`, `pkg/fault/class.go:159` and `:181` — then decide behaviour
+with no further input, which is what makes the retry subset derivable from a result alone. The
+partition is coarser than the disposition: `EndOfInput` is uncounted because it is not a failure at
+all rather than because it is a wait, and `Fenced`, `DuplicateIdempotent` and `Unclassified` land in
+the counted-and-retryable cell even though the prose gives each of them a non-retry response.
+
 ```go
 // RETRY-SAFETY OBLIGATION. Stated here because the compiler cannot enforce it and
 // the conformance kit asserts it:
@@ -1249,6 +1922,51 @@ var ErrDeclined = New(PermanentContract, OpValidate, errDeclined)
 ```
 
 ### 5.2 Per-record outcomes — the failure shape, written with the success shape
+
+```mermaid
+stateDiagram-v2
+    direction TB
+
+    [*] --> Attempting
+    Attempting --> Settled : clean result, nothing to retry
+    Attempting --> Classify : a *fault.Fault is returned
+
+    state Classify <<choice>>
+    Classify --> Exhausted : Class.Terminal is true, no attempt is made
+    Classify --> Waiting : Class.Counted is false, attempt NOT incremented
+    Classify --> Spending : counted and non-terminal
+
+    state Spending <<choice>>
+    Spending --> Waiting : RetryPolicy.Next allows another attempt
+    Spending --> Exhausted : RetryPolicy.Next returns ok false
+
+    Waiting --> Attempting : delay elapsed, Request.Attempt incremented
+    Waiting --> Exhausted : Backoff.MaxElapsed exceeded
+
+    Exhausted --> DeadLettered : RetryPolicy.Terminal is TerminalDeadLetter
+    Exhausted --> Dropped : TerminalDrop
+    Exhausted --> Stopped : TerminalStop
+
+    Settled --> [*]
+    DeadLettered --> [*]
+    Dropped --> [*]
+    Stopped --> [*]
+
+    note right of Waiting
+      delay = fault.RetryAfterOf(err) when the chain
+      carries a hint, otherwise RetryPolicy.Next(attempt),
+      which is full-jitter uniform in [0, exponential].
+      NOT BUILT: this loop is engine behaviour and
+      internal/engine.Pipeline.Run is a one-line stub.
+    end note
+```
+
+Every path out of `Exhausted` is terminal because `TerminalInvalid` is the zero value that `Validate`
+rejects — that is the mechanism, in `pkg/fault/retry.go:47-58`, that makes "retry forever"
+inexpressible rather than merely discouraged. Only the arithmetic on the transitions is real code
+(`RetryPolicy.Next`, `RetryPolicy.Validate`, `fault.RetryAfterOf`); the loop that would drive these
+transitions does not exist yet, and neither does the forced reconnect before the final attempt that
+`Backoff`'s doc comment promises.
 
 ```go
 // RecordFault is one record's outcome, classified by the connector at the point
@@ -1311,6 +2029,61 @@ func (p RetryPolicy) Next(attempt int) (time.Duration, bool)
 ---
 
 ## 6. Lanes — the spine, as a type
+
+```mermaid
+stateDiagram-v2
+    direction TB
+
+    state "Announced — row durable before Announce returns" as Announced
+    state "Gated — LaneAssignment.GatedOn non-empty" as Gated
+    state "Planned, unclaimed — Assignment.Epoch 0" as Planned
+    state "Claimed — Lease.Epoch = N" as Claimed
+    state "Reading — LaneCtl.Assigned returns it" as Reading
+    state "Idle — LaneStatus.Idle, IdleSince stamped" as Idle
+    state "Finished — Finished and FinishedAt both durable" as Finished
+    state "Revoked — Ledger.Revoke, acks withheld" as Revoked
+    state "Forgotten — lane row and connector state deleted" as Forgotten
+
+    [*] --> Announced : LaneCtl.Announce / AnnounceMany
+    Announced --> Gated : LaneSpec.StartAfter non-empty
+    Announced --> Planned : no StartAfter
+    Gated --> Planned : every StartAfter group Finished AND FinishedAt durable
+    Planned --> Claimed : Coordinator.Claim over DefaultLeaseTTL
+    Claimed --> Reading : Source.Open reads LaneCtl.Assigned
+    Reading --> Idle : Heartbeater.Heartbeat marks the lane idle
+    Idle --> Reading : a record or a position arrives
+    Reading --> Reading : Ledger.Committed then Ack.Through — phase three
+    Reading --> Finished : Batch.EndOfLane or LaneCtl.Finish, after every group settles
+    Claimed --> Revoked : Coordinator.Renew fails
+    Reading --> Revoked : LaneCtl.Revoked reports true
+    Revoked --> Planned : after DefaultReassignmentDelay — next Claim gets Epoch N+1
+    Finished --> Forgotten : LaneCtl.Forget — refused unless Finished
+    Finished --> [*] : row kept — re-announcing the Name resumes it
+    Forgotten --> [*] : re-announcing the Name is a cold start
+
+    note right of Claimed
+      THE EPOCH FENCE. Lease.Epoch rides on every durable
+      write the core makes for this lane. A stale epoch is
+      rejected by the store with fault.ErrFenced, which
+      revokes THE LANE and not the worker.
+      LaneAssignment.Worker is reporting only.
+    end note
+
+    note left of Planned
+      NOT BUILT. store.Coordinator has no implementation and
+      internal/engine.Pipeline.Run is a one-line error return.
+      The types on this diagram are real Go. Nothing has ever
+      driven a lane through them.
+    end note
+
+    note left of Revoked
+      Records already handed over still settle for
+      accounting, but Ledger.Committed drops the Ack,
+      so Source.Commit is never called for the lane.
+    end note
+```
+
+A lane's whole life, from a durable announcement to either a kept `Finished` row or a `Forget`: the states are `LaneAssignment` field combinations defined in `pkg/connector/lane.go`, the transitions are the methods in `pkg/connector/lanectl.go`, and the lease and epoch are `store.Lease` in `pkg/store/coordinator.go`. Read the two `NOT BUILT` notes literally — every type here compiles, but `store.Coordinator` has no implementation, nothing anywhere assigns `FinishedAt`, and `internal/engine.Pipeline.Run` is a one-line error return, so no lane has ever taken a single one of these transitions.
 
 ```go
 // Package connector defines every interface a connector author implements and
@@ -1763,6 +2536,48 @@ func (p *Persister) Restore(lane record.LaneID) (record.Blob, bool)
 
 ## 7. `Source` — four methods, frozen
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as engine.Build
+    participant RG as source read goroutine — NOT BUILT
+    participant S as Source
+    participant RT as SourceRuntime
+    participant CG as source control goroutine — NOT BUILT
+
+    B->>S: registry.SourceDef.New(ctx, *config.Config)
+    Note over B,S: no I/O here. Config is already parsed, defaulted and validated
+    RG->>S: Open(ctx, rt) with ctx scoped to the OPENING
+    S->>RT: rt.Lanes().Assigned(ctx)
+    RT-->>S: []connector.LaneAssignment
+    alt cold start — Assigned returned nothing
+        S->>RT: rt.Lanes().Announce(ctx, connector.LaneSpec)
+        RT-->>S: record.LaneID, durable before it returns
+    else warm start — resume from a[0].Cursor
+        S->>S: decode Cursor.Token, the record.Blob it authored, verbatim
+        Note over S: an unreadable Token.Version is fault.Contract, loudly
+    end
+    S->>RT: rt.Context() for the CONNECTION-lifetime ctx
+    loop until fault.ErrEndOfInput
+        RG->>S: Read(ctx, dst *record.Batch) with dst.Lane already set
+        S->>S: dst.Add, dst.Position, dst.EndOfLane
+        S-->>RG: nil, or ErrNotConnected to re-Open, or ErrEndOfInput
+        Note over RG: cancel means DRAIN. The engine admits what is in dst before the error
+    end
+    CG->>S: Commit(ctx, connector.Ack) only after canal's own durable flush
+    CG->>S: Heartbeat, Backlog, Nack — optional, same control goroutine
+    Note over RG,CG: Read never runs with itself. It DOES run with the control goroutine
+    RG->>S: Close(ctx) — exactly once, always, on a fresh grace ctx
+    Note over B,CG: TODAY only New and Close have callers, both in internal/engine/build.go. Pipeline.Run returns an error.
+```
+
+The four frozen methods and the two goroutines that call them, exactly as specified in
+`pkg/connector/source.go` and `internal/engine/doc.go`; the cold/warm split is the one
+`internal/example/linefile/source.go` actually implements, and the discriminator is whether
+`Assigned` returned anything, never a nil test on a position. Everything on the two engine
+lifelines is contract, not code — `internal/engine/build.go` calls only `New` and, through
+`Pipeline.Close`, `Close`.
+
 ```go
 // Source is the required source interface. Four methods. Frozen: no method will
 // ever be added to it. New core capabilities arrive through the SourceRuntime
@@ -1937,9 +2752,68 @@ that was not persisted. This is the fix for the rooted proposal's "watermark rep
 never persisted" defect: the watermark comes from canal's durable write, not from the resolver and not
 from the source.
 
+```mermaid
+flowchart LR
+    RQ["connector.Request<br/>Body, Records, Attempt, IdempotencyKey"] --> W["Sink.Write"]
+    W --> WR["connector.WriteResult<br/>Failed, Deferred, Duplicates, Written"]
+    SR["SinkRuntime<br/>Context, Schemas, Streams, Config, Log, Metrics, Note"] -.-> W
+    WR ==>|the only durability signal a sink can emit| TR
+
+    subgraph CORE["the core owns the mapping, end to end"]
+        direction TB
+        TR["ledger.Tracker settles each record.Ref"] --> PF["prefix over record.Position"]
+        PF --> CK["one durable write through store.StateStore"]
+        CK --> AK["connector.Ack"]
+    end
+
+    AK --> SC["Source.Commit(ctx, Ack) — the SOURCE side does see progress"]
+
+    subgraph GAP["what a Sink is structurally denied"]
+        direction TB
+        N1["no acknowledgement callback anywhere on Sink"]
+        N2["no SinkRuntime.Lanes — SourceRuntime has Lanes"]
+        N3["no SinkRuntime.State — SourceRuntime has State"]
+    end
+    GAP -.- W
+```
+
+The asymmetry §8 is named after, verified against `pkg/connector/runtime.go`: `SourceRuntime`
+declares `Lanes()` and `State()`, `SinkRuntime` declares neither, and `Sink` in
+`pkg/connector/sink.go` has no callback — so a sink has no expressible way to claim progress
+except by returning a clean `WriteResult`, which is what designs R4's exposure out at the type
+level rather than in prose.
+
 ### 7.1 Optional source interfaces
 
 Each is exported, each has exactly one corresponding `Caps` field, each is asserted in one place.
+
+```mermaid
+flowchart TB
+    subgraph S1["Single lane — what the ninety-percent source implements"]
+        direction TB
+        A1["one record.Allocator,<br/>stamps ONE lane"] --> B1["one *record.Batch,<br/>Batch.Lane already set"]
+        B1 --> R1["Source.Read(ctx, dst *record.Batch)"]
+    end
+
+    subgraph S2["Many lanes — SourceCaps.ReadsLanes true"]
+        direction TB
+        H["one Allocator AND one *record.Batch<br/>PER LANE this instance holds"]
+        H --> P{"partitioned into at most<br/>SourceCaps.ReadConcurrency<br/>DISJOINT lane groups"}
+        P --> G1["goroutine 1<br/>LaneReader.ReadLanes(ctx, dst)"]
+        P --> G2["goroutine N<br/>LaneReader.ReadLanes(ctx, dst)"]
+    end
+
+    R1 --> L["ledger.Ledger.Admit"]
+    G1 --> L
+    G2 --> L
+    L --> F["Admit REFUSES a batch whose records disagree with<br/>Batch.Lane, fault.PermanentContract naming both lanes"]
+
+    P -.-> N1["ReadConcurrency 1 IS the multiplexed shape.<br/>ReadConcurrency equal to the lane count IS the<br/>per-lane shape. No lane is in two live calls."]
+    R1 -.-> N2["A source declaring ReadsLanes still implements Read,<br/>because the required interface is required. The core<br/>never calls it — fault.PermanentInternal is the body."]
+    H -.-> NB["NOT BUILT. registry.ResolvedSource.ReadConcurrency and<br/>Ledger.Admit's lane check are real and tested. The engine<br/>that owns the per-lane Allocators and calls ReadLanes is not."]
+```
+
+One lane per `Source.Read` versus many per `LaneReader.ReadLanes`, defined in `pkg/connector/source.go` and `pkg/connector/source_optional.go`; the concurrency bound is computed by `(*ResolvedSource).ReadConcurrency(parallelism)` in `pkg/registry/resolve.go:44`, which clamps to `spec.Spec.Parallelism` so the operator's number always wins downward. The one piece that is genuinely implemented is the guard at the bottom — `internal/ledger/ledger.go:216-223` rejects a batch whose records were stamped for a different lane than `Batch.Lane`, which is what turns ADR 0026's silent mislabelling into a loud contract fault.
 
 ```go
 // LaneReader upgrades a source from "one lane per Read" to "MANY LANES PER CALL".
@@ -2158,6 +3032,68 @@ type StateAdopter interface {
 
 ## 8. `Sink` — three methods, frozen, progress-blind
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as engine.Build
+    participant E as sink node loop — NOT BUILT
+    participant K as Sink
+    participant RT as SinkRuntime
+
+    B->>K: registry.SinkDef.New(ctx, *config.Config)
+    E->>K: Open(ctx, rt, connector.Opening)
+    Note over K: Opening carries Restored, Schemas, Streams, Guarantee — SHAPE, never progress
+    K->>RT: rt.Streams(), rt.Schemas(), rt.Config(ctx)
+    loop one connector.Request at a time, up to SinkCaps.MaxConcurrency in flight
+        E->>K: Write(ctx, req) with req.Attempt = 1
+        alt everything landed durably
+            K-->>E: connector.AllWritten(req.Count), nil
+        else the sink can name what failed
+            K-->>E: WriteResult with Failed []fault.RecordFault, plus err
+            Note over E: only the NAMED record.Ref values are re-requested, req.Attempt+1
+        else the sink cannot know what landed
+            K-->>E: empty WriteResult, err of class fault.Indeterminate
+            Note over E: the WHOLE request is retried. Never partial-apply and report success
+        end
+        E->>E: res.Reconcile(req.Count) — a mismatch is fault.PermanentContract
+    end
+    Note over E,K: a Flusher sink is settled on Flush, NOT on Write's return
+    E->>K: Close(ctx) — exactly once, always, even after a failed Open
+    Note over B,RT: TODAY only New and Close have callers, both in internal/engine/build.go. No record has been written.
+```
+
+Three frozen methods and the three answers `Write` may give, from `pkg/connector/sink.go` — the
+mid-batch failure is the middle branch, where only the records named in `WriteResult.Failed` come
+back with a higher `Request.Attempt`, and the safe default is the bottom branch, where naming
+nothing means nothing is claimed durable. `WriteResult.Reconcile` is real code
+(`pkg/connector/sink.go`); the engine that would call it is not.
+
+```mermaid
+flowchart TD
+    W["Sink.Write returns (res WriteResult, err error)"] --> E{"err == nil"}
+
+    E -->|"yes"| A{"len(res.Failed) == 0"}
+    E -->|"no"| B{"len(res.Failed) == 0"}
+
+    A -->|"yes"| Q1["Q1 — every record in req.Records is DURABLE<br/>a sink returning this early has LIED"]
+    A -->|"no"| Q2["Q2 — everything NOT named in res.Failed is durable<br/>each named record carries its own Class and reason"]
+    B -->|"no"| Q3["Q3 — as Q2, and err is the headline for logs and status"]
+    B -->|"yes"| Q4["Q4 — NOTHING claimed durable<br/>graceful degradation, the whole request is retried"]
+
+    Q1 --> R{"res.Reconcile(req.Count)"}
+    Q2 --> R
+    Q3 --> R
+    Q4 -.->|"see caption"| R
+    R -->|"ok == false"| PC["fault.PermanentContract"]
+```
+
+The four quadrants of `Sink.Write` are a pure function of two booleans, and the unnamed-record default
+is safe in each — defined in `pkg/connector/sink.go:30-58`, with `Reconcile` at `:250`. The Q4 edge is
+dotted because the identity is **unsatisfiable there**: a verified probe of
+`WriteResult{Written: 0}.Reconcile(500)` returns `ok=false, want=500`, so the documented
+graceful-degradation shape fails the mandatory check unless the engine skips reconciliation when
+`err != nil` — which no code and no prose currently says it does.
+
 ```go
 // Sink is the required sink interface. Three methods. Frozen.
 //
@@ -2364,6 +3300,68 @@ func AllWritten(n int) WriteResult // convenience for the happy path
 ```
 
 ### 8.1 Optional sink interfaces
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant E as checkpoint pump — NOT BUILT
+    participant K as Sink — Committer plus WriterState
+    participant ST as store.StateStore
+
+    Note over E,ST: ONE CHECKPOINT, in this exact order
+    E->>K: Flush(ctx, FlushCheckpoint)
+    E->>K: PrepareCommit(ctx, CommitPoint) — SEALS
+    K-->>E: []connector.Committable, each naming its Lanes and Cursors
+    E->>K: SnapshotState(ctx, id) — RECORDS what is still OPEN
+    K-->>E: []record.Blob
+    Note over E,K: PrepareCommit BEFORE SnapshotState, or a sealed artifact lands twice
+    E->>ST: ONE durable record under CommitPoint.ID — cursors, epoch, writer state, committables
+    ST-->>E: flushed
+    E->>K: Commit(ctx, cs) — only after that record is durable
+    K--)E: answer lost. The commit LANDED and the confirmation timed out
+    Note over E,ST: crash here. The committable survives inside the recovered checkpoint
+
+    Note over E,ST: RECOVERY, in this exact order
+    E->>K: Open(ctx, rt, Opening with Restored set to that id)
+    E->>K: RestoreState(ctx, blobs) — RECOGNITION comes first
+    E->>K: ResolveStale(ctx, cs) — preferred over AbortStale whenever declared
+    K-->>E: []CommitOutcome — AlreadyCommitted for what landed, RetryLater for what is in doubt
+    E->>K: Commit(ctx, recovered)
+    E->>K: first Write(ctx, req)
+```
+
+The two orderings `pkg/connector/sink_optional.go` declares normative, drawn as one timeline: a
+commit that succeeds and then loses its answer is exactly why `StaleResolver.ResolveStale` returns
+a per-item `CommitOutcome` where `Committer.AbortStale` returns one naked error. Both orderings
+exist only as doc comments and type signatures today — no checkpoint pump calls any of it, and
+the only `store.StateStore` in the tree is in-memory.
+
+```mermaid
+flowchart LR
+    REFS["req.Records []record.Ref<br/>req.Count entries, each Ref.ID a record.RecordID"] --> CALL["Sink.Write<br/>or Flusher.Flush"]
+    CALL --> RES["connector.WriteResult"]
+
+    RES --> WRIT["Written int64<br/>DURABLE — includes Duplicates"]
+    RES --> DUPS["Duplicates []record.RecordID<br/>DURABLE — already landed"]
+    RES --> DEFR["Deferred []record.RecordID<br/>NOT-ATTEMPTED-AGAIN — accepted, not yet durable,<br/>MUST NOT be resent; illegal from Write"]
+    RES --> FAIL["Failed []fault.RecordFault<br/>FAILED — keyed on RecordFault.Record,<br/>never on a batch index"]
+
+    FAIL --> SPLIT{"per entry:<br/>Class.Terminal()"}
+    SPLIT -->|"false"| SUB["the RETRY SUBSET<br/>derivable from the result alone —<br/>no side table, no positional correlation"]
+    SPLIT -->|"true"| TERM["RetryPolicy.Terminal<br/>dead-letter, drop or stop"]
+
+    WRIT --> IDENT["res.Reconcile(count)<br/>Written == count - len(Failed) - len(Deferred)"]
+    DEFR --> IDENT
+    FAIL --> IDENT
+    DUPS -.-> WRIT
+```
+
+This is R7 in one picture: a partial batch failure is reported per record by `RecordFault.Record`, a
+framework-assigned `record.RecordID` that survives filtering and rebatching, and the retry subset then
+falls straight out of `Class.Terminal()` with no side table — `pkg/connector/sink.go:196-257` and
+`pkg/fault/record_fault.go`. `Deferred` is the fourth disposition and is meaningful only from
+`Flusher.Flush`; the check is cardinality-only, so a `Failed` entry naming a record that was never in
+the request still passes green.
 
 ```go
 // Flusher declares that Write does NOT by itself make data durable and that
@@ -2846,12 +3844,101 @@ type CodecCaps struct {
 
 ## 10. Capabilities — declared data plus optional interfaces
 
+```mermaid
+flowchart TB
+    subgraph author["what the connector author writes"]
+        IFACE["concrete type S<br/>optional method sets<br/>e.g. Nackable, Committer"]
+        DATA["SourceCaps / SinkCaps / TransformCaps / BufferCaps<br/>plain values, JSON, no methods"]
+    end
+
+    IFACE -->|"implements[T](any(z)) on var z S"| CHECK
+    DATA -->|"the matching bool field"| CHECK
+
+    CHECK{"registry.capCheck<br/>declared vs implemented"}
+
+    CHECK -->|"declared AND implemented"| PROBED["CapProbed<br/>handle kept by Resolve"]
+    CHECK -->|"declared, NOT implemented"| PANIC["panic at init<br/>the dangerous lie"]
+    CHECK -->|"implemented, NOT declared"| UNDECL["CapUndeclared<br/>Descriptor.Warnings, handle left nil"]
+    CHECK -->|"name only, in Caps.Unknown"| UNKNOWN["CapUnknown<br/>ignored and reported"]
+
+    PROBED --> REPORT["registry.CapReport<br/>Name, Present, Source, Reason, Unlocks, Iface"]
+    UNDECL --> REPORT
+    UNKNOWN --> REPORT
+    REPORT --> DESC["registry.Descriptor.Capabilities<br/>served to the UI without instantiating anything"]
+```
+
+The cross-check runs in one direction only: declaring what you do not implement is fatal, implementing what you did not declare is a warning and leaves the capability switched off, because the declaration — not the method set — is what a wire can carry. Defined in `pkg/registry/crosscheck.go` (`capCheck`, `implements`, `report`) and `pkg/registry/descriptor.go` (`CapReport`, `CapSource`).
+
 ### 10.1 The rule, and the two halves
 
 **Behaviour is an optional exported interface. The fact of that behaviour is declared data.**
 
+```mermaid
+flowchart LR
+    subgraph optional["optional source interfaces — pkg/connector/source_optional.go, shared_optional.go"]
+        VAL["Validator.Validate<br/>per-field diagnostics that needed a connection"]
+        PRB["Prober.Probe<br/>a named liveness breakdown, not one bool"]
+        CHO["ChoiceProvider.Choices<br/>'list the tables' with no core knowledge of tables"]
+        DIS["Discoverer.Discover<br/>a stream picker with no frontend code"]
+        LRD["LaneReader.ReadLanes<br/>many lanes per call, paired with ReadConcurrency"]
+        HBT["Heartbeater.Heartbeat<br/>an idle lane stops pinning a pruning upstream"]
+        BKL["BacklogReporter.Backlog<br/>records, bytes and event-time lag, or nil for unknown"]
+        NCK["Nackable.Nack<br/>upstream is told when a record is dead-lettered"]
+        ADP["StateAdopter.AdoptsStateOf<br/>a rename or rewrite adopts the old cursors"]
+    end
+
+    VAL -->|"Validates"| SUBMIT
+    PRB -->|"Probes"| SUBMIT
+    CHO -->|"Choices"| SUBMIT
+    DIS -->|"Discoverable"| SUBMIT
+    LRD -.->|"ReadsLanes"| RUN
+    HBT -.->|"Heartbeats"| RUN
+    BKL -.->|"ReportsBacklog"| RUN
+    NCK -.->|"Nackable"| RUN
+    ADP -.->|"AdoptsState"| RECOV
+
+    SUBMIT["submit time and the control API<br/>reached today through registry.ResolvedSource"]
+    RUN["the running read path<br/>NOT BUILT — Pipeline.Run is a stub"]
+    RECOV["restart and connector migration<br/>NOT BUILT — no durable store exists"]
+```
+
+Each edge label is the `SourceCaps` field that must also be set — the interface alone does nothing. The dotted edges lead to behaviour that does not exist yet: `internal/engine.Pipeline.Run` is a one-line error return, so no resolved source handle is ever called. Interfaces in `pkg/connector/source_optional.go` and `shared_optional.go`, flags in `pkg/connector/caps.go`, the "unlocks" wording in `pkg/registry/add.go`.
+
 Data crosses a process boundary; a type assertion does not. A flag with no methods behind it is
 worthless. So both exist, and registration cross-checks them.
+
+```mermaid
+flowchart LR
+    subgraph dur["durability — which interface earns the acknowledgement"]
+        W["Sink.Write<br/>required and frozen"]
+        F["Flusher.Flush<br/>Write is not durable, the Flush that covers it is"]
+        C["Committer<br/>PrepareCommit, Commit, AbortStale"]
+        T["TokenSink<br/>WriteWithToken, LoadToken"]
+    end
+
+    W -->|"no optional interface"| AP
+    F -->|"Flushes"| AP
+    C -->|"Commits"| AP
+    T -->|"StoresToken"| AP
+    AP["ResolvedSink.AckPoint<br/>token wins, then commit, then flush, then write"]
+
+    W --> AL["SinkCaps.MaxGuarantee = AtLeastOnce"]
+    ID["SinkCaps.Idempotent<br/>declared data, no interface behind it"] --> EF["MaxGuarantee = EffectivelyOnce"]
+    C --> XO["MaxGuarantee = ExactlyOnce"]
+    T --> XO
+
+    WS["WriterState<br/>SnapshotState, RestoreState"] -.->|"KeepsState — SnapshotState runs AFTER PrepareCommit"| C
+    SR["StaleResolver.ResolveStale"] -.->|"ResolvesStale — a per-item answer, preferred over AbortStale"| C
+
+    subgraph shape["shape and destination lifecycle — no effect on the tier"]
+        SS["StructuredSink.AcceptsStructured<br/>Request.Rows instead of Request.Body"]
+        PT["Partitioner.Partition<br/>per-tenant or per-table batching with no batching code"]
+        SA["SchemaApplier.ApplySchemaChange<br/>WHICH kinds is data: SinkCaps.SchemaChanges"]
+        PR["Preparer.Prepare<br/>the destination is created or verified before data flows"]
+    end
+```
+
+On the sink side an implemented interface moves the acknowledgement point and raises the guarantee ceiling — `Idempotent` is the one rung that is pure data with no interface behind it. Ladder in `SinkCaps.MaxGuarantee` (`pkg/connector/caps.go:310`) and `ResolvedSink.AckPoint` (`pkg/registry/resolve.go:265`); interfaces in `pkg/connector/sink_optional.go`. `Validator`, `Prober` and `ChoiceProvider` are shared with the source side and behave identically.
 
 ```go
 // Caps is embedded in every component kind's capability struct. It is the
@@ -3132,6 +4219,31 @@ type TransformCaps struct {
 
 ### 10.2 The runtimes — how the core grows without breaking a connector
 
+```mermaid
+flowchart TB
+    FROZEN["frozen required interfaces<br/>Source 4 methods, Sink 3, Transform 3, Buffer 7<br/>no method is ever added to any of them"]
+
+    subgraph growth["where a new core capability may go instead — ADR 0013"]
+        G1["a new optional interface plus a new Caps field<br/>the CONNECTOR implements it, cross-checked at registration"]
+        G2["a new method on a *Runtime interface<br/>the CORE implements it, the connector only calls it"]
+        G3["a new field on Opening, Request, Ack or WriteResult"]
+    end
+
+    FROZEN -.->|"never grows"| G1
+    FROZEN -.->|"never grows"| G2
+    FROZEN -.->|"never grows"| G3
+
+    G2 --> SRT["SourceRuntime<br/>Lanes, State, Streams, Schemas, Declare, Instance, Config, Batcher, Note"]
+    G2 --> TRT["TransformRuntime<br/>Lanes, Log, Metrics, Note, Node"]
+    G2 --> SKRT["SinkRuntime<br/>deliberately NO Lanes and NO State"]
+
+    SRT -->|"Lanes()"| LC["connector.LaneCtl<br/>Announce, AnnounceMany, Seed, Finish, Forget,<br/>Assigned, Changes, Revoked, Admission"]
+    TRT -->|"Lanes()"| LV["connector.LaneView<br/>Table only — read-only view of the durable lane table"]
+    LC -->|"embeds"| LV
+```
+
+`LaneCtl` and `LaneView` are the cheapest growth channel precisely because they are NOT capabilities: the core implements them and injects them, so they appear in no `Caps` struct, no `capCheck` table and no `Resolved*` struct, and adding a method to either costs a connector author nothing. Defined in `pkg/connector/runtime.go` and `pkg/connector/lanectl.go`.
+
 ```go
 // SourceRuntime is the source's handle onto the core. Everything a connector needs
 // from canal arrives here.
@@ -3339,6 +4451,36 @@ const (
 
 ### 10.3 Registration — data plus a compile-time-shaped cross-check
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Init as connector package init
+    participant Add as registry.AddSource
+    participant Build as engine.Build
+    participant Res as registry.ResolveSource
+
+    Note over Init,Add: process start — no connector code is instantiated
+    Init->>Add: SourceDef with Caps and New
+    Add->>Add: checkCommon — Caps.APIVersion inside MinAPIVersion..APIVersion
+    Add->>Add: UpstreamRetention set, Boundedness and LaneKinds non-empty, StableKeys needs Notes
+    Add->>Add: capCheck table of 8 rows against implements on var z S
+    alt declared and not implemented
+        Add-->>Init: panic — declares capabilities it does not implement
+    else implemented and not declared
+        Add->>Add: one line into Descriptor.Warnings, capability stays OFF
+    end
+    Add-->>Init: Descriptor carrying Capabilities as CapReport values
+
+    Note over Build,Res: submit time — one Build per pipeline
+    Build->>Res: ResolveSource with name, instance and declared Caps
+    Res->>Res: the single type-assertion site, 9 rows, handle kept only if DECLARED
+    Res-->>Build: ResolvedSource of nilable handles, plus Report
+
+    Note over Add,Res: DRIFT — add.go has 8 rows and resolve.go has 9. reads_lanes and resolves_stale live only in resolve.go, so over-declaring either does NOT panic.
+```
+
+The cross-check happens twice at two different times, from two hand-maintained tables — `pkg/registry/add.go:60` and `pkg/registry/resolve.go:67` for sources, `add.go:149` and `resolve.go:169` for sinks — and the tables have drifted, so the panic contract stated above does not hold for `ReadsLanes` or `ResolvesStale`.
+
 ```go
 // Package registry holds component definitions keyed by kind and name.
 //
@@ -3524,6 +4666,34 @@ func (r *Registry) Descriptor(k Kind, name string) (Descriptor, bool)
 
 ### 10.4 `Resolve` — the single type-assertion site
 
+```mermaid
+flowchart TB
+    REQ["requested tier<br/>spec.Spec.Guarantee, overridden per node by spec.Node.Guarantee"]
+    SC["SourceCaps<br/>Replayable, RedeliversUnacked, StableKeys,<br/>UpstreamRetention, LaneKinds, MaxLanes"]
+    KC["SinkCaps<br/>MaxGuarantee, Idempotent, Modes,<br/>RequiresKey, RequiresCompleteImages, SchemaChanges"]
+    ST["store.StoreCaps.Supports<br/>FlushIsDurable, CAS, EpochFencing, AtomicMultiKey"]
+
+    SC --> SCEIL["sourceCeiling<br/>AtMostOnce if neither Replayable nor RedeliversUnacked<br/>AtLeastOnce if no StableKeys"]
+    ST --> STCEIL["storeCeiling<br/>strongest tier this deployment's store supports"]
+
+    SCEIL --> BR["per sink node<br/>branch = sourceCeiling.Min(sink.MaxGuarantee()).Min(storeCeiling)"]
+    KC --> BR
+    STCEIL --> BR
+
+    REQ --> NC["telemetry.NodeContract<br/>Guarantee = requested.Min(branch)<br/>AckPoint from ResolvedSink.AckPoint()<br/>DurabilityEdge = 'sink:' + node id"]
+    BR --> NC
+
+    NC --> NEG["telemetry.Negotiated<br/>Guarantee = weakest progress-bearing branch<br/>Nodes, Why, AckPoint, DurabilityEdge, Downgrades"]
+    NC --> DG["config.Diagnostics<br/>one error per impossible combination, all returned together"]
+
+    DG --> WV["applyWaivers over spec.Downgrades<br/>DEFECTIVE — do not rely on this edge"]
+    WV --> Q{"any SeverityError left?"}
+    Q -->|"yes"| NO["Build refuses at submit time"]
+    Q -->|"no"| YES["Pipeline is built — but Pipeline.Run is a stub, so nothing moves"]
+```
+
+Negotiation is a pure function of the resolved capability set and it runs today, in `internal/engine/negotiate.go`; the `applyWaivers` node is marked defective because it downgrades every capability and guarantee error on a match of node, signer and reason alone, never reading `Downgrade.Requested`, `Effective` or `Missing`, so one signature disables the data-loss refusals as well as the tier refusal it was written for.
+
 ```go
 // ResolvedSource is a source with every optional capability snapshotted into a
 // plain struct of nilable handles at one well-defined moment.
@@ -3583,6 +4753,33 @@ func ResolveSink(name string, k connector.Sink, c connector.SinkCaps) (*Resolved
 ---
 
 ## 11. `spec` — topology as data (R1)
+
+```mermaid
+flowchart LR
+    subgraph G["spec.Spec.Graph — one []spec.Node, no ordinal, no stage count"]
+        direction LR
+        O["orders<br/>registry.KindSource"]
+        R["returns<br/>registry.KindSource"]
+        M["merge<br/>registry.KindTransform<br/>TransformCaps.Regroups"]
+        W["warehouse<br/>registry.KindSink"]
+        Q["queue<br/>registry.KindSink"]
+        X["metrics<br/>registry.KindSink"]
+        D["dlq<br/>registry.KindSink"]
+    end
+
+    O -->|"Node.Inputs: From=orders Select=EdgeMain"| M
+    R -->|"Node.Inputs: From=returns Select=EdgeMain"| M
+    M -->|"Select=EdgeMain"| W
+    M -->|"Select=EdgeMain"| Q
+    M -.->|"Select=EdgeMain BestEffort=true"| X
+    W -->|"Select=EdgeFailed"| D
+```
+
+Fan-in is one node listing two `spec.Edge` values in `Node.Inputs`; fan-out is two nodes listing the
+same `Edge.From`; dead-lettering is an edge whose `Select` is `EdgeFailed`; a by-design lossy branch is
+`Edge.BestEffort` (dotted). There is no ordinal, no position and no stage count in `spec.Spec` — the
+whole topology is `Graph []Node` plus each node's `Inputs []Edge`, which is the structural answer to the
+frozen eight-stage schema R1 was written against; defined in `pkg/spec/spec.go` and `pkg/spec/node.go`.
 
 ```go
 // Package spec is a pipeline's declarative definition: the thing the ConfigStore
@@ -3823,6 +5020,42 @@ func (s *Spec) StreamsFor(node record.NodeID) []StreamConfig
 ```
 
 **Graph validation, run by `engine.Build`.** All checks produce diagnostics anchored to a node id, all
+
+```mermaid
+flowchart TD
+    S["spec.Spec"] --> V["engine.validateGraph"]
+    REG["registry.Registry<br/>Has / Kind.Produces / Kind.Consumes"] -.->|"asked, never switched on"| V
+
+    V --> C1["node ids present and unique"]
+    V --> C2["Node.Kind + Node.Name is registered"]
+    V --> C3["Edge.From exists; no self-edge"]
+    V --> C4["no Inputs implies Kind.Produces"]
+    V --> C5["buffer node has exactly one Input"]
+    V --> C6["transform with 2+ Inputs declares Regroups"]
+    V --> C7["EdgeFailed only from canFailPerRecord"]
+    V --> C8["Spec.Terminals all Kind.Consumes"]
+    V --> C9["checkAcyclic"]
+    V --> C10["checkReachable"]
+
+    C1 --> DG
+    C2 --> DG
+    C3 --> DG
+    C4 --> DG
+    C5 --> DG
+    C6 --> DG
+    C7 --> DG
+    C8 --> DG
+    C9 --> DG
+    C10 --> DG
+
+    DG["config.Diagnostics<br/>every problem at once<br/>each Diagnostic.Node anchored"]
+```
+
+Every check runs and every failure is appended, so one call returns the complete problem list rather
+than the first one; the producer/consumer questions are put to `registry.Kind` rather than to a `switch`
+on node names, which is what keeps "add a node kind" a data change. This validator is fully implemented
+in `internal/engine/graph.go`, unlike `Pipeline.Run`.
+
 at once:
 
 - exactly one node per `ID`; every `Edge.From` names an existing node; the graph is acyclic;
@@ -3837,7 +5070,71 @@ at once:
 
 ## 12. `ledger` — the ack graph, the commit protocol, and the answer to the hard question
 
+```mermaid
+flowchart TB
+    B["record.Batch — Lane, Position, N records"]
+    A["Ledger.Admit(ctx, b)"]
+    G["group — refs = sum of Origin.Refs(), records = b.Len()"]
+    TK["Tracker.Track(ctx, pos, weight, refs) — blocks on budget"]
+    BY["l.byRec — RecordID to GroupID"]
+
+    B --> A
+    A -->|"stamps Position.Seq, opens l.groups[b.Group()]"| G
+    A --> TK
+    A -->|"one entry per admitted record"| BY
+
+    subgraph descend["fan-out and derivation — engine calls, never a connector"]
+        EX["Ledger.Expand(gid, n)"]
+        RG["Ledger.Register(id, gid)"]
+    end
+
+    G -.->|"1 to N, or fan-out to n sink nodes"| EX
+    EX -->|"gr.refs += n and ticket.n.refs += n"| G
+    BY -.->|"Batch.Derive / Batch.Merge produce new RecordIDs"| RG
+    RG -->|"derived id points at the SAME group"| BY
+
+    subgraph back["settlement, propagating back from the sinks"]
+        OU["ledger.Outcome — Record, Disposition, Node, Fault"]
+        SE["Ledger.Settle(outs)"]
+    end
+
+    OU --> SE
+    SE -->|"g.settled++, delete byRec entry"| G
+    SE -->|"Release(ticket, 1) per outcome; Abandon(ticket) if the closing outcome is Abandoned"| TK
+    G -->|"settled >= refs: drain handles, delete the group"| CNT["laneState ack counters — ackRecords, ackAbandoned, ackAbandonedBy"]
+
+    DEF>"KNOWN DEFECT, not design — Admit overwrites the map entry when a batch reuses an already-open GroupID, orphaning the first ticket. ledger.go:304. See docs/decisions/_rule-compliance.md"]
+    A -.-> DEF
+```
+
+The ack graph is one counter and one map: a batch admitted to `Ledger.Admit` opens a `group` whose `refs` is the sum of `Origin.Refs()`, and every descendant the engine derives is pointed back at that same group through `Ledger.Register`, or adds to it through `Ledger.Expand` — so fan-out, filtering and expansion need no core code path per topology. Defined in `internal/ledger/ledger.go` (`Admit`, `Expand`, `Register`, `Settle`) and `internal/ledger/disposition.go` (`Outcome`).
+
 ### 12.1 The tracker
+
+```mermaid
+flowchart LR
+    TR["Tracker.TrackResolved(pos) — zero-record batch, zero weight, enters ALREADY resolved"]
+
+    subgraph list["Tracker ordered list, head to tail — one node per admitted group"]
+        n1["seq 1<br/>resolved"]
+        n2["seq 2<br/>resolved<br/>Safe=true"]
+        n3["seq 3<br/>refs &gt; 0<br/>OUTSTANDING"]
+        n4["seq 4<br/>resolved<br/>Safe=true"]
+        n5["seq 5<br/>resolved"]
+    end
+
+    n1 --> n2 --> n3 --> n4 --> n5
+    TR -.->|"appended in ORDER, so it cannot jump the prefix"| n5
+
+    n2 ==>|"advanceLocked retires 1 and 2, then STOPS at the first unresolved node"| P["laneState.resolved = position of seq 2"]
+    n3 -.->|"a gap is structurally unrepresentable: 4 and 5 stay pending"| P
+
+    P --> Q{"advanced position .Safe?"}
+    Q -->|yes| F["laneState.pendingFlush — the only thing Flushable() will offer"]
+    Q -->|no| H["nothing offered; the lane waits for a later Safe prefix"]
+```
+
+The tracker resolves out of order and commits in order: `advanceLocked` walks the contiguous resolved prefix from the head and stops at the first outstanding node, so a gap is structurally unrepresentable, and only a resolved position with `Safe` set is offered to `Flushable`. Defined in `internal/ledger/tracker.go`; note that the position offered is the LAST node retired by one advance, not the last `Safe` one — see NOTES.
 
 ```go
 // Package ledger owns canal's acknowledgement graph.
@@ -3916,6 +5213,46 @@ func (t *Tracker[P]) Close()
 
 ### 12.2 The commit protocol, end to end — three phases, fenced
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Src as Source
+    participant Eng as engine.Pipeline
+    participant Led as ledger.Ledger
+    participant Snk as Sink
+    participant St as store.StateStore
+    participant Up as the source's own upstream
+
+    Note over Eng: NOT BUILT — engine.Pipeline.Run is a one-line error return.<br/>Every Eng step below is the specified protocol, not running code.
+
+    Eng->>Src: Read(ctx, b)
+    Eng->>Led: Admit(ctx, b)
+    Note right of Led: stamps Position.Seq, opens the group,<br/>Tracker.Track BLOCKS when over budget
+
+    Eng->>Snk: Write(ctx, req)
+    Snk-->>Eng: connector.WriteResult
+    Note over Snk,Eng: PHASE ONE — the SINK's write is durable
+
+    Eng->>Led: Settle(outs)
+    Led-->>Led: Release or Abandon, prefix advances,<br/>pendingFlush set only if the new position is Safe
+
+    Eng->>Led: Flushable()
+    Led-->>Eng: map of LaneID to Position, one per lane that advanced to a NEW Safe position
+    Eng->>St: Set(ctx, w) — ONE atomic store.Batch carrying the lane cursors, the schema epoch, the pending committables and the dedupe additions, per-key CAS and epoch fenced
+    St-->>Eng: returns only once the bytes are durable
+    Note over Eng,St: PHASE TWO — canal's OWN record is now on disk
+
+    Eng->>Led: Committed(m)
+    Note right of Led: revoked lane — counters updated, Ack DISCARDED.<br/>That is the epoch fence. Otherwise Ack carries laneState.epoch.
+    Led-->>Eng: Acks() yields connector.Ack with Through and Epoch
+    Eng->>Src: Commit(ctx, ack) on a DEDICATED pump goroutine
+    Note over Src,Up: PHASE THREE — only now. Moving this above the flush is the<br/>two-phase data-loss bug ADR 0006 exists to prevent.
+    Src->>Up: advance the slot, delete the messages, commit the group offset — or nothing
+    Note over Src,Up: DEFECTS, NOT DESIGN — the shipped code around this protocol has three known fatal defects<br/>(applyWaivers disabling the phase-two guard, a Ledger.send/Close race, group-id reuse at<br/>ledger.go:304). Read docs/decisions/_rule-compliance.md before trusting this as implemented.
+```
+
+Three phases in one fixed order: the sink's write is durable, THEN canal's own record is flushed through `store.StateStore.Set`, and only THEN is the source told it may advance — with the acknowledgement carrying the lane's lease epoch and suppressed entirely for a revoked lane. Specified in `docs/decisions/0006-three-phase-commit.md` and `internal/ledger/ledger.go` (`Flushable`, `Committed`, `Acks`); the engine side is `internal/engine/build.go`, whose `Pipeline.Run` is still a one-line error return.
+
 This is the most important section in the document. Read it as normative sequence.
 
 ```
@@ -3980,6 +5317,35 @@ returns, which the engine treats as a checkpoint request). Kafka Connect's
 after a crash and why KAFKA-4942 is the ecosystem's most misdiagnosed log line.
 
 ### 12.3 The Ledger
+
+```mermaid
+flowchart TB
+    S["Ledger.Settle(outs) — a sink reported terminal dispositions"]
+    S --> ORD{"laneState.ordering"}
+
+    ORD -->|"OrderingPrefix"| C1{"ticket refs discharged AND every earlier position in the lane resolved?"}
+    C1 -->|no| W1["prefix holds. Tracker.Pending() names the oldest outstanding node and its age"]
+    C1 -->|yes| C2{"the advanced position has Safe set?"}
+    C2 -->|no| W1
+    C2 -->|yes| C3{"strictly ahead of laneState.committed? — checked in Flushable()"}
+    C3 -->|no| W2["a cursor is never moved backwards"]
+    C3 -->|yes| P2["PHASE TWO — store.StateStore.Set, atomic, CAS and epoch fenced, returns only when DURABLE"]
+    P2 --> CM["Ledger.Committed(m) sets laneState.committed"]
+    CM --> C4{"laneState.revoked?"}
+    C4 -->|"yes — this worker is fenced"| DR["counters updated, NO Ack is ever delivered for the lane"]
+    C4 -->|no| AK["connector.Ack — Lane, Epoch, Through, Records, Abandoned, AbandonedBy, LaneFinished"]
+    AK --> PUMP["commit pump calls Source.Commit(ctx, ack) — the source may NOW tell its upstream to advance"]
+
+    ORD -->|"OrderingDiscrete"| D1{"group settled >= refs, handles split into landed and abandoned?"}
+    D1 -->|no| W1
+    D1 -->|yes| D2["Ledger.emitDiscrete — Ack carries Handles and AbandonedHandles; revoked lanes are still dropped"]
+    D2 -.->|"emitted straight out of Settle — there is no canal-side cursor, so phase two is SKIPPED"| PUMP
+
+    DEF>"KNOWN DEFECTS, not design — applyWaivers disables the phase-two data-loss guard on any signed waiver, and Build accepts a PrunesOnCommit source against memstore. See docs/decisions/_rule-compliance.md"]
+    P2 -.-> DEF
+```
+
+Everything that must be true before `Source.Commit` is called, in the order the `Ledger` checks it: refs discharged, prefix contiguous, position `Safe`, strictly ahead of the durable cursor, flushed, and the lane not revoked. Read off `internal/ledger/ledger.go` `Settle`, `Flushable`, `Committed`, `emitDiscrete` and `Revoke` — note the discrete branch, which has no canal-side cursor and therefore emits from `Settle` without a phase two.
 
 ```go
 // Ledger is the per-pipeline settlement graph. One Ledger holds one Tracker per
@@ -4182,6 +5548,90 @@ anything else exactly-once.
 ## 13. The checkpoint: one durable record, opaque payloads, a typed header
 
 ### 13.1 The record
+
+```mermaid
+classDiagram
+    direction LR
+
+    class Checkpoint {
+        +Header Header
+        +Lanes Map~LaneID, LaneState~
+        +Committables Map~uint64, Committable~
+        +WriterState Map~NodeID, Blob~
+        +TransformState Map~NodeID, Blob~
+        +SchemaEpoch uint64
+        +Stamp()
+        +WrittenByNewerBuild() bool
+    }
+
+    class Header {
+        TYPED, CORE-READABLE, CLOSED VOCABULARY
+        +Format uint32
+        +ID uint64
+        +Tenant TenantID
+        +Pipeline PipelineID
+        +Generation uint64
+        +Epoch uint64
+        +Worker string
+        +CanalVersion string
+        +Connectors Map~string, string~
+        +CommittedAt time.Time
+        +RecordsIn int64
+        +RecordsOut int64
+        +BytesOut int64
+    }
+
+    class LaneState {
+        +Spec Blob
+        +Cursor Position
+        +Group LaneGroup
+        +After LaneGroup[]
+        +Kind LaneKind
+        +Ordering Ordering
+        +Bounded bool
+        +Finished bool
+        +FinishedAt time.Time
+        +Label string
+        +Weight uint64
+        +Version uint64
+    }
+
+    class Blob {
+        OPAQUE PAYLOAD - connector-authored bytes
+        +Version uint32
+        +Bytes []byte
+    }
+
+    class Committable {
+        typed frame around an OPAQUE Handle
+        +Checkpoint uint64
+        +Node NodeID
+        +Handle Blob
+        +Lanes LaneID[]
+        +Cursors Map~LaneID, Position~
+        +Records int64
+    }
+
+    Checkpoint *-- Header : exactly one
+    Checkpoint *-- "0..n" LaneState : keyed by record.LaneID
+    Checkpoint *-- "0..n" Committable : keyed by the checkpoint ID that minted it
+    Checkpoint *-- "0..n" Blob : WriterState and TransformState, keyed by record.NodeID
+    LaneState *-- Blob : Spec is write-once
+    LaneState o-- Position : Cursor is write-many
+
+    class Position {
+        +Seq uint64 - core-assigned, NEVER persisted
+        +Token Blob - the connector's resume payload
+        +Order []byte
+        +Label string
+        +Safe bool
+        +At time.Time
+    }
+
+    note for Checkpoint "ONE record, ONE atomic write. Serialised and written through store.StateStore in a single operation, so the schema epoch cannot diverge from the cursors that decode against it. Declared in internal/engine/checkpoint.go; NOTHING constructs it yet."
+```
+
+One durable record: a typed, closed-vocabulary `Header` the core can read and render, wrapped around payloads (`record.Blob`, `connector.Committable.Handle`, `LaneState.Spec`) that are opaque, connector-authored and independently versioned. Declared in `internal/engine/checkpoint.go`, `pkg/record/ids.go` and `pkg/connector/sink_optional.go`; nothing in the module constructs a `Checkpoint` yet, so this is the specified shape, not a serialiser that runs.
 
 There is **exactly one** snapshot format, always self-contained and relocatable. Flink's
 canonical/native × aligned/unaligned matrix is an operator tax whose sharp edges ("aligned checkpoints
@@ -4615,6 +6065,29 @@ type Converter interface {
 
 ## 15. `config` — one declaration, five consumers, and the frontend contract
 
+```mermaid
+flowchart LR
+    A["connector author, once, at init<br/>config.NewSpec.Field.Lint.Example"] --> S
+
+    S["config.Spec<br/>frozen data, nothing on it is a callback"]
+
+    S --> C1["1 · validation<br/>Spec.Validate raw → config.Diagnostics<br/>structure, types, ranges, enums, unknown fields, Lints"]
+    S --> C2["2 · defaulting<br/>Field.Default resolved by Config.defaultFor<br/>read through config.Get / config.Must"]
+    S --> C3["3 · UI form model<br/>registry.Descriptor.Config, serialised verbatim<br/>Field.ShowIf, Field.RequiredIf, Field.Choices"]
+    S --> C4["4 · JSON Schema export<br/>Spec.JSONSchema → Descriptor.JSONSchema<br/>generated at registration, never hand-written"]
+    S --> C5["5 · reference docs<br/>Spec.Docs → Markdown"]
+    S -.-> C6["CLI — not built<br/>no main package exists"]
+
+    S --> R["Field.Secret drives Config.Redacted<br/>the only config form that leaves the process"]
+    R --> T["telemetry.PipelineStatus.Config"]
+```
+
+One `config.Spec` per component, built at init and never mutated, is the single artefact all five
+consumers read — which is why a specialised connector UI needs no core change. Solid edges are code that
+exists (`pkg/config/validate.go`, `config.go`, `render.go`, and `pkg/registry/add.go`, which calls
+`Spec.JSONSchema` at registration); the dotted edge is not built, and `Spec.Docs` currently has no caller
+in the module.
+
 The frontend goal is satisfied *only* if capabilities and config are declarative data. If any capability
 is a Go callback the UI must instantiate a connector to learn about it; if any config metadata lives in
 code the UI needs per-connector knowledge. Break that and the frontend becomes N frontends.
@@ -4952,6 +6425,40 @@ const (
 
 ### 15.3 Two-tier validation, and `Build` as a pure function
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant UI as generic form
+    participant REG as registry.Registry
+    participant SP as config.Spec
+    participant CV as connector.Validator
+    participant EB as engine.Build
+
+    Note over UI: no HTTP API and no UI exist in this repo yet
+    UI->>REG: Descriptors
+    REG-->>UI: Descriptor carrying Config, JSONSchema, Capabilities
+    Note over UI: Field.ShowIf and Field.RequiredIf are data,<br/>so the browser evaluates them with no round trip
+
+    UI->>SP: tier 1 - Validate raw
+    SP-->>UI: Config plus Diagnostics, all at once, no I O
+
+    opt only if the component implements it - absence never blocks a build
+        UI->>CV: tier 2 - Validate ctx
+        CV-->>UI: Diagnostics using CodeUnreachable, CodeAuthFailed, CodeNotFound
+    end
+
+    UI->>EB: tier 3 - Build ctx, registry, spec, deps
+    EB->>EB: validateGraph, per-node Spec.Validate, ResolveSource, ResolveSink, negotiate
+    EB-->>UI: Pipeline, telemetry.Negotiated, Diagnostics
+    Note over EB: Pipeline.Run is a one-line error return.<br/>Everything above this note is real, compiling, running code.
+```
+
+The three tiers are separated by what each is allowed to do: tier one is pure and therefore runs in the
+browser as well as in Go, tier two is the only one permitted I/O, and tier three negotiates capabilities
+as a pure function of config and returns `telemetry.Negotiated` before anything connects. Signatures in
+`pkg/config/validate.go`, `pkg/connector/shared_optional.go` and `internal/engine/build.go`; the caller
+drawn here as "generic form" does not exist yet.
+
 ```go
 // Build assembles a pipeline. Capability negotiation happens here, as a PURE
 // FUNCTION OF CONFIG, before anything starts. Nothing in Build does I/O except the
@@ -5077,6 +6584,62 @@ The last-but-one is worth naming: **the deployment's own stores are part of what
 
 ## 16. `telemetry` — metric names, the closed label set, and the read model
 
+```mermaid
+classDiagram
+    direction LR
+
+    class PipelineStatus {
+        +Generation uint64
+        +ObservedGeneration uint64
+        +Version uint64
+        +Complete bool
+        +Missing worker ids
+        +Phase Phase
+        +LaneCount int
+        +LanesTruncated bool
+        +Config redacted tree
+    }
+
+    class Negotiated {
+        +Guarantee
+        +DurabilityEdge
+        +AckPoint
+        +Why
+    }
+    class NodeContract
+    class Downgrade
+    class Throughput
+    class Condition
+    class NodeStatus
+    class LaneStatus
+    class Backlog
+    class BufferStatus
+    class WorkerStatus
+    class ScanProgress
+    class Event
+    class FaultInfo
+
+    PipelineStatus *-- Negotiated
+    PipelineStatus *-- Throughput
+    PipelineStatus *-- "0..n" Condition
+    PipelineStatus *-- "0..n" NodeStatus
+    PipelineStatus *-- "0..n" LaneStatus
+    PipelineStatus *-- "0..n" BufferStatus
+    PipelineStatus *-- "0..n" WorkerStatus
+    PipelineStatus *-- "0..1" ScanProgress
+    PipelineStatus *-- "0..n" Event
+    PipelineStatus *-- "0..1" FaultInfo
+    LaneStatus *-- "0..1" Backlog
+    Negotiated *-- "0..n" NodeContract
+    Negotiated *-- "0..n" Downgrade
+```
+
+`PipelineStatus` is one value type with everything inlined — there are no references to fetch and no
+second document; defined in `pkg/telemetry/readmodel.go`, with `Negotiated` in `negotiated.go` and
+`Condition` in `status.go`. Note `LaneCount` and `LanesTruncated`, which the code block below this
+diagram omits, and note that nothing in the module constructs a `PipelineStatus` yet: its only declared
+producers are `store.StatusStore.Report` and `.Aggregate`, which have no implementation.
+
 ```go
 // Package telemetry owns metric naming, the closed label vocabulary, and the single
 // read-model document. The core owns naming and export; a connector registers
@@ -5139,6 +6702,54 @@ type Condition struct {
 ```
 
 **The honesty invariant, and it is asserted by a test.** `CondSourceReady: True` **must never be able to
+
+```mermaid
+flowchart LR
+    subgraph RM["telemetry read model — core-owned; two connector-authored strings in total"]
+        L1["LaneStatus.Stream and LaneStatus.Label"]
+        L2["LaneStatus.Progress"]
+        L3["LaneStatus.Backlog"]
+        L4["LaneStatus.CheckpointAge, Idle, IdleSince"]
+        L5["LaneStatus.Blocked, GatedOn, InFlight, InFlightBudget"]
+        S1["ScanProgress.Fraction, LanesTotal, LanesFinished"]
+        C1["Phase and Condition"]
+        P1["LaneCount and LanesTruncated"]
+    end
+
+    subgraph UI["generic renderer — not built; no connector-specific code by construction"]
+        W1["per-stream grouping and row title"]
+        W2["per-lane progress bar"]
+        W3["backlog readout"]
+        W4["stall alert, suppressed while Idle"]
+        W5["why is nothing happening panel"]
+        W6["one scan bar for the whole pipeline"]
+        W7["health banner"]
+        W8["shows that lanes were cut — but nothing can fetch the rest"]
+    end
+
+    N["any nil pointer renders through one shared unknown renderer, never as zero"]
+
+    L1 --> W1
+    L2 --> W2
+    L3 --> W3
+    L4 --> W4
+    L5 --> W5
+    S1 --> W6
+    C1 --> W7
+    P1 --> W8
+
+    L2 -.-> N
+    L3 -.-> N
+    L4 -.-> N
+    S1 -.-> N
+```
+
+Every widget is driven by a core-computed field, so a UI that has never heard of the connector still
+renders per-lane and per-stream progress; `LaneStatus.Label` and `LaneStatus.Stream` are the only two
+connector-authored strings and are rendered verbatim (`pkg/telemetry/readmodel.go`). Two honest gaps:
+the renderer does not exist, and `LanesTruncated` announces a cut list that no API can page through —
+`store.StatusStore.Aggregate` takes no cursor, offset or limit.
+
 imply** `CondProgressing: True`. A fixture in which the source and sink are connected and the durable
 cursor has not moved for an hour must render as unhealthy. A metrics UI that cannot distinguish *the
 endpoint answered* from *your data arrived* is actively misleading, and this separation is the
@@ -5315,6 +6926,62 @@ restart-and-resume is a headline feature, restart time is a metric and not an as
 
 ## 17. `store` — the standalone ↔ enterprise seam
 
+```mermaid
+flowchart TB
+  subgraph above["Above the seam: byte-identical in both deployment shapes"]
+    CONN["connector.Source / connector.Sink / connector.Buffer"]
+    DEPS["engine.Deps: Config, State, Coordinator, Status, Worker"]
+  end
+
+  subgraph seam["pkg/store: four interfaces. Swapping these four is the ENTIRE difference"]
+    CS["store.ConfigStore<br/>Get / List / Put / Delete / Watch"]
+    SS["store.StateStore<br/>Get / Range / Set / Delete / Capabilities"]
+    CO["store.Coordinator<br/>Join / Campaign / Plan / Claim / Renew / Release"]
+    ST["store.StatusStore<br/>Report / Aggregate"]
+  end
+
+  subgraph laptop["canal run, one process: NO implementation in the repo"]
+    L1["bbolt file (not built)"]
+    L2["bbolt file, one Set is one transaction (not built)"]
+    L3["single: always leader, every lane local, epoch 1 (not built)"]
+    L4["in-process status (not built)"]
+  end
+
+  subgraph cluster["canal serve, N workers: NO implementation in the repo"]
+    C1["Postgres spec rows, LISTEN/NOTIFY watch (not built)"]
+    C2["Postgres rows, version column plus epoch column (not built)"]
+    C3["pg_try_advisory_lock, leases table, SKIP LOCKED (not built)"]
+    C4["worker_status rows with a TTL (not built)"]
+  end
+
+  MEM["internal/example/memstore.StateStore<br/>the ONLY store implementation that exists<br/>Durability is connector.DurabilityNone"]
+
+  CONN --> DEPS
+  DEPS --> CS
+  DEPS --> SS
+  DEPS --> CO
+  DEPS --> ST
+
+  L1 -.-> CS
+  L2 -.-> SS
+  L3 -.-> CO
+  L4 -.-> ST
+
+  CS -.-> C1
+  SS -.-> C2
+  CO -.-> C3
+  ST -.-> C4
+
+  MEM ==> SS
+```
+
+The four interfaces are defined in `pkg/store/config_store.go`, `state_store.go`, `coordinator.go` and
+`status_store.go`, and they reach the engine as the first four fields of `engine.Deps`
+(`internal/engine/build.go:25`) — that struct is the whole seam. Everything drawn dashed is design and
+not code: the module contains no implementation of `ConfigStore`, `Coordinator` or `StatusStore`, the
+only `StateStore` is `internal/example/memstore` (which declares `connector.DurabilityNone`), and there
+is no `main` package, so neither `canal run` nor `canal serve` exists yet as a command.
+
 **Four interfaces. If a fifth appears, the abstraction is wrong.** This is the only thing that differs
 between a laptop and a cluster.
 
@@ -5471,6 +7138,42 @@ column). etcd is a *better semantic* fit — `ModRevision` CAS and `Watch(fromRe
 interface — so it exists as a second implementation whose purpose is to stop the interface acquiring
 Postgres-isms.
 
+```mermaid
+sequenceDiagram
+  autonumber
+  participant LD as leader worker (plans only)
+  participant CO as store.Coordinator
+  participant W as worker holding the lane
+  participant SS as store.StateStore
+
+  Note over LD,SS: NOT BUILT. No Coordinator implementation exists in the repo.<br/>The types below are declared in pkg/store and called by nothing.
+
+  LD->>CO: Campaign(ctx) returns Leadership
+  LD->>CO: Plan(ctx, tenant, pipeline, gen, []LaneRow)
+  Note right of CO: LaneRow.Spec is a record.Blob.<br/>The plan is durable rows, not the leader's memory.
+
+  W->>CO: Claim(ctx, AssignmentID, WorkerID, ttl)
+  CO-->>W: Lease{Assignment, Worker, Epoch, Expires}
+  W->>SS: Set(ctx, Batch{Epoch, Writes, Deletes})
+  SS-->>W: accepted. Per-key CAS and per-key epoch both pass
+
+  Note over LD,CO: the entire control plane goes down here
+
+  W->>SS: Set(ctx, Batch{Epoch}) keeps checkpointing
+  SS-->>W: accepted. The data plane needs nothing from the leader
+
+  W->>CO: Renew(ctx, Lease) fails, so the lane is treated as revoked
+  W->>SS: Set(ctx, Batch{stale Epoch})
+  SS-->>W: fault.ErrFenced naming the lane, not the pipeline
+```
+
+This is the shape the types in `pkg/store/coordinator.go` and `pkg/store/key.go` describe: the leader
+only writes durable `LaneRow`s, and the `Lease.Epoch` — not the leader's belief — fences every
+`StateStore.Set`, per key via `Versioned.Epoch` and `Batch.EpochFor`. None of it runs: there is no
+`Coordinator` implementation, and `Ledger.SetEpoch` and `Ledger.Revoke`
+(`internal/ledger/ledger.go:179` and `:599`), which would carry the epoch into settlement, have no
+callers outside their own package.
+
 **Non-negotiables.**
 
 - **The connector-facing API is byte-identical in both modes.** Kafka Connect and Flink converged on this
@@ -5530,6 +7233,32 @@ after. The abandoned attempt had no authentication, no authorization and no tena
 ## 18. Flow control and buffering
 
 ### 18.1 Bounded by construction
+
+```mermaid
+flowchart TD
+  READ["Source.Read(ctx, dst)"] --> ENG["engine node loop<br/>Pipeline.Run is a one-line error return: NOT BUILT"]
+  ENG --> ADMIT["ledger.Ledger.Admit(ctx, b)"]
+  ADMIT --> CHK{"lane registered, not revoked,<br/>and every record stamped for b.Lane?"}
+  CHK -- "no" --> F1["fault.Contract(OpBuffer, ...) or fault.ErrFenced"]
+  CHK -- "yes" --> ZERO{"b.Len() is zero?"}
+  ZERO -- "a position carrying no records" --> TR["Tracker.TrackResolved(pos)<br/>never blocks, contributes no weight<br/>and its node list has NO cap (audit probe: 5,000,001 nodes)"]
+  ZERO -- "records present" --> ORD{"lane Ordering"}
+  ORD -- "OrderingDiscrete" --> NOTRACK["no Tracker is constructed for this lane<br/>so Admit NEVER blocks (audit probe: 200,000 admitted at budget 8)"]
+  ORD -- "OrderingPrefix" --> TRACK["Tracker.Track(ctx, pos, weight, refs)"]
+  TRACK --> BUD{"pending plus weight within budget?"}
+  BUD -- "yes" --> OK["Ticket issued, group opened, Read is called again"]
+  BUD -- "no" --> BLOCK["park on the wake channel<br/>select on wake or ctx.Done()"]
+  BLOCK -- "ctx cancelled" --> CTXERR["returns ctx.Err(): a bare context error,<br/>not a classified fault and no RetryAfter"]
+  BLOCK -- "a settlement arrives" --> WAKE["Tracker.Release closes and replaces wake"]
+  WAKE --> BUD
+```
+
+The one backpressure mechanism is `Tracker.Track` parking on the `wake` channel inside `Ledger.Admit`
+(`internal/ledger/ledger.go:193`, `internal/ledger/tracker.go:99`), and it is a channel rather than a
+`sync.Cond` precisely so `ctx.Done()` can win. Two shipped paths route around it — a discrete-ordered
+lane gets no `Tracker` at all (`ledger.go:169-171`) and `TrackResolved` appends with no cap
+(`tracker.go:140-161`) — so this section's "nothing in a graph can grow without limit" is not yet true
+of the backpressure mechanism itself.
 
 1. **Every edge is bounded.** Nothing in a graph can grow without limit. This is R6 generalised from the
    buffer to every edge, and it is the base mechanism: slowness is transitive by construction.
@@ -5594,11 +7323,62 @@ with `RetryAfter` set from the configured `WhenFull` policy's backoff. The built
 to `503` plus a `Retry-After` header. **The one thing that never happens is a `202` for data that is not
 yet durable** — that is R4's original violation and the reason this whole rule exists.
 
+```mermaid
+sequenceDiagram
+  autonumber
+  participant P as HTTP peer
+  participant PS as push source (internal/stress/push-source)
+  participant LC as connector.LaneCtl (core-implemented, injected)
+  participant EN as engine node loop (NOT BUILT)
+  participant LG as ledger.Ledger
+
+  P->>PS: POST, holding an open request
+  PS->>LC: Admission(laneID)
+  LC-->>PS: Admission{Budget, Headroom, Known, Blocked, Ready}
+
+  alt no headroom
+    PS-->>P: 429 or 503 plus Retry-After, at once
+    Note right of PS: Before Admission existed the only refusal<br/>was a timeout: measured at 601 ms for an answer<br/>knowable at t=0. Ready is the edge to select on.
+  else headroom, or Known is false
+    PS->>PS: park the request on the rendezvous
+    EN->>PS: Read(ctx, dst) collects the batch
+    EN->>LG: Admit(ctx, b)
+    LG-->>EN: nil, ctx.Err(), fault.ErrFenced or fault.Contract(OpBuffer, ...)
+    Note over EN,LG: Admit's error goes to the ENGINE. Read has no out-parameter<br/>and SourceRuntime has no callback, so no fault from Admit<br/>ever reaches the source.
+    PS-->>P: 202 only after settlement, else 503 on ack_timeout
+  end
+```
+
+The refusal path a push source actually has is `LaneCtl.Admission` (`pkg/connector/lanectl.go:198`),
+which returns `{Budget, Headroom, Known, Blocked, Ready}` and exists because
+`internal/stress/push-source` measured a 601 ms refusal for an answer knowable at t=0. Note the two
+things the paragraph above gets wrong against the code: `Ledger.Admit`'s error is returned to its
+caller — the engine — and reaches no connector, and `Admission.Blocked` is never set true by the
+shipped ledger (`internal/ledger/ledger.go:281,310` assign `false`, nothing assigns `true`).
+
 **A buffer** returns `Accepted{Records, Refused}` and the engine applies `WhenFull`:
 `Block` (default) applies backpressure upstream; `DropNewest` discards and **counts**
 (`canal_buffer_refused_total{reason="drop_newest"}`); `Reject` settles the group `Abandoned` so the source
 sees `Ack.Abandoned > 0` and decides; `Overflow` spills to the chained buffer. **Silent loss is
 unconfigurable.**
+
+```mermaid
+flowchart TD
+  PUT["Buffer.Put(ctx, b) offers a batch"] --> ACC["Accepted{Records int, Refused []record.RecordID}<br/>partial refusal is representable, so success-for-records-not-taken is not"]
+  ACC --> POL{"the remainder meets connector.WhenFull<br/>from spec.Spec.WhenFull.<br/>NO code in internal/engine reads it: NOT BUILT"}
+  POL -- "WhenFullBlock: zero value and default" --> BLK["backpressure upstream: the source parks in Ledger.Admit"]
+  POL -- "WhenFullDropNewest" --> DROP["discard the INCOMING records and count them<br/>canal_buffer_refused_total with reason drop_newest"]
+  POL -- "WhenFullReject" --> REJ["settle the affected group Abandoned"]
+  POL -- "WhenFullOverflow" --> OVF["spill to the chained buffer<br/>BufferCaps.Chains has zero readers in internal/engine"]
+  REJ --> ACK["Source.Commit sees a non-zero Ack.Abandoned<br/>plus Ack.AbandonedBy naming the node, and decides for itself"]
+  DEP["Buffer.Depth() reports Records, Bytes, Capacity and OldestAge:<br/>soft pressure, a different diagnosis from hard blocking"] -.-> POL
+```
+
+Refusal is typed data rather than an error: `Accepted{Records, Refused}` at
+`pkg/connector/buffer.go:57`, with the four `WhenFull` members at `:115-141` and deliberately no
+unbounded one. Everything below the decision node is declared and unexecuted — `spec.Spec.WhenFull`
+(`pkg/spec/spec.go:30`) and `ParseWhenFull` exist, but no file in `internal/engine` reads either, and
+the module registers no `Buffer` implementation at all.
 
 **The soft/hard distinction is preserved in the metrics**, because "waiting for a buffer" and "blocked on
 the downstream" are different diagnoses: `canal_node_blocked_seconds_total` is hard blocking;
@@ -5644,6 +7424,50 @@ honest, and it is disclosed in `Negotiated.DurabilityEdge`.
 ---
 
 ## 19. The out-of-process seam — what makes constraint #3 free later
+
+```mermaid
+classDiagram
+  direction LR
+
+  class Source {
+    <<interface>>
+    Open(ctx, rt SourceRuntime) error
+    Read(ctx, dst Batch) error
+    Commit(ctx, a Ack) error
+    Close(ctx) error
+  }
+
+  class SourceRuntime {
+    <<interface>>
+    Lanes() LaneCtl
+    State() StateHandle
+    Schemas() SchemaLookup
+    Declare(ctx, ch, result) Ref
+    Metrics() Metrics
+    Note(e Event)
+  }
+
+  class linefile["internal/example/linefile.Source — real, in-process"]
+  class stress["internal/stress push-source, txn-sink and six more — real, in-process"]
+  class remote["engine/remote.remoteSource — NOT BUILT"]
+  class Dispenser["engine/remote.Dispenser — NOT BUILT"]
+  class engineBuild["internal/engine.Build — the only type-assertion site,<br/>via registry.ResolveSource(name, iface, caps)"]
+
+  Source <|.. linefile : implements
+  Source <|.. stress : implements
+  Source <|.. remote : would implement, no core change
+  Dispenser ..> Source : NewSource(ctx) returns Source plus SourceCaps
+  SourceRuntime <.. Source : the REVERSE channel, served by canal
+  engineBuild ..> Source : holds it as an interface and cannot tell local from remote
+```
+
+One interface, satisfied twice: the four frozen methods of `pkg/connector/source.go` are implemented
+in-process today by `internal/example/linefile` and the eight `internal/stress` connectors, and would be
+implemented later by an `engine/remote` type that does not exist (zero occurrences of `Dispenser` in the
+Go). What keeps the second implementation cheap is visible here: `registry.ResolveSource`
+(`pkg/registry/resolve.go:64`) is exported and performs the only type assertion, on canal's side, and
+`SourceRuntime` (`pkg/connector/runtime.go:24`) is already an interface, so the reverse channel a
+subprocess needs is declared rather than retrofitted.
 
 canal ships **one** binary with **in-process** connectors. But the following choices, all of them made
 here and now, are exactly what lets a gRPC or subprocess implementation satisfy the **same** interfaces
@@ -5732,6 +7556,43 @@ sandbox. Stated now because the costs are not comparable: a sandboxed plugin tha
 an entire capability-granting system (egress policy, IP guards, secret brokering) on top of the
 serialisation cost, and Conduit's WASM path forked the plugin interface entirely and then deferred the
 component model by ADR. If a sandbox is ever wanted it is a *second* `Dispenser`, not a redesign.
+
+```mermaid
+flowchart LR
+  subgraph ok["Already crosses a process boundary: verified by reading the types"]
+    A1["record.Blob with Version and Bytes, JSON-tagged<br/>cursors, lane specs, committables, writer state"]
+    A2["connector.Ack: round-trips through encoding/json verbatim"]
+    A3["record.Position: fully exported and JSON-tagged"]
+    A4["store.Key, Versioned and Batch: bytes and scalars only"]
+    A5["SourceCaps and SinkCaps are declared data, and<br/>registry.ResolveSource is exported, so no type assertion crosses"]
+  end
+
+  subgraph broken["Has NO wire form: zero MarshalJSON implementations in the module"]
+    B1["record.Payload: fields b, v and has are unexported<br/>json.Marshal returns an empty object"]
+    B2["record.Value: an interface with an unexported isValue method<br/>Kind is discarded, Bytes is indistinguishable from String"]
+    B3["record.Meta: kv, secrets and changes are unexported"]
+    B4["connector.Admission.Ready and LaneCtl.Changes are channels"]
+  end
+
+  C0["TRUE for the source side and the control plane:<br/>an audit probe built an out-of-process connector.Source<br/>against these types with no core change"]
+  C1["FALSE for every record-bearing method:<br/>Source.Read, Sink.Write, Buffer.Put and Transform<br/>lose the payload silently over a wire"]
+  G1["ADR 0015 point 8's CI wire-shippability generator DOES NOT EXIST,<br/>so nothing stops this from rotting further"]
+
+  A5 --> C0
+  A1 --> C0
+  B1 --> C1
+  B2 --> C1
+  B3 --> C1
+  B4 -.-> C1
+  G1 -.-> C1
+```
+
+The eleven choices above hold for the control plane and the source side and fail for anything carrying a
+record: `record.Payload` (`pkg/record/payload.go:24`), `record.Value` (`pkg/record/value.go:23`) and
+`record.Meta` (`pkg/record/meta.go:48`) are entirely unexported fields and the module contains zero
+`MarshalJSON` implementations, so `Source.Read`, `Sink.Write` and `Buffer.Put` would lose their payloads
+silently over a wire. The CI generator named in point 8 as the guard against exactly this does not
+exist.
 
 ---
 
@@ -5827,6 +7688,46 @@ mentioned files or standard output.
 
 ### (b) Full initial scan, then incremental stream, crashing at 40% of the scan
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S as Source
+    participant LC as LaneCtl
+    participant PL as store.Coordinator planner
+    participant LG as ledger.Ledger
+    participant ST as store.StateStore
+
+    Note over S,ST: NOT BUILT. Every arrow below is a declared Go method.<br/>No implementation computes GatedOn from StartAfter, nothing<br/>anywhere assigns FinishedAt, and Pipeline.Run is a stub.
+    Note over S: low = the upstream log position,<br/>captured BEFORE any scan lane exists
+    S->>LC: Announce LaneSpec Name tail, Group tail,<br/>StartAfter scan, Spec = low, Unbounded
+    LC->>ST: lane row written durably
+    LC-->>S: record.LaneID — the row exists before Announce returns
+    S->>LC: AnnounceMany eight LaneSpec Group scan, Bounded
+    LC->>ST: ONE atomic write for all eight rows
+
+    PL->>ST: read the durable, cluster-wide lane table
+    Note over PL: tail names an unfinished StartAfter group,<br/>so it is not assignable — GatedOn = scan
+    S->>LC: Assigned
+    LC-->>S: the scan lanes only. The tail is never returned.
+
+    loop every scan lane, until Batch.EndOfLane
+        S->>LG: engine admits the batch Source.Read filled — Ledger.Admit
+        LG->>ST: phase two — the lane cursor is flushed
+        LG-->>S: phase three — Ack.Through, then Source.Commit
+    end
+
+    S->>LC: Finish, or Batch.EndOfLane on the last batch
+    LC->>ST: Finished AND FinishedAt in the same atomic write
+    LG-->>S: Ack.LaneFinished true
+    Note over PL,ST: the gate opens only when EVERY scan-group lane<br/>has a DURABLE FinishedAt. A finish that has not<br/>survived a crash is a gate that can open twice.
+    PL->>ST: re-plan — the tail row is no longer Gated
+    S->>LC: Assigned
+    LC-->>S: tail, reconstructed from LaneSpec.Spec = low
+    Note over S: reads the changelog from low, so changes made<br/>DURING the scan replay. No phase, no if-snapshotting.
+```
+
+The handoff in full: the tail lane is announced *first*, carrying the pre-scan log position in its write-once `LaneSpec.Spec` and gated by `StartAfter` (`pkg/connector/lane.go:118-139`), so the fact that the tail must resume from that position is durable before one scan row moves; the gate is then enforced by the planner from the durable table (`store.Coordinator.Plan`, `pkg/store/coordinator.go:66-78`), which is what makes it hold cluster-wide instead of being connector convention. Nothing on this diagram runs yet — no code computes `GatedOn` from `StartAfter` and no code assigns `FinishedAt`, so the durability half of the gate has no writer at all.
+
 A generic "keyed store with a change log" source, configured `read: [scan, stream]`, `scan_lanes: 8`.
 
 **Cold start.**
@@ -5876,6 +7777,41 @@ cursors; lanes 4–7 with no cursor. In-flight records — at most `budget` per 
 re-read.
 
 **Restart.**
+
+```mermaid
+flowchart LR
+    subgraph D["Durable lane table at kill -9, 40% into the scan"]
+        direction TB
+        T1["tail<br/>GatedOn = scan, Spec = low, no Cursor"]
+        F1["scan/0 and scan/1<br/>Finished, FinishedAt set"]
+        C2["scan/2<br/>Cursor.Token = last key read"]
+        C3["scan/3<br/>Cursor.Token = last key read"]
+        N4["scan/4 .. scan/7<br/>announced, no Cursor"]
+    end
+
+    subgraph A["Restart — LaneCtl.Assigned returns SIX rows"]
+        direction TB
+        R2["scan/2 resumes AT its cursor"]
+        R3["scan/3 resumes AT its cursor"]
+        R4["scan/4 .. scan/7 at their range lower bounds"]
+    end
+
+    X(["Not assigned"])
+
+    F1 -->|"a finished chunk is never rescanned"| X
+    T1 -->|"the gate is still shut, so no worker tails early"| X
+    C2 --> R2
+    C3 --> R3
+    N4 --> R4
+
+    R2 --> Y["Each lane is reconstructed from LaneSpec.Spec plus<br/>Cursor.Token — the same bytes the source authored,<br/>handed back verbatim. It does not re-Announce."]
+    R3 --> Y
+    R4 --> Y
+    Y --> Z["Six independent rows, so a cluster may claim each on a<br/>DIFFERENT worker. Lost work is at most one lane Budget<br/>of in-flight records, which are re-read, never skipped."]
+    Z -.-> NB["NOT BUILT. The lane row and its cursor are declared types<br/>only. The sole StateStore is internal/example/memstore,<br/>which is in-memory, so nothing here survives a real kill -9."]
+```
+
+Why a crash at 40% neither rescans nor loses: finished chunks are excluded from `Assigned` by `Finished`, the gated tail is excluded by `GatedOn`, and the six survivors each carry their own `Cursor` next to their own write-once `Spec` — the two differently-lifetimed halves that `pkg/connector/lane.go:174-211` keeps as separate fields, which is exactly what lets the resume re-parallelise onto more workers than it started with. The `Assigned` filter shown here is implemented only in the test double `pkg/connectortest/runtime.go:278-292`; there is no durable store behind it.
 
 8. `Open` → `Assigned` returns **six** assignments: `scan/2` at `key > 'acme-991'`, `scan/3` at
    `key > 'zeta-2'`, and `scan/4..7` at their range starts. Lanes 0 and 1 are absent because they finished.
@@ -6125,51 +8061,522 @@ replacement are both **absent — not solved, absent.**
 
 ## 22. The connector-author guide
 
-### 22.1 The whole obligation
+Every Go snippet in this section was extracted into a module outside this repository, compiled with
+`go build`, vetted with `go vet` and formatted with `gofmt`. Where a snippet's behaviour is asserted,
+the assertion is a test that runs. The scratch module is kept alongside this document so the check is
+repeatable.
 
-To add a source: **implement four methods, declare capabilities, declare config, register in `init`.** No
-core file changes. No switch statement anywhere gains a case. The core never learns your connector's name.
+### 22.1 The minimal source, in full
 
-To add a sink: **three methods.**
-
-### 22.2 A complete trivial source
+This is the whole thing. It compiles, it registers, and it is 50 lines as written — 43 non-blank, of
+which 10 are the import block.
 
 ```go
-// Package linefile reads a file one line per record. It is the smallest useful
-// source and it is deliberately reproduced in full: if this is not short, the
-// architecture has failed.
-package linefile
+// Package minsource is the smallest source that registers and runs.
+package minsource
 
 import (
-	"bufio"
 	"context"
-	"encoding/binary"
-	"fmt"
-	"io"
-	"os"
-	"slices"
-	"time"
 
-	"github.com/BernardoCSACarreira/canal/config"
-	"github.com/BernardoCSACarreira/canal/connector"
-	"github.com/BernardoCSACarreira/canal/fault"
-	"github.com/BernardoCSACarreira/canal/record"
-	"github.com/BernardoCSACarreira/canal/registry"
+	"github.com/BernardoCSACarreira/canal/pkg/config"
+	"github.com/BernardoCSACarreira/canal/pkg/connector"
+	"github.com/BernardoCSACarreira/canal/pkg/fault"
+	"github.com/BernardoCSACarreira/canal/pkg/record"
+	"github.com/BernardoCSACarreira/canal/pkg/registry"
 )
-
-// tokenV1 versions this connector's cursor encoding. Everything durable is
-// (version, bytes), and a version this build cannot read is a LOUD failure.
-const tokenV1 = 1
 
 func init() {
 	registry.AddSource(registry.Default, registry.SourceDef[*src]{
-		Name:    "line_file",
-		Version: "1.0.0",
-		Title:   "Line-delimited file",
-		Summary: "Reads a local file, one record per line.",
-		Notes:   "Origin.Key is not populated: a text line has no stable identity.",
-		Support: registry.SupportCommunity,
+		Meta: registry.Meta{Name: "min_source", Version: "1.0.0", Title: "Minimal source",
+			Summary: "Emits one record, then ends."},
+		Spec: config.NewSpec(),
+		Caps: connector.SourceCaps{
+			Caps:              connector.Caps{APIVersion: connector.APIVersion},
+			Boundedness:       []connector.Boundedness{connector.Bounded},
+			LaneKinds:         []connector.LaneKind{connector.LaneKindScan},
+			UpstreamRetention: connector.RetentionUnbounded,
+		},
+		New: func(context.Context, *config.Config) (*src, error) { return &src{}, nil },
+	})
+}
 
+type src struct{ done bool }
+
+func (s *src) Open(ctx context.Context, rt connector.SourceRuntime) error {
+	_, err := rt.Lanes().Announce(ctx, connector.LaneSpec{
+		Name: "only", Stream: "rows", Kind: connector.LaneKindScan, Boundedness: connector.Bounded})
+	return err
+}
+
+func (s *src) Read(_ context.Context, dst *record.Batch) error {
+	if s.done {
+		return fault.ErrEndOfInput
+	}
+	dst.Reset()
+	if r := dst.Add(); r != nil {
+		r.Payload = record.BytesPayload([]byte("hello"))
+	}
+	dst.EndOfLane, s.done = true, true
+	return nil
+}
+
+func (s *src) Commit(context.Context, connector.Ack) error { return nil }
+func (s *src) Close(context.Context) error                 { return nil }
+```
+
+Four things in that file are not optional and the registry will not let you omit them:
+`Caps.APIVersion`, `UpstreamRetention`, a non-empty `Boundedness` and a non-empty `LaneKinds`.
+Everything else on `SourceCaps` defaults to the conservative answer. `Meta.Support` defaults to
+`SupportCommunity`, which is its zero value.
+
+`Spec: config.NewSpec()` is an empty spec, not a nil one. A nil spec panics at init naming the fix,
+because the registry appends stage-standard fields to it and a nil spec has nowhere to put them
+(`pkg/registry/lint.go:14-19`).
+
+### 22.2 The minimal sink, in full
+
+39 lines as written, 32 non-blank, of which 10 are the import block. A sink is one method shorter and
+one concept lighter: it never sees a lane, a position or an acknowledgement.
+
+```go
+// Package minsink is the smallest sink that registers and runs.
+package minsink
+
+import (
+	"context"
+	"os"
+
+	"github.com/BernardoCSACarreira/canal/pkg/config"
+	"github.com/BernardoCSACarreira/canal/pkg/connector"
+	"github.com/BernardoCSACarreira/canal/pkg/fault"
+	"github.com/BernardoCSACarreira/canal/pkg/registry"
+)
+
+func init() {
+	registry.AddSink(registry.Default, registry.SinkDef[*sink]{
+		Meta: registry.Meta{Name: "min_sink", Version: "1.0.0", Title: "Minimal sink",
+			Summary: "Writes request bodies to stderr."},
+		Spec: config.NewSpec(),
+		Caps: connector.SinkCaps{
+			Caps:           connector.Caps{APIVersion: connector.APIVersion},
+			MaxConcurrency: 1,
+			Modes:          []connector.DestMode{connector.DestAppend},
+		},
+		New: func(context.Context, *config.Config) (*sink, error) { return &sink{}, nil },
+	})
+}
+
+type sink struct{}
+
+func (k *sink) Open(context.Context, connector.SinkRuntime, connector.Opening) error { return nil }
+
+func (k *sink) Write(_ context.Context, req *connector.Request) (connector.WriteResult, error) {
+	if _, err := os.Stderr.Write(req.Body); err != nil {
+		return connector.WriteResult{}, fault.Transient(fault.OpWrite, err)
+	}
+	return connector.AllWritten(req.Count), nil
+}
+
+func (k *sink) Close(context.Context) error { return nil }
+```
+
+`os.Stderr.Write` is an unbuffered syscall, so a clean return really does mean durable and this sink
+is not lying. **The moment you put a buffer in front of that write, the clean return becomes a lie**
+and you must implement `connector.Flusher` — see §22.12.
+
+```mermaid
+classDiagram
+    direction LR
+
+    class Source {
+        <<interface>>
+        Open(ctx, rt SourceRuntime) error
+        Read(ctx, dst Batch) error
+        Commit(ctx, a Ack) error
+        Close(ctx) error
+    }
+
+    class Sink {
+        <<interface>>
+        Open(ctx, rt SinkRuntime, o Opening) error
+        Write(ctx, req Request) WriteResult, error
+        Close(ctx) error
+    }
+
+    class SourceRuntime {
+        <<interface>>
+        Lanes() LaneCtl
+        State() StateHandle
+        Schemas() SchemaLookup
+        Declare(ctx, ch, result) Ref, error
+    }
+
+    class SinkRuntime {
+        <<interface>>
+        Schemas() SchemaLookup
+        Streams() ConfiguredStream
+        no Lanes
+        no State
+    }
+
+    Source ..> SourceRuntime : handed at Open
+    Sink ..> SinkRuntime : handed at Open
+```
+
+The two required interfaces and the two runtimes they are handed. `SinkRuntime` has no `Lanes()` and
+no `State()` — that absence is the design, not an oversight: a sink is structurally incapable of
+holding progress, so a new sink cannot get progress wrong. Defined in `pkg/connector/source.go`,
+`pkg/connector/sink.go` and `pkg/connector/runtime.go:115-144`.
+
+### 22.3 Registering from a module outside this repository
+
+This is the actual test of "zero core edits", and it passes. The connector above lives in its own Go
+module with its own `go.mod`, on its own release cadence, and canal learns about it through `init()`
+and nothing else.
+
+```
+module example.com/canalconn
+
+go 1.23.6
+
+require github.com/BernardoCSACarreira/canal v0.0.0
+
+replace github.com/BernardoCSACarreira/canal => /path/to/canal
+```
+
+The `replace` line is there only because canal has no published module version yet. Once it is
+tagged, the `require` line alone is the whole integration.
+
+A host binary composes connectors by blank-importing them, exactly as `database/sql` drivers are
+composed:
+
+```go
+package main
+
+import (
+	_ "example.com/canalconn/minsink"
+	_ "example.com/canalconn/minsource"
+)
+
+func main() {}
+```
+
+Verified: with only those two blank imports, `registry.Default.Names(registry.KindSource)` returns
+`[min_source]` and `registry.Default.Names(registry.KindSink)` returns `[min_sink]`, and
+`git status --porcelain` in the canal repo is empty. Nothing in `pkg/` and nothing in `internal/`
+mentions either connector.
+
+The empty `config.NewSpec()` on `min_sink` resolves to a real form. The registry appended six
+stage-standard fields the author did not write and the operator configures per node:
+
+```
+retry  when_full  codec  batching  max_in_flight  dedupe
+```
+
+and `Descriptor.Config.JSONSchema()` returns a 5.5 KB generated JSON Schema for those fields, with no
+hand-maintained schema anywhere (`pkg/config/render.go:15`).
+
+### 22.4 The import boundary
+
+A connector imports **five packages, or six if it declares schemas**. `go list -deps` on the minimal
+source above returns exactly:
+
+```
+pkg/schema  pkg/record  pkg/fault  pkg/config  pkg/connector  pkg/registry
+```
+
+```mermaid
+flowchart TD
+    subgraph AUTHOR["your module, anywhere on disk"]
+        Y["your connector package"]
+    end
+
+    subgraph OPEN["the six packages a connector may import"]
+        SCH["pkg/schema"]
+        REC["pkg/record"]
+        FLT["pkg/fault"]
+        CFG["pkg/config"]
+        CON["pkg/connector"]
+        REG["pkg/registry"]
+    end
+
+    subgraph CLOSED["internal/ — unreachable from any other module"]
+        ENG["internal/engine"]
+        LED["internal/ledger"]
+    end
+
+    Y --> CON
+    Y --> REG
+    Y --> CFG
+    Y --> FLT
+    Y --> REC
+    Y -.->|"only if it declares schemas"| SCH
+
+    REC --> SCH
+    FLT --> REC
+    CFG --> FLT
+    CFG --> REC
+    CON --> CFG
+    CON --> FLT
+    CON --> REC
+    CON --> SCH
+    REG --> CFG
+    REG --> CON
+
+    ENG --> LED
+    ENG --> CON
+    LED --> CON
+
+    Y x--x|"compile error"| ENG
+```
+
+Every edge above was read from the `import` blocks of the `.go` files, not from prose. The reason a
+connector cannot reach the engine is not documentation and not review discipline: it is Go's
+`internal/` rule. A probe importing `internal/engine` from an external module fails to build with
+
+```
+use of internal package github.com/BernardoCSACarreira/canal/internal/engine not allowed
+```
+
+The dependency arrow between `pkg/registry` and `pkg/connector` runs **registry → connector**
+(`pkg/registry/def.go` constrains its type parameters on `connector.Source` and `connector.Sink`).
+`pkg/spec` imports `pkg/registry`, never the reverse; adding the reverse edge creates an import cycle.
+Note that §3's dependency table disagrees with this diagram in several rows; where they disagree, the
+`.go` files are correct and §3 is the defect.
+
+### 22.5 What you must decide before you write a line — sources
+
+```mermaid
+flowchart TD
+    A["I am writing a Source"] --> B{"What does my upstream do<br/>when I act on Commit?"}
+    B -->|"discards the data"| B1["UpstreamRetention = PrunesOnCommit"]
+    B -->|"keeps a bounded window"| B2["UpstreamRetention = RetentionWindow"]
+    B -->|"never discards"| B3["UpstreamRetention = RetentionUnbounded"]
+
+    B1 --> C
+    B2 --> C
+    B3 --> C
+    C{"Does the read finish?"}
+    C -->|"yes"| C1["Boundedness = Bounded<br/>LaneKinds includes LaneKindScan"]
+    C -->|"no, it tails"| C2["Boundedness = Unbounded<br/>LaneKinds includes LaneKindStream"]
+
+    C1 --> D
+    C2 --> D
+    D{"Can I re-read from a<br/>committed position?"}
+    D -->|"yes"| D1["Replayable = true"]
+    D -->|"no, but my peer re-sends<br/>anything I do not acknowledge"| D2["RedeliversUnacked = true"]
+    D -->|"neither"| D3["both false<br/>the core refuses AtLeastOnce"]
+
+    D1 --> E
+    D2 --> E
+    D3 --> E
+    E{"Does every record have a stable<br/>identity I can put in Origin.Key?"}
+    E -->|"yes"| E1["StableKeys = true<br/>AND Meta.Notes explains the derivation"]
+    E -->|"no"| E2["leave Origin.Key unset"]
+
+    E1 --> F["Implement Open, Read, Commit, Close"]
+    E2 --> F
+```
+
+Four questions, four `SourceCaps` fields, and then the same four methods regardless of the answers.
+`UpstreamRetention` is the one the registry refuses to let you skip, because it is what makes the
+commit protocol safe: a source whose upstream prunes on commit needs canal's own position flushed
+first, and a source that has not answered the question has not thought about correctness. Fields
+defined in `pkg/connector/caps.go:40-183`; the refusals in `pkg/registry/add.go:41-55`.
+
+### 22.6 What you must decide before you write a line — sinks
+
+```mermaid
+flowchart TD
+    A["I am writing a Sink"] --> B{"How many Write calls may<br/>run at once on one instance?"}
+    B --> B1["MaxConcurrency = N, at least 1"]
+
+    B1 --> C{"Which destination modes<br/>can I honour?"}
+    C --> C1["Modes = append / upsert /<br/>overwrite / delete"]
+
+    C1 --> D{"Is re-delivering an identical<br/>request harmless?"}
+    D -->|"yes"| D1["Idempotent = true"]
+    D -->|"no"| D2["Idempotent = false<br/>an indeterminate write stalls the lane"]
+
+    D1 --> E
+    D2 --> E
+    E{"Can I say WHICH records<br/>of a request failed?"}
+    E -->|"yes"| E1["PartialFailure = true<br/>fill WriteResult.Failed"]
+    E -->|"no"| E2["PartialFailure = false<br/>return err with Failed empty"]
+
+    E1 --> F
+    E2 --> F
+    F{"Is the data durable when<br/>Write returns cleanly?"}
+    F -->|"yes"| F1["Implement Open, Write, Close"]
+    F -->|"no, I buffer"| F2["Also implement connector.Flusher<br/>and set Flushes = true"]
+```
+
+`MaxConcurrency` and `Modes` are the two the registry refuses to default on your behalf.
+`SinkCaps` is defined at `pkg/connector/caps.go:256-306`; the refusals at
+`pkg/registry/add.go:136-141`. The last question is the whole sink contract in one line, and §22.12
+is what to do when the answer is "no".
+
+### 22.7 The registration lints: six ways to be told exactly what to fix
+
+`AddSource` and `AddSink` panic at `init`. That is the right severity, and it is deliberate: the
+panic fires on the author's first `go test`, in the author's own package, before anything is
+deployed. Every message names the field or the Go interface that fixes it.
+
+```mermaid
+flowchart TD
+    I["init calls registry.AddSource(registry.Default, def)"] --> G1{"1. Name set, and Caps.APIVersion<br/>inside MinAPIVersion..APIVersion?"}
+    G1 -->|"no"| P
+    G1 -->|"yes"| G2{"2. Name not already registered<br/>in this Registry?"}
+    G2 -->|"no"| P
+    G2 -->|"yes"| G3{"3. UpstreamRetention set, and<br/>Boundedness and LaneKinds non-empty?"}
+    G3 -->|"no"| P
+    G3 -->|"yes"| G4{"4. If StableKeys, is Meta.Notes<br/>non-empty?"}
+    G4 -->|"no"| P
+    G4 -->|"yes"| G5{"5. Does config.Spec pass lint?<br/>named, documented, no dangling predicate"}
+    G5 -->|"no"| P
+    G5 -->|"yes"| G6{"6. Is every DECLARED capability<br/>backed by a method on the Go type?"}
+    G6 -->|"no"| P
+    G6 -->|"yes"| OK["registered, plus a Descriptor<br/>the control API can serve"]
+
+    G6 -.->|"implemented but NOT declared"| W["not a panic: a Warning on the Descriptor,<br/>and the capability stays OFF"]
+    W --> OK
+
+    P["panic at init, naming the exact field<br/>or Go interface that fixes it"]
+```
+
+The gauntlet in `pkg/registry/add.go:28-89`, in the order the code runs it. The dotted edge is the
+deliberate asymmetry: declared-without-implemented is fatal because it is a lie the engine would act
+on; implemented-without-declared is a warning, because a v2 core adding an optional interface must
+not retroactively break a v1 connector that satisfies it by coincidence
+(`pkg/registry/crosscheck.go:36-40`).
+
+These are the messages, reproduced verbatim from a probe that triggers each one:
+
+| you did this | it says |
+| --- | --- |
+| registered the same name twice | `canal/registry: source "probe" is already registered` |
+| left `UpstreamRetention` at its zero value | `canal/registry: source "probe" must declare UpstreamRetention; it is what makes the commit protocol safe` |
+| left `Boundedness` empty | `canal/registry: source "probe" declares no Boundedness` |
+| left `LaneKinds` empty | `canal/registry: source "probe" declares no LaneKinds` |
+| set `StableKeys` and left `Meta.Notes` empty | `canal/registry: source "probe" declares StableKeys with empty Notes; document how Origin.Key is derived` |
+| set `Discoverable` without implementing the interface | `canal/registry: source "probe" declares capabilities it does not implement: [discoverable (needs connector.Discoverer)]` |
+| declared an API version this core does not support | `canal/registry: source "probe" declares connector API version 7; this build of canal supports 1 to 1` |
+| passed a nil `New` | `canal/registry: source "probe" has no New` |
+| passed a nil `Spec` | `canal/registry: source "probe" has a nil config.Spec; use config.NewSpec()` |
+| declared a config field with no `Title` and no `Description` | `canal/registry: source "probe": field [path] has neither Title nor Description; the UI would render a bare key` |
+| left `Meta.Name` empty | `canal/registry: source: Name is required and is immutable once published` |
+| left `MaxConcurrency` at zero on a sink | `canal/registry: sink "ks" must declare MaxConcurrency of at least 1` |
+| left `Modes` empty on a sink | `canal/registry: sink "ks" declares no destination Modes` |
+
+Read the sixth row again. `[discoverable (needs connector.Discoverer)]` is the whole point: the
+capability report is not a boolean, it is a task list. The same machinery renders the *absence* of a
+capability to an operator with a reason and a consequence, rather than a blank.
+
+### 22.8 Testing your connector
+
+There is **no conformance kit**. `pkg/connectortest` is what exists, and it is real: embeddable,
+inert implementations of every core-implemented interface a connector is handed — the three runtimes,
+`LaneCtl` and `StateHandle`. Its `LaneCtl` is good enough to drive a real source through a cold
+start, a warm start and a revocation, and its `StateHandle` implements real compare-and-swap so the
+fenced-write path is genuinely exercised.
+
+Embed it rather than hand-writing a fake, so that a method added to a runtime in v2 costs your test
+suite nothing:
+
+```go
+package minsource
+
+import (
+	"context"
+	"testing"
+
+	"github.com/BernardoCSACarreira/canal/pkg/connectortest"
+	"github.com/BernardoCSACarreira/canal/pkg/record"
+)
+
+func TestReadsOneRecordThenEnds(t *testing.T) {
+	ctx := context.Background()
+	rt := &connectortest.SourceRuntime{}
+	s := &src{}
+
+	if err := s.Open(ctx, rt); err != nil {
+		t.Fatal(err)
+	}
+	lanes, _ := rt.Lanes().Assigned(ctx)
+	if len(lanes) != 1 {
+		t.Fatalf("want 1 announced lane, got %d", len(lanes))
+	}
+
+	alloc := record.NewAllocator("t", "p", "n", lanes[0].ID, "rows", 1, 1)
+	b := record.NewBatch(alloc, 16)
+	if err := s.Read(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	if b.Len() != 1 || !b.EndOfLane {
+		t.Fatalf("want 1 record and EndOfLane, got %d %v", b.Len(), b.EndOfLane)
+	}
+	if err := s.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+```
+
+That test passes. Note that in a test you construct the `record.Allocator` and `record.Batch`
+yourself; in a running pipeline the engine owns both and hands you a batch that is already stamped.
+
+### 22.9 The lifecycle you are writing against
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as engine.Build
+    participant R as read goroutine
+    participant C as control goroutine
+    participant S as your Source
+
+    Note over B,S: Everything below the Open line is NOT BUILT.<br/>internal.engine.Pipeline.Run returns an error and moves no record.
+
+    B->>S: New with a parsed config, and NO I/O here
+    B->>S: Open with a runtime. The ctx dies when Open returns, so keep rt.Context
+    S-->>B: nil, or fault.Transient to be retried with backoff
+
+    loop until fault.ErrEndOfInput
+        R->>S: Read into dst. Never concurrent with itself
+        S-->>R: fills dst via dst.Add, sets dst.Position
+    end
+
+    par Commit may run WHILE Read is blocked
+        C->>S: Commit with an Ack. Settled downstream AND durably flushed
+    and the control calls never overlap each other
+        C->>S: Heartbeat, Backlog, Nack, if declared
+    end
+
+    B->>S: Close exactly once, always, with a fresh grace-period ctx
+```
+
+**This ordering is a contract, not an observation of a running system.**
+`internal/engine.Pipeline.Run` is currently `return fmt.Errorf("engine: Pipeline.Run is not
+implemented yet; the interface set is the deliverable of this stage")` (`internal/engine/build.go:321`).
+No record has moved through the engine. Write against the contract — it is what the interfaces in
+`pkg/connector/source.go:15-98` specify and what the ledger in `internal/ledger` was built to
+enforce — but do not read this diagram as a description of behaviour anyone has watched happen.
+
+The two consequences that catch every first-time author:
+
+- **`Open`'s `ctx` is scoped to the opening** and may be cancelled the instant `Open` returns. A
+  connection-lifetime context comes from `rt.Context()`.
+- **`Read` and `Commit` can run at the same time.** A source therefore needs at most one mutex, and
+  only over state shared between the read path and the progress path. The alternative — promising
+  that `Commit` never runs concurrently with a blocking `Read` — is unsatisfiable, because an idle
+  tail source would either never commit or need locks the contract denies.
+
+### 22.10 Growing step one: taking configuration
+
+Config is data. You declare fields; the core parses, defaults, validates and renders them; `New`
+receives the finished result. There is no `Configure` callback and no map to re-parse. Both excerpts
+below sit inside the same `registry.SourceDef` literal as §22.1's, at the same indentation:
+
+```go
 		Spec: config.NewSpec().
 			Field(config.Field{
 				Name:        "path",
@@ -6178,40 +8585,229 @@ func init() {
 				Short:       "Absolute or relative path.",
 				Examples:    []any{"/var/log/app.log"},
 			}),
+```
 
-		Caps: connector.SourceCaps{
-			Caps:                connector.Caps{APIVersion: 1},
-			DefaultOrdering:     connector.OrderingPrefix,
-			Boundedness:         []connector.Boundedness{connector.Bounded},
-			LaneKinds:           []connector.LaneKind{connector.LaneKindScan},
-			MaxLanes:            1,
-			UpstreamRetention:   connector.RetentionUnbounded,
-			UnitAssignment:      connector.UnitsStatic,
-			Replayable:          true,
-			MidLaneResume:       true,
-			ComparablePositions: true,
-		},
+and the constructor reads the finished result:
 
+```go
 		// New does NO I/O. Config is already parsed, defaulted and validated.
-		New: func(_ context.Context, c *config.Config) (*src, error) {
-			s := &src{path: config.Must[string](c, "path")}
+		New: func(_ context.Context, c *config.Config) (*cfgSrc, error) {
+			s := &cfgSrc{path: config.Must[string](c, "path")}
 			return s, c.Err()
 		},
-	})
+```
+
+A field is **required by default**; set `Optional: true` to make it optional. `config.Must[T]`
+records a diagnostic rather than panicking, which is why `New` returns `c.Err()` — one error check
+for any number of fields. Setting `Secret: true` makes the core redact the value in logs, metrics,
+the read model, error messages and the API, with zero connector involvement.
+
+### 22.11 Growing step two: optional source capabilities
+
+Every optional capability is **an interface you implement plus a flag you set**. Both, or the
+registry panics. Nothing else changes: `Source` stays four methods and is frozen.
+
+```mermaid
+flowchart LR
+    subgraph IMPL["implement the interface AND set the SourceCaps flag"]
+        I1["connector.Discoverer<br/>Discoverable"]
+        I2["connector.BacklogReporter<br/>ReportsBacklog"]
+        I3["connector.Heartbeater<br/>Heartbeats"]
+        I4["connector.Nackable<br/>Nackable"]
+        I5["connector.Validator<br/>Validates"]
+        I6["connector.Prober<br/>Probes"]
+        I7["connector.ChoiceProvider<br/>Choices"]
+        I8["connector.StateAdopter<br/>AdoptsState"]
+    end
+
+    subgraph GET["what the core then does for you"]
+        U1["a stream picker with no frontend code<br/>drift as a diff against a stored catalog"]
+        U2["backlog records and bytes<br/>event-time lag"]
+        U3["an idle lane does not pin a pruning<br/>upstream's retention"]
+        U4["upstream is told when a record<br/>is dead-lettered"]
+        U5["per-field diagnostics that required<br/>a connection to discover"]
+        U6["a named liveness breakdown<br/>rather than one boolean"]
+        U7["pick a table from this database, with no<br/>core knowledge that tables exist"]
+        U8["a rename or rewrite adopts the<br/>old connector's cursors"]
+    end
+
+    I1 --> U1
+    I2 --> U2
+    I3 --> U3
+    I4 --> U4
+    I5 --> U5
+    I6 --> U6
+    I7 --> U7
+    I8 --> U8
+```
+
+The right-hand column is not marketing: those strings are the literal `unlocks` values the registry
+attaches to each capability at `pkg/registry/add.go:60-85`, and they are what an operator sees next
+to an *absent* capability, so "no scan progress" comes with the reason and the fix. **The consequences
+themselves are engine behaviour and the engine is not built**; today the capability is recorded,
+cross-checked and reported, and nothing consumes it at runtime yet.
+
+Three of them, added to a source that started as §22.1:
+
+```go
+		Caps: connector.SourceCaps{
+			Caps:              connector.Caps{APIVersion: connector.APIVersion},
+			Boundedness:       []connector.Boundedness{connector.Unbounded},
+			LaneKinds:         []connector.LaneKind{connector.LaneKindStream},
+			UpstreamRetention: connector.PrunesOnCommit,
+
+			// Each flag below is checked against the METHOD SET of *capSrc at init.
+			Discoverable:   true, // connector.Discoverer
+			ReportsBacklog: true, // connector.BacklogReporter
+			Heartbeats:     true, // connector.Heartbeater
+		},
+```
+
+```go
+// Discover lets the UI list streams with no frontend code for this connector.
+func (s *capSrc) Discover(context.Context) (connector.Catalog, error) {
+	return connector.Catalog{
+		At: time.Now(),
+		Streams: []connector.StreamDesc{{
+			Name:     "events",
+			Supports: []connector.LaneKind{connector.LaneKindStream},
+		}},
+	}, nil
 }
 
-type src struct {
-	path string
-	rt   connector.SourceRuntime
-	lane record.LaneID
-	f    *os.File
-	sc   *bufio.Scanner
-	off  int64
-	done bool
+// Backlog answers "how much is left". Every quantity is a POINTER: nil means "I cannot
+// answer" and zero means "caught up", and conflating them publishes a lie.
+func (s *capSrc) Backlog(context.Context, record.LaneID) (connector.Backlog, error) {
+	return connector.Backlog{Records: connector.Count(0), Exact: true, AsOf: time.Now()}, nil
 }
 
-func (s *src) Open(ctx context.Context, rt connector.SourceRuntime) error {
-	s.rt = rt
+// Heartbeat keeps a pruning upstream from pinning its own retention while idle. It
+// carries NO position: the way to advance a cursor without a record is a zero-record
+// positioned batch from Read.
+func (s *capSrc) Heartbeat(context.Context, record.LaneID, time.Duration) error { return nil }
+```
+
+Declaring `Heartbeats` also causes the registry to append a `heartbeat_interval` field to the
+connector's config form, which the author did not write. Verified: `cap_source`'s rendered field list
+is `retry when_full lane_budget heartbeat_interval`, where `min_source`'s is
+`retry when_full lane_budget`.
+
+One further source capability is not on the diagram because it changes the shape of `Read` rather
+than adding a method to the side: `connector.LaneReader` with `ReadsLanes: true` replaces
+`Read(ctx, dst)` with `ReadLanes(ctx, []*record.Batch)`, one batch per lane. **That is the correct
+answer for a source serving several lanes over one connection — never retargeting `dst.Lane`, which
+the ledger refuses with `fault.PermanentContract` naming both lanes.**
+
+### 22.12 Growing step three: optional sink capabilities
+
+```mermaid
+flowchart LR
+    subgraph IMPL["implement the interface AND set the SinkCaps flag"]
+        I1["connector.Flusher<br/>Flushes"]
+        I2["connector.StructuredSink<br/>Structured"]
+        I3["connector.Partitioner<br/>Partitions"]
+        I4["connector.SchemaApplier<br/>AppliesSchema plus SchemaChanges"]
+        I5["connector.Committer<br/>Commits"]
+        I6["connector.WriterState<br/>KeepsState"]
+        I7["connector.TokenSink<br/>StoresToken"]
+        I8["connector.Preparer<br/>Prepares"]
+    end
+
+    subgraph GET["what the core then does for you"]
+        U1["buffered writing with an honest<br/>acknowledgement point"]
+        U2["records rather than bytes, for an<br/>SDK-shaped destination"]
+        U3["per-table, per-tenant or per-day<br/>batching with no batching code"]
+        U4["schema drift applied at the destination"]
+        U5["exactly-once by two-phase commit"]
+        U6["in-progress work survives a restart"]
+        U7["exactly-once in one durability domain"]
+        U8["the destination is created or verified<br/>before any data flows"]
+    end
+
+    I1 --> U1
+    I2 --> U2
+    I3 --> U3
+    I4 --> U4
+    I5 --> U5
+    I6 --> U6
+    I7 --> U7
+    I8 --> U8
+```
+
+Sink capabilities and their registry-declared consequences, from `pkg/registry/add.go:149-183`.
+`connector.Validator`, `connector.Prober` and `connector.ChoiceProvider` are shared with the source
+side and behave identically. As above: recorded and reported today, consumed by an engine that does
+not exist yet.
+
+Two of them, added to a sink that started as §22.2. This is the buffered case, and the reason
+`Flusher` exists:
+
+```go
+		Caps: connector.SinkCaps{
+			Caps:           connector.Caps{APIVersion: connector.APIVersion},
+			MaxConcurrency: 1,
+			Modes:          []connector.DestMode{connector.DestAppend},
+
+			Flushes:    true, // connector.Flusher
+			Partitions: true, // connector.Partitioner
+		},
+```
+
+```go
+// Write no longer claims durability. Because this sink declares Flushes, the core settles
+// on Flush and not on Write's return, so buffering here is honest rather than a lie.
+func (k *capSink) Write(_ context.Context, req *connector.Request) (connector.WriteResult, error) {
+	if _, err := k.w.Write(req.Body); err != nil {
+		return connector.WriteResult{}, fault.Transient(fault.OpWrite, err)
+	}
+	for _, ref := range req.Records {
+		k.pending = append(k.pending, ref.ID)
+	}
+	return connector.AllWritten(req.Count), nil
+}
+
+// Flush is where durability actually happens. FlushEndOfInput is the hook for finalising:
+// close the file, write the manifest.
+func (k *capSink) Flush(_ context.Context, reason connector.FlushReason) (connector.WriteResult, error) {
+	if err := k.w.Flush(); err != nil {
+		// Bytes may or may not have reached the destination: Indeterminate, never Transient.
+		return connector.WriteResult{}, fault.Unknown(fault.OpFlush, err)
+	}
+	n := int64(len(k.pending))
+	k.pending = k.pending[:0]
+	_ = reason
+	return connector.WriteResult{Written: n}, nil
+}
+
+// Partition gives the engine a batching key. The engine keeps one open batch per key with
+// its own limits, so this sink writes no batching code at all.
+func (k *capSink) Partition(r *record.Record) (string, error) {
+	return string(r.Origin().Stream), nil
+}
+```
+
+`Origin` is a **method**, not a field: `r.Origin().Stream`. Provenance is stamped once by an
+allocator inside `pkg/record` and there is no exported mutator, so a transform cannot corrupt
+settlement identity.
+
+`Flush` has a fourth answer that `Write` does not: `WriteResult.Deferred`, meaning *accepted, not
+durable yet, do not resend, do not advance the cursor past these*. A sink whose durability cadence is
+coarser than the checkpoint cadence — a thirty-second warehouse batch inside a one-second
+checkpoint — must use it. Reporting those records as `Failed` causes a resend of data the sink is
+still holding; reporting them as written is a lie.
+
+### 22.13 A fuller worked source
+
+`internal/example/linefile` (197 lines) is the reference source with everything the minimal one
+omits: config, a versioned cursor token, a cold-start and warm-start branch, and a rendered position.
+It compiles and it imports exactly the six packages. Two parts of it are worth reading before you
+write your own.
+
+**The cold/warm-start branch** (`linefile/source.go:93-126`). This is the shape of every resumable
+source. It is **28 lines of code**, not the four an earlier version of this document claimed, and there
+is no conformance kit testing both paths — you test them:
+
+```go
 
 	as, err := rt.Lanes().Assigned(ctx)
 	if err != nil {
@@ -6232,190 +8828,98 @@ func (s *src) Open(ctx context.Context, rt connector.SourceRuntime) error {
 			return err
 		}
 	} else {
-		// Warm start. The cursor is the same bytes this connector authored.
+		// Warm start. The cursor is the same bytes this connector authored, handed back verbatim.
 		s.lane = as[0].ID
 		switch tok := as[0].Cursor.Token; {
 		case tok.IsZero():
-			// no progress yet
+			// No progress yet.
 		case tok.Version == tokenV1:
 			s.off = int64(binary.BigEndian.Uint64(tok.Bytes))
 		default:
-			// Rule 3 of the format contract: never reject a NEWER version if the
-			// format is additive. This encoding is fixed-width, so a different
-			// version genuinely is unreadable, and failing loudly is correct.
+			// Rule three of the format contract says never reject a NEWER version when the format is
+			// additive. This encoding is fixed-width, so a different version genuinely is unreadable,
+			// and failing loudly with both numbers named is correct.
 			return fault.Contract(fault.OpOpen,
 				fmt.Errorf("cursor version %d unreadable by build %d", tok.Version, tokenV1))
 		}
 	}
+```
 
-	if s.f, err = os.Open(s.path); err != nil {
-		return fault.Transient(fault.OpOpen, err) // Open is retried with backoff
-	}
-	if _, err = s.f.Seek(s.off, io.SeekStart); err != nil {
-		return fault.Permanent(fault.OpOpen, err)
-	}
-	s.sc = bufio.NewScanner(s.f)
-	return nil
-}
+**The position** (`linefile/source.go:171-183`). `Order` and `Scalar` are free here because a
+big-endian uint64 already *is* an order-preserving encoding of a byte offset, and supplying them is
+what earns `ComparablePositions`:
 
-func (s *src) Read(ctx context.Context, dst *record.Batch) error {
-	if s.done {
-		return fault.ErrEndOfInput
-	}
-	dst.Reset()
-	dst.Lane = s.lane
-
-	for dst.Len() < 500 && s.sc.Scan() {
-		line := s.sc.Bytes()
-		s.off += int64(len(line)) + 1
-		r := dst.Add() // identity and provenance are ALREADY stamped
-		if r == nil {
-			break
-		}
-		r.Payload = record.BytesPayload(slices.Clone(line))
-	}
-	if err := s.sc.Err(); err != nil {
-		return fault.Transient(fault.OpRead, err)
-	}
-	if dst.Len() == 0 {
-		s.done = true
-		dst.EndOfLane = true
-		return nil // an empty final batch still carries EndOfLane
-	}
-
+```go
+func (s *src) at() record.Position {
 	var b [8]byte
 	binary.BigEndian.PutUint64(b[:], uint64(s.off))
 	scalar := float64(s.off)
-	dst.Position = record.Position{
+	return record.Position{
 		Token:  record.Blob{Version: tokenV1, Bytes: b[:]},
-		Order:  b[:], // big-endian uint64 IS an order-preserving encoding
+		Order:  b[:],
 		Scalar: &scalar,
 		Safe:   true, // every line boundary is a legal resume point
 		At:     time.Now(),
 		Label:  fmt.Sprintf("byte %d", s.off),
 	}
-	return nil
-}
-
-// Commit does nothing: this source's progress IS canal's cursor, which the core
-// already persisted in phase two before calling here. A source with an upstream
-// that needs telling (a slot, a consumer group, a queue delete) does it here.
-func (s *src) Commit(context.Context, connector.Ack) error { return nil }
-
-// Close is safe on a never-opened source, and the core calls it after a failed
-// Open and after config validation.
-func (s *src) Close(context.Context) error {
-	if s.f == nil {
-		return nil
-	}
-	return s.f.Close()
 }
 ```
 
-That is the whole source: **one registration block and four short methods.** It gets, for free: durable
-resumable progress, a per-lane replay window, backpressure, retry with classified faults, a dead-letter
-route, a config form in the UI, a JSON Schema for editors, a rendered position, a scan progress bar, the
-full metric set, conformance tests, and — the day `engine/remote` exists — an out-of-process deployment.
+Note what `Read` does *not* do: it never assigns `dst.Lane`. `Batch.Reset()` deliberately leaves
+`Lane` alone (`pkg/record/batch.go:308-316`) because the batch already carries the lane its allocator
+stamps, and retargeting it is refused by the ledger.
 
-### 22.3 A complete trivial sink
-
-```go
-package stdoutsink
-
-import (
-	"bufio"
-	"context"
-	"errors"
-	"os"
-
-	"github.com/BernardoCSACarreira/canal/config"
-	"github.com/BernardoCSACarreira/canal/connector"
-	"github.com/BernardoCSACarreira/canal/fault"
-	"github.com/BernardoCSACarreira/canal/registry"
-)
-
-func init() {
-	registry.AddSink(registry.Default, registry.SinkDef[*sink]{
-		Name:    "stdout",
-		Version: "1.0.0",
-		Title:   "Standard output",
-		Summary: "Writes encoded bytes to standard output.",
-		Support: registry.SupportCommunity,
-		Spec:    config.NewSpec(), // the registry appends codec, batching, retry
-		Caps: connector.SinkCaps{
-			Caps:           connector.Caps{APIVersion: 1},
-			MaxConcurrency: 1,
-			Modes:          []connector.DestMode{connector.DestAppend},
-			Idempotent:     false,
-			PartialFailure: false,
-		},
-		New: func(context.Context, *config.Config) (*sink, error) { return &sink{}, nil },
-	})
-}
-
-type sink struct {
-	f *os.File
-	w *bufio.Writer
-}
-
-func (k *sink) Open(_ context.Context, _ connector.SinkRuntime, _ connector.Opening) error {
-	k.f = os.Stdout
-	k.w = bufio.NewWriter(k.f)
-	return nil
-}
-
-func (k *sink) Write(_ context.Context, req *connector.Request) (connector.WriteResult, error) {
-	if _, err := k.w.Write(req.Body); err != nil {
-		return connector.WriteResult{}, fault.Transient(fault.OpWrite, err)
-	}
-	// A CLEAN RETURN MEANS DURABLE. This sink does not implement Flusher, so the
-	// core settles on this return and on nothing else — which makes the flush and
-	// the sync mandatory here, not deferred to Close.
-	//
-	// Two competing proposals shipped a reference sink that returned nil with bytes
-	// still in an unflushed bufio.Writer. That is R4's original violation in three
-	// lines of example code, and it is why this comment exists.
-	if err := k.w.Flush(); err != nil {
-		return connector.WriteResult{}, fault.Unknown(fault.OpWrite, err)
-	}
-	if err := k.f.Sync(); err != nil && !errors.Is(err, os.ErrInvalid) {
-		// A partial write may have landed: Indeterminate, never Transient.
-		return connector.WriteResult{}, fault.Unknown(fault.OpWrite, err)
-	}
-	return connector.AllWritten(req.Count), nil
-}
-
-func (k *sink) Close(context.Context) error {
-	if k.w == nil {
-		return nil
-	}
-	return k.w.Flush()
-}
-```
-
-### 22.4 The connector author's checklist
+### 22.14 The connector author's checklist
 
 1. **Classify every error you return.** `fault.Transient` / `Unknown` / `Permanent` / `Mapping` /
-   `Contract`. An unclassified error increments a counter the conformance kit asserts stays at zero.
-2. **Never return `TransientUpstream` when the effect may have landed.** Use `Indeterminate`.
+   `Contract` / `Internal` / `Bug` / `Throttle`. An unclassified error is `fault.Unclassified` and is
+   the class nobody wants to see in a status page.
+2. **Never return `TransientUpstream` when the effect may have landed.** Use `fault.Unknown`, which
+   is `Indeterminate`.
 3. **Return a clean result from `Write` only when the data is durable.** If you buffer, implement
-   `Flusher` — that is what it is for.
-4. **Version every blob you author.** Cursor tokens, lane specs, committables, writer state. Additive-only
-   encoding; never reject a newer version unless your encoding genuinely cannot tolerate it; stamp the
-   version at serialise time.
+   `Flusher` — that is what it is for. If your durability cadence is coarser than the checkpoint
+   cadence, use `WriteResult.Deferred`.
+4. **Version every blob you author.** Cursor tokens, lane specs, committables, writer state.
+   Additive-only encoding; never reject a newer version unless your encoding genuinely cannot
+   tolerate it; stamp the version at serialise time.
 5. **Derive lane names from stable content**, never from an inode, a pointer, a connection id or a
    timestamp.
-6. **Set `Safe: false`** on any position from which resuming would skip data, and `Safe: true` at your
-   boundaries. If you have no such distinction, set `true` everywhere.
-7. **Produce records only through `Batch.Add`**, and derive only through `Derive`/`Merge`.
-8. **Set `Origin.Key`** if you can, and document the derivation in `Notes` if it is computed. Declaring
-   `StableKeys` with empty `Notes` fails registration.
-9. **Handle cancellation as drain-then-stop**, not abort.
-10. **Make `Close` safe on a never-opened component** and give every network call in it a timeout.
-11. **Do no I/O in `New`.** `Open` is what gets retried.
-12. **Declare exactly the capabilities you implement.** Over-declaring panics at `init`; under-declaring is
-    reported in the UI as `CapUndeclared`.
-13. **Run the conformance kit.** One function call. See §23.
+6. **Set `Safe: false`** on any position from which resuming would skip data, and `Safe: true` at
+   your boundaries. If you have no such distinction, set `true` everywhere.
+7. **Produce records only through `Batch.Add` or `Batch.AddFor`**, and derive only through
+   `Derive`/`Merge`. Never assign `dst.Lane`.
+8. **Set `Origin.Key`** if you can, and document the derivation in `Meta.Notes` if it is computed.
+   Declaring `StableKeys` with empty `Notes` fails registration.
+9. **Handle cancellation as drain-then-stop**, not abort. Never discard records already produced into
+   `dst` on an error path.
+10. **Make `Close` safe on a never-opened component** and give every network call in it a timeout. It
+    is called exactly once, always, including after a failed `Open` and including when `Open` was
+    never called — config validation constructs a component and then closes it.
+11. **Do no I/O in `New`.** `Open` is what gets retried with backoff.
+12. **Declare exactly the capabilities you implement.** Over-declaring panics at `init`;
+    under-declaring is recorded as a `Descriptor` warning and reported as `CapUndeclared`, and the
+    capability stays off.
+13. **Test with `pkg/connectortest`**, embedding its runtimes rather than hand-writing fakes. There is
+    no conformance kit; several code comments in `pkg/` still refer to one in the present tense and
+    they are wrong.
+
+### 22.15 What a connector gets, and what it does not get yet
+
+Delivered and verifiable today:
+
+- registration from outside the repository with no core edit;
+- a config form, a generated JSON Schema, and six stage-standard fields the author did not write;
+- capability cross-checking against the Go method set, with panics that name the fix;
+- an operator-facing capability report that explains absences instead of rendering blanks;
+- test doubles for every core-implemented interface.
+
+Designed and specified, but **not built** — do not plan around them landing on a date:
+
+- durable resumable progress. The only `store.StateStore` implementation in the tree is in-memory.
+- backpressure, retry with classified faults, the dead-letter route, the metric set, position
+  rendering and scan progress. All of these are engine behaviour and
+  `internal/engine.Pipeline.Run` returns an error.
+- an out-of-process deployment. There is no `engine/remote` package and no `cmd/` main package.
 
 ---
 
@@ -6671,7 +9175,7 @@ implied by a listed row; the six minors that are not are listed at the end.
 | SG-7 | `Fetch` must not block, forcing every streaming source to hand-roll an unbounded engine-invisible fetcher | **Fixed.** `Read` **blocks**, with drain-then-stop on cancellation. No source needs a private goroutine (§7) |
 | SG-9 | `Track` blocks on `sync.Cond` which its own ctx cannot wake; per-split metrics contradict the cardinality rule | **Fixed.** A token channel plus `select` on ctx; per-lane detail is served from the read model, never as a metric label (§12.1, §16.1) |
 | SG-11, PG-? | Unexported provenance and a non-serialisable cause silently vanish across the remote boundary | **Fixed.** The wire form of a fault is its nine declared fields; `Fault.Err` is documented local-only, and the in-process path pays the same fidelity loss (§19.9) |
-| SG-12, PE-7, PG-7 | Connector-spawned goroutines with no bound, no cancellation handle and no error path; enumerator state mutated during a "pure read" snapshot | **REOPENED AND FIXED (§30.7).** "No connector-owned goroutine is sanctioned" was wrong for one whole class: an inbound HTTP or gRPC listener cannot be driven from inside `Read`. They are now sanctioned under four rules — started in `Open`, stopped in `Close`, tied to `rt.Context()`, never touching a `Batch`, never calling a settlement-bearing method — with the first and third asserted by the conformance kit. Nothing hands out a goroutine spawner; the rules bound what a connector starts itself |
+| SG-12, PE-7, PG-7 | Connector-spawned goroutines with no bound, no cancellation handle and no error path; enumerator state mutated during a "pure read" snapshot | **REOPENED AND FIXED (§29.7).** "No connector-owned goroutine is sanctioned" was wrong for one whole class: an inbound HTTP or gRPC listener cannot be driven from inside `Read`. They are now sanctioned under four rules — started in `Open`, stopped in `Close`, tied to `rt.Context()`, never touching a `Batch`, never calling a settlement-bearing method — with the first and third asserted by the conformance kit. Nothing hands out a goroutine spawner; the rules bound what a connector starts itself |
 | SG-14, XC-15 | Recovery calls `Commit` with no stated ordering against `Open`; committables carry no writer identity | **Fixed.** The order is `Open` → `AbortStale` → `Commit(recovered)` → first `Write`, stated in §8.1; `Committable.Lanes` is the identity |
 | XE-6 | Deleting a capability from core refuses every connector still declaring it | **Fixed.** An unrecognised declared capability is `CapUnknown`: ignored and reported (§10.1) |
 | XE-8, XG-13 | A live lazily-read sub-stream inside a value makes records unserialisable | **Fixed.** `record.Value` has no stream member, and the reason is stated at the type (§4.2) |
@@ -6784,17 +9288,17 @@ consequences including the negative ones accepted. The nine must-close items are
 | [0022](decisions/0022-codec-as-stage-standard-field.md) | Serialization is three registered stages attached per sink node | — |
 | [0023](decisions/0023-conformance-and-chaos.md) | Two framework-owned test suites, and the seven invariants | — |
 | [0024](decisions/0024-guarantee-tiers.md) | Guarantee tiers are which interfaces you implement, negotiated at submit time | — |
-| [0025](decisions/0025-record-identity-is-writable.md) | Record identity is writable by the source; settlement identity is not | §30.2 |
-| [0026](decisions/0026-multi-lane-reading.md) | Multi-lane reading is one optional interface over a batch of batches | §30.2 |
-| [0027](decisions/0027-positions-without-records.md) | A position may advance without a record, through the tracker | §30.2 |
-| [0028](decisions/0028-lanectl-is-the-growth-sink.md) | LaneCtl is the growth sink for lane-table needs | §30.2 |
-| [0029](decisions/0029-per-node-scope-in-spec.md) | Guarantee, mode, cadence and writer state are per node, not per pipeline | §30.2 |
-| [0030](decisions/0030-throttling-is-not-failure.md) | Throttling is flow control and does not spend a retry attempt | §30.2 |
-| [0031](decisions/0031-declared-capabilities-need-writers.md) | Every declared capability must have a reachable writer and a conformance test | §30.6 |
+| [0025](decisions/0025-record-identity-is-writable.md) | Record identity is writable by the source; settlement identity is not | §29.2 |
+| [0026](decisions/0026-multi-lane-reading.md) | Multi-lane reading is one optional interface over a batch of batches | §29.2 |
+| [0027](decisions/0027-positions-without-records.md) | A position may advance without a record, through the tracker | §29.2 |
+| [0028](decisions/0028-lanectl-is-the-growth-sink.md) | LaneCtl is the growth sink for lane-table needs | §29.2 |
+| [0029](decisions/0029-per-node-scope-in-spec.md) | Guarantee, mode, cadence and writer state are per node, not per pipeline | §29.2 |
+| [0030](decisions/0030-throttling-is-not-failure.md) | Throttling is flow control and does not spend a retry attempt | §29.2 |
+| [0031](decisions/0031-declared-capabilities-need-writers.md) | Every declared capability must have a reachable writer and a conformance test | §29.6 |
 
 ---
 
-## 30. The hostile-connector repair — what eight adversarial implementations changed
+## 29. The hostile-connector repair — what eight adversarial implementations changed
 
 **Status: NORMATIVE.** This section is the record of the only validation this interface set has had that
 was not self-assessment. Eight connectors were written against the real Go, deliberately chosen to be the
@@ -6809,7 +9313,7 @@ before the repair, from a cosmetic helper extraction. Everything below arrived a
 interface, a growable core-implemented runtime, a struct field, an engine fix, or a sentence that should
 always have been written.
 
-### 30.1 Where the breakages actually were
+### 29.1 Where the breakages actually were
 
 They were not evenly spread, and the distribution is the finding:
 
@@ -6834,7 +9338,7 @@ before applying them, negotiated sink capability against them, and had a five-mo
 them — with no interface through which a source could ever report that a column had appeared. A complete
 consumer with no producer.
 
-### 30.2 What was added, and why each is where it is
+### 29.2 What was added, and why each is where it is
 
 **Two identity setters, in the spine** (`record.Record.SetKey`, `.SetUpstream`). Six independent fatal
 reports is the definition of belonging in the spine rather than in a capability. They take `SetHandle`'s
@@ -6882,7 +9386,7 @@ hand-wrote fake runtimes, and adding one method to `SourceRuntime` broke all fiv
 that breaks every test in the ecosystem is a breaking change with a nicer name. Embeddable bases fix it
 permanently, and every future runtime method costs a connector's test suite nothing.
 
-### 30.3 The engine bugs the stress cases surfaced
+### 29.3 The engine bugs the stress cases surfaced
 
 These were not interface gaps. They were defects, and each is now a passing regression test under
 `internal/stress/`:
@@ -6905,7 +9409,7 @@ These were not interface gaps. They were defects, and each is now a passing regr
    `"128MiB"`, so every duration or size comparison was unconditionally false. A predicate that is quietly
    constant is worse than one that is missing, because the form looks validated.
 
-### 30.4 Accepted, with the workaround stated
+### 29.4 Accepted, with the workaround stated
 
 Three things were left as they are, deliberately.
 
@@ -6930,7 +9434,7 @@ the request:* a zero-record positioned batch from `Read` or `ReadLanes`, which i
 and now costs no budget. A gated lane that is not being read at all is held by the heartbeat and marked
 `LaneStatus.Idle`, which is what stopped the false `CheckpointAge` alarms.
 
-### 30.5 The eight cases, resolved
+### 29.5 The eight cases, resolved
 
 | Case | Now expressible via |
 |---|---|
@@ -6943,7 +9447,7 @@ and now costs no budget. A gated lane that is not being read at all is held by t
 | 900 runtime-discovered streams, per-stream modes, map state | `LaneReader` with `ReadConcurrency` 1; `SourceRuntime.Streams`; `LaneCtl.Table`/`AnnounceMany`/`Forget`; `StateHandle.Shared`; `LaneStatus.Idle` |
 | Enterprise: 400 pipelines, 40 pods, 1→32 readers, rotating secrets | `LaneReader`; `SetKey`; `Write.Epoch` + `store.Versioned.Epoch`; `AddFor`; `LaneCtl.Seed`; widened `Ack.LaneFinished`; `Runtime.Config`; the `MaxLanes` growth-not-recovery rule; `record.DeriveLaneID` |
 
-### 30.6 The rule this produced
+### 29.6 The rule this produced
 
 The eight cases agree on one thing no amount of review had produced: **a declared capability with no
 reachable writer is the most expensive defect shape in an interface set**, because it type-checks, it
@@ -6955,7 +9459,7 @@ The conformance kit (ADR 0023) therefore gains one obligation: **for every decla
 must contain a connector that actually declares it and a test that observes its effect end to end.** A
 capability nothing exercises is a capability nothing validates.
 
-### 30.7 Connector-owned goroutines are sanctioned
+### 29.7 Connector-owned goroutines are sanctioned
 
 §25's risk register filed connector-owned goroutines as *moot, because none is sanctioned*. That was
 wrong for one whole class of source: an inbound HTTP or gRPC listener cannot be driven from inside `Read`,
@@ -6978,7 +9482,7 @@ by handing a source a batch that panics if touched outside the call.
 
 ---
 
-## 29. Implementation order
+## 30. Implementation order
 
 The order is not negotiable, because R3 exists to prevent breadth before a working path.
 

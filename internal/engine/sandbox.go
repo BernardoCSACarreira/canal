@@ -46,6 +46,24 @@ func sandbox[Req, Res any](ctx context.Context, name string, req Req,
 		done <- result{res: res, err: err}
 	}()
 
+	// A COMPLETED CALL WINS OVER A CANCELLED CONTEXT, and the non-blocking check below is what makes
+	// that true.
+	//
+	// Both cases can be ready at the same instant — a plugin that returned exactly as the context was
+	// cancelled — and Go picks at random among ready cases. Taking the ctx branch there reports a
+	// call that ALREADY SUCCEEDED as abandoned, so a sink write that landed is never settled, its
+	// group stays open forever, and the drain that waits for the ledger to empty times out. That is
+	// how it was found: a pipeline cancelled mid-batch failed to commit anything, because one write
+	// in five hundred lost the coin toss.
+	//
+	// Preferring the result costs nothing. The call is over; the only question is whether its answer
+	// is thrown away.
+	select {
+	case r := <-done:
+		return r.res, r.err
+	default:
+	}
+
 	select {
 	case r := <-done:
 		return r.res, r.err

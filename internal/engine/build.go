@@ -312,10 +312,7 @@ func anchor(into config.Diagnostics, id record.NodeID, from config.Diagnostics) 
 	return into
 }
 
-// Run executes the pipeline until ctx is cancelled, the input ends, or a terminal fault occurs.
-//
-// TODO(engine): the node loops, the commit pump and the shutdown sequence. The shapes they must implement
-// are fixed and are not open questions:
+// The shapes Run implements, kept here because they are the contract rather than the code:
 //
 //   - One goroutine per node with one select, over bounded channels of *record.Batch with capacity two.
 //     A SOURCE node runs exactly two: the read goroutine (Open, Read, Close) and the control goroutine
@@ -339,9 +336,6 @@ func anchor(into config.Diagnostics, id record.NodeID, from config.Diagnostics) 
 //
 //   - The planner runs a pure Reconcile(plan, catalog, lanes, now) on a thirty-second timer as well as on
 //     events, so no control path depends on message delivery.
-func (p *Pipeline) Run(ctx context.Context) error {
-	return fmt.Errorf("engine: Pipeline.Run is not implemented yet; the interface set is the deliverable of this stage")
-}
 
 // Close releases everything the pipeline holds. It is safe to call on a pipeline that never ran, and it is
 // the caller's obligation whether Run succeeded or not.

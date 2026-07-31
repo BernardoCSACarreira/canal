@@ -10,7 +10,7 @@ anywhere in the engine.
 
 **The interface set is real. The engine is not built.** Nothing has ever moved a record.
 
-| | |
+| | | 
 |---|---|
 | `pkg/` — the connector-author surface | **real, compiling, documented.** 76 files, 12,108 lines. |
 | `internal/engine`, `internal/ledger` | **partly real.** 2,474 lines. `Build` resolves, validates and negotiates a delivery guarantee. `Pipeline.Run` is a one-line error return. |

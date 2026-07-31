@@ -21,8 +21,8 @@ anywhere in the engine.
 
 `go build ./...`, `go vet ./...`, `gofmt -l .` and `go test -race ./...` are clean: 68 test functions
 across 16 packages, 3 of them under `pkg/`. [CI](.github/workflows/ci.yml) runs all of that on Linux and
-macOS, cross-compiles for five targets, verifies the module still has zero third-party dependencies, and
-renders every mermaid diagram in the repository.
+macOS, cross-compiles for five targets, and verifies the module still has zero third-party
+dependencies.
 
 `pkg/` is still thinly tested — the enum wire form, the read-model shape and the descriptor round trip
 have tests because defects were found there; the rest is asserted only by the stress corpus and the

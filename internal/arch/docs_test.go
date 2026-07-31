@@ -5,9 +5,14 @@
 // mechanical, and putting them in `go test` rather than in a YAML step means a contributor finds a
 // broken link before pushing rather than after.
 //
-// What is NOT here: whether a mermaid diagram actually RENDERS. That needs a browser, so it lives in
-// the CI workflow. These tests cover the failures that are checkable without one — an unbalanced
-// fence, an unknown diagram type, an empty block — which is most of them.
+// What is NOT checked anywhere: whether a mermaid diagram actually RENDERS. That needs a headless
+// browser, and a CI job doing it was removed as a bad trade — it downloaded Chromium on every code
+// push to catch one narrow class (a syntax error inside a diagram body) whose only symptom is an
+// error box on a documentation page. These tests cover the rest, which is most of it: an unbalanced
+// fence, an unknown diagram type, an empty block, a pinned colour.
+//
+// If in-body syntax errors ever become a real problem, the cheap fix is more structural checks here
+// — balanced brackets and quotes in labels — not a browser.
 package arch
 
 import (

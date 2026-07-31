@@ -9,8 +9,14 @@ name: CI
 #      dependency-direction, connector-boundary, link and mermaid-well-formedness checks, so a
 #      contributor sees them locally from `go test ./...` and CI simply runs the same thing. A gate
 #      that only exists in YAML is a gate you cannot reproduce.
-#   2. What remains here is what genuinely needs an environment: several platforms, several
-#      architectures, and a browser.
+#   2. What remains here is what genuinely needs an environment: several platforms and several
+#      architectures. Nothing here needs a network beyond the checkout, or a toolchain beyond Go.
+#
+# There was briefly a fourth job that rendered every mermaid diagram with a headless Chromium. It was
+# removed. Beyond the structural checks already in internal/arch, all it caught was a syntax error
+# inside a diagram BODY — and the cost was a browser download on every code push, making it by far
+# the slowest and least reliable job here. A diagram that fails to parse renders as an error box on
+# the GitHub page, so the failure is visible and cosmetic rather than silent and shipped. Wrong trade.
 
 on:
   push:
@@ -133,66 +139,3 @@ jobs:
             diff -u go.mod.bak go.mod || true
             exit 1
           fi
-
-  diagrams:
-    name: mermaid renders
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: render every diagram
-        # The structural checks — fences balanced, diagram type known, no pinned colours — are Go
-        # tests in internal/arch and run everywhere. This job is the part that needs a browser:
-        # whether mermaid can actually parse each diagram. Sixty of them landed in one change, and a
-        # diagram that fails to parse is invisible until somebody opens the page on GitHub.
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/diagrams
-          while IFS= read -r file; do
-            # The output name carries the source path, because awk's counter restarts on every
-            # invocation: a shared NNN prefix silently let README's three diagrams overwrite the
-            # architecture document's first three, and 60 extracted as 57.
-            slug=$(printf '%s' "$file" | sed 's|^\./||; s|[/.]|_|g')
-            awk -v out=/tmp/diagrams -v slug="$slug" '
-              /^```mermaid[ \t]*$/ { inblk=1; f=sprintf("%s/%s-%03d.mmd", out, slug, ++c); next }
-              inblk && /^```[ \t]*$/ { inblk=0; close(f); next }
-              inblk { print > f }
-            ' "$file"
-          done < <(find . -name '*.md' -not -path './.git/*')
-
-          shopt -s nullglob
-          files=(/tmp/diagrams/*.mmd)
-
-          # Cross-check the extractor against a plain fence count. This is the check that would have
-          # caught the overwrite bug above, where 60 diagrams silently became 57 — an extractor that
-          # quietly drops work reports a green build for diagrams it never looked at.
-          fences=$(find . -name '*.md' -not -path './.git/*' -exec grep -c '^```mermaid$' {} + \
-                   | awk -F: '{s+=$2} END {print s+0}')
-          echo "extracted ${#files[@]} diagrams; ${fences} mermaid fences in the tree"
-          if [ "${#files[@]}" -ne "$fences" ]; then
-            echo "::error::extracted ${#files[@]} diagrams but found $fences fences; the extractor is dropping some"
-            exit 1
-          fi
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "::error::no diagrams were extracted; the extractor is broken, not the docs"
-            exit 1
-          fi
-
-          failed=0
-          for f in "${files[@]}"; do
-            if ! npx --yes @mermaid-js/mermaid-cli@11 -i "$f" -o "${f%.mmd}.svg" >/dev/null 2>/tmp/err; then
-              echo "::error::$f does not render:"
-              sed -n '1,15p' /tmp/err
-              head -5 "$f"
-              failed=$((failed+1))
-            fi
-          done
-          if [ $failed -gt 0 ]; then
-            echo "::error::$failed of ${#files[@]} diagrams failed to render"
-            exit 1
-          fi
-          echo "all ${#files[@]} diagrams render"

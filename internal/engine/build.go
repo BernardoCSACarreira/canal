@@ -149,6 +149,10 @@ type Pipeline struct {
 	// of Run would make a finished pipeline report the same empty document as one that never started.
 	active atomic.Pointer[runner]
 
+	// inflight counts the plugin calls the core has outstanding on each node, so that Close never
+	// enters a component that a call sandbox abandoned is still inside. See sandbox.go.
+	inflight inflight
+
 	// config is the last observation of the control plane's stored revision, or nil when this worker
 	// has no store.ConfigStore or has not looked yet. See config.go.
 	//
@@ -211,7 +215,7 @@ func Build(ctx context.Context, r *registry.Registry, s spec.Spec, d Deps) (*Pip
 	var built []closer
 
 	fail := func() (*Pipeline, telemetry.Negotiated, config.Diagnostics) {
-		closeAll(ctx, deps, built)
+		closeAll(ctx, deps, built, nil)
 		return nil, telemetry.Negotiated{}, diags
 	}
 
@@ -472,11 +476,34 @@ type closer struct {
 	close func(context.Context) error
 }
 
-func closeAll(ctx context.Context, d Deps, cs []closer) {
+// closeAll closes components in reverse construction order.
+//
+// out is the caller's outstanding-call table, or nil when there cannot be any: Build's failure path
+// passes nil because nothing it does goes through sandbox — it constructs and validates, and neither
+// is a plugin call the core can abandon.
+func closeAll(ctx context.Context, d Deps, cs []closer, out *inflight) {
 	// Close receives a FRESH context carrying the grace period, never the cancelled build context.
 	base := context.WithoutCancel(ctx)
 	for i := len(cs) - 1; i >= 0; i-- {
 		cctx, cancel := context.WithTimeout(base, d.GracePeriod)
+
+		// SETTLING SPENDS THE COMPONENT'S OWN GRACE PERIOD, not a second one beside it. A node's whole
+		// shutdown budget is GracePeriod; waiting for an abandoned call to unwind comes out of it and
+		// leaves the remainder for Close, so the worst case per component is what it always was.
+		//
+		// The wait almost always succeeds in microseconds, because an abandoned call is one whose
+		// context was already cancelled and a connector that respects context is already unwinding.
+		// It is the connector that does NOT that this exists for, and for that one the answer is to
+		// LEAK THE COMPONENT: a file handle held open until the process exits is a far smaller harm
+		// than a second goroutine inside a connector that is demonstrably not expecting one.
+		if out != nil && !out.settle(cctx, cs[i].id) {
+			d.Log.Error("not closing a component that still has an abandoned call inside it; "+
+				"its resources are leaked until this process exits",
+				"node", cs[i].id, "grace_period", d.GracePeriod)
+			cancel()
+			continue
+		}
+
 		if err := cs[i].close(cctx); err != nil {
 			d.Log.Warn("closing a component after a failed build returned an error",
 				"node", cs[i].id, "error", err)
@@ -530,6 +557,6 @@ func (p *Pipeline) Close(ctx context.Context) error {
 	for id, k := range p.sinks {
 		cs = append(cs, closer{id: id, close: k.Sink.Close})
 	}
-	closeAll(ctx, p.deps, cs)
+	closeAll(ctx, p.deps, cs, &p.inflight)
 	return p.ledger.Close()
 }

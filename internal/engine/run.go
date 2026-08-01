@@ -489,7 +489,7 @@ func (r *runner) openSources(ctx context.Context) error {
 		// Every call into a connector goes through the sandbox, so a panic is a classified fault and
 		// a hang is abandoned rather than wedging the host.
 		src := r.p.sources[id]
-		if _, err := sandbox(ctx, r.p.obs, id, src.Name, rt,
+		if _, err := sandbox(ctx, r.p, id, src.Name, rt,
 			func(c context.Context, rt *sourceRuntime) (struct{}, error) {
 				return struct{}{}, src.Source.Open(c, rt)
 			}); err != nil {
@@ -514,7 +514,7 @@ func (r *runner) openSinks(ctx context.Context) error {
 			Guarantee: r.p.negotiated.Guarantee,
 			Streams:   configuredStreams(r.p.spec),
 		}
-		if _, err := sandbox(ctx, r.p.obs, id, sk.Name, opening,
+		if _, err := sandbox(ctx, r.p, id, sk.Name, opening,
 			func(c context.Context, o connector.Opening) (struct{}, error) {
 				return struct{}{}, sk.Sink.Open(c, rt, o)
 			}); err != nil {
@@ -528,7 +528,7 @@ func (r *runner) openSinks(ctx context.Context) error {
 		if cc == nil {
 			continue
 		}
-		if _, err := sandbox(ctx, r.p.obs, id, sk.Name, rt,
+		if _, err := sandbox(ctx, r.p, id, sk.Name, rt,
 			func(c context.Context, rt *sinkRuntime) (struct{}, error) {
 				return struct{}{}, cc.open(c, rt)
 			}); err != nil {
@@ -595,7 +595,7 @@ func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 		}
 
 		batch := record.NewBatch(alloc, maxReadBatch)
-		_, err := sandbox(ctx, r.p.obs, id, src.Name, batch,
+		_, err := sandbox(ctx, r.p, id, src.Name, batch,
 			func(c context.Context, b *record.Batch) (struct{}, error) {
 				return struct{}{}, src.Source.Read(c, b)
 			})
@@ -987,7 +987,7 @@ func (r *runner) commitPump(ctx context.Context) {
 			continue
 		}
 		start := time.Now()
-		if _, err := sandbox(ctx, r.p.obs, srcNode, src.Name, ack,
+		if _, err := sandbox(ctx, r.p, srcNode, src.Name, ack,
 			func(c context.Context, a connector.Ack) (struct{}, error) {
 				return struct{}{}, src.Source.Commit(c, a)
 			}); err != nil {

@@ -4,10 +4,82 @@ import (
 	"context"
 	"fmt"
 	"runtime/debug"
+	"sync"
 
 	"github.com/BernardoCSACarreira/canal/pkg/fault"
 	"github.com/BernardoCSACarreira/canal/pkg/record"
 )
+
+// inflight counts the plugin calls the core has outstanding on each node.
+//
+// IT EXISTS BECAUSE ABANDONING A CALL DOES NOT END IT. sandbox gives up on a wedged call and returns,
+// and the goroutine carrying it is still inside the component — that is the documented cost. What was
+// not accounted for is that the host then does what the API tells it to and calls Pipeline.Close,
+// which enters the SAME component while the abandoned call is still assigning its fields. The race
+// detector finds it by sweeping a cancel across the startup window: linefile writes s.f in Open and
+// reads it in Close with nothing between them, and every connector in the module has that shape.
+//
+// A connector author cannot defend against it, because the contract never told them Open and Close
+// could overlap — see [connector.Source], which now says the core will not do it. This is how that
+// promise is kept: Close settles a node before entering it, and refuses to enter one whose call has
+// not come back.
+type inflight struct {
+	mu sync.Mutex
+	n  map[record.NodeID]int
+
+	// idle holds one channel per BUSY node, closed when its count reaches zero. A channel rather than
+	// a sync.Cond because the waiter has a deadline, and Cond cannot be waited on with one.
+	idle map[record.NodeID]chan struct{}
+}
+
+// enter records a call starting on a node.
+func (i *inflight) enter(node record.NodeID) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.n == nil {
+		i.n, i.idle = map[record.NodeID]int{}, map[record.NodeID]chan struct{}{}
+	}
+	if i.n[node] == 0 {
+		i.idle[node] = make(chan struct{})
+	}
+	i.n[node]++
+}
+
+// leave records a call returning, waking anything waiting on the node's last one.
+func (i *inflight) leave(node record.NodeID) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.n[node]--
+	if i.n[node] > 0 {
+		return
+	}
+	delete(i.n, node)
+	if ch := i.idle[node]; ch != nil {
+		close(ch)
+		delete(i.idle, node)
+	}
+}
+
+// settle waits until a node has no call outstanding, and reports whether it got there.
+//
+// A false return is not a failure to be retried: it means a call the core already gave up on is
+// STILL RUNNING, so the component cannot be entered at all. The alertable signal for that state is
+// canal_abandoned_plugin_calls_total, which is necessarily non-zero whenever this returns false —
+// every outstanding call at close time is one sandbox abandoned.
+func (i *inflight) settle(ctx context.Context, node record.NodeID) bool {
+	i.mu.Lock()
+	ch := i.idle[node]
+	i.mu.Unlock()
+	if ch == nil {
+		return true
+	}
+	select {
+	case <-ch:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
 
 // sandbox runs one plugin call in a goroutine with recover, and selects on ctx.
 //
@@ -23,7 +95,7 @@ import (
 // THE HONEST COST, accepted and measured: the goroutine leaks until the wedged call returns, and every
 // call costs one goroutine. The leak is counted as canal_abandoned_plugin_calls_total, and a non-zero
 // value is an alertable condition rather than a footnote.
-func sandbox[Req, Res any](ctx context.Context, o *obs, node record.NodeID, name string, req Req,
+func sandbox[Req, Res any](ctx context.Context, p *Pipeline, node record.NodeID, name string, req Req,
 	fn func(context.Context, Req) (Res, error),
 ) (Res, error) {
 	type result struct {
@@ -35,12 +107,23 @@ func sandbox[Req, Res any](ctx context.Context, o *obs, node record.NodeID, name
 	// grows.
 	done := make(chan result, 1)
 
+	// ENTERED BEFORE THE GOROUTINE STARTS, and that ordering is the guarantee rather than a style.
+	// sandbox returns the instant ctx is done, and an ALREADY-cancelled context takes that branch
+	// before the goroutine has necessarily been scheduled — so counting inside the goroutine would
+	// let Close find the node idle and walk into a component the call is about to enter.
+	//
+	// Leaving is deferred first so it runs last, after the send and after any recover. That half is
+	// conservatism, not correctness: fn has already returned by then, so nothing is inside the
+	// component either way. See inflight.
+	p.inflight.enter(node)
+
 	go func() {
+		defer p.inflight.leave(node)
 		defer func() {
-			if p := recover(); p != nil {
+			if pn := recover(); pn != nil {
 				var zero Res
 				done <- result{res: zero, err: fault.Bug(fault.OpUnknown,
-					fmt.Errorf("component %q panicked: %v\n%s", name, p, debug.Stack()))}
+					fmt.Errorf("component %q panicked: %v\n%s", name, pn, debug.Stack()))}
 			}
 		}()
 		res, err := fn(ctx, req)
@@ -72,7 +155,7 @@ func sandbox[Req, Res any](ctx context.Context, o *obs, node record.NodeID, name
 		// The goroutine above is now leaked until the wedged call returns. Counting it here is what
 		// turns the honest cost named in this file's comment into an alertable condition instead of
 		// a footnote nobody can act on.
-		o.abandonedCall(node)
+		p.obs.abandonedCall(node)
 		var zero Res
 		return zero, fault.Internal(fault.OpUnknown,
 			fmt.Errorf("component %q did not return before its deadline; the call was abandoned: %w", name, ctx.Err()))

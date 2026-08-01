@@ -23,6 +23,14 @@ type Source interface {
 	// Open returns. A source needing a connection-lifetime context takes rt.Context().
 	// This is stated on the method because a connector holding connections tied to a dead
 	// context is the commonest first bug.
+	//
+	// CONCURRENCY: Open and Close never run concurrently with each other or with any other
+	// method on this component, so the fields Open assigns need no lock against the fields
+	// Close reads. The core enforces it rather than assuming it: a cancelled Open is
+	// ABANDONED and its goroutine keeps running, and Close waits for that goroutine — up to
+	// the grace period — before entering the component, and declines to enter at all if it
+	// has not come back. That guarantee was missing once, and every connector in the module
+	// had a latent data race between the two.
 	Open(ctx context.Context, rt SourceRuntime) error
 
 	// Read fills dst and sets dst.Position for a prefix lane. It blocks until at least one

@@ -17,9 +17,10 @@ import (
 // This asymmetry is the single most valuable property of the whole design: a new sink
 // cannot get progress wrong, because it is never shown progress.
 type Sink interface {
-	// Open connects and prepares. Same context narrowing and same re-callability as
-	// [Source.Open]: ctx is scoped to the opening, and a connection-lifetime context comes
-	// from rt.Context().
+	// Open connects and prepares. Same context narrowing, same re-callability and the same
+	// concurrency guarantee as [Source.Open]: ctx is scoped to the opening, a
+	// connection-lifetime context comes from rt.Context(), and Open never runs concurrently
+	// with Close even when the core has abandoned it.
 	//
 	// It receives what it needs to create or alter the destination BEFORE the first record
 	// that needs it — which is why Open exists rather than folding into the constructor.

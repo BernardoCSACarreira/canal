@@ -96,7 +96,7 @@ func (r *runner) prepare(ctx context.Context, point connector.CommitPoint) ([]co
 		covered := r.deferred.takeCovered(id)
 		held := r.deferred.take(id)
 
-		cs, err := sandbox(ctx, r.p.obs, id, sk.Name, point,
+		cs, err := sandbox(ctx, r.p, id, sk.Name, point,
 			func(c context.Context, p connector.CommitPoint) ([]connector.Committable, error) {
 				return sk.Committer.PrepareCommit(c, p)
 			})
@@ -144,7 +144,7 @@ func (r *runner) publish(ctx context.Context, id uint64, cs []connector.Committa
 		sk := r.p.sinks[node]
 		mine := byNode[node]
 
-		outs, err := sandbox(ctx, r.p.obs, node, sk.Name, mine,
+		outs, err := sandbox(ctx, r.p, node, sk.Name, mine,
 			func(c context.Context, in []connector.Committable) ([]connector.CommitOutcome, error) {
 				return sk.Committer.Commit(c, in)
 			})
@@ -434,7 +434,7 @@ func (r *runner) buildCheckpoint(ctx context.Context, id uint64) (*Checkpoint, e
 		if sk.State == nil {
 			continue
 		}
-		bs, err := sandbox(ctx, r.p.obs, node, sk.Name, id,
+		bs, err := sandbox(ctx, r.p, node, sk.Name, id,
 			func(c context.Context, cid uint64) ([]record.Blob, error) {
 				return sk.State.SnapshotState(c, cid)
 			})
@@ -579,7 +579,7 @@ func (r *runner) restoreWriterState(ctx context.Context, ws map[record.NodeID][]
 				"node", node, "blobs", len(ws[node]))
 			continue
 		}
-		if _, err := sandbox(ctx, r.p.obs, node, sk.Name, ws[node],
+		if _, err := sandbox(ctx, r.p, node, sk.Name, ws[node],
 			func(c context.Context, bs []record.Blob) (struct{}, error) {
 				return struct{}{}, sk.State.RestoreState(c, bs)
 			}); err != nil {
@@ -621,12 +621,12 @@ func (r *runner) resolveStale(ctx context.Context, pending map[uint64][]connecto
 			// PREFERRED. A per-item answer strictly dominates one naked error for a batch, and the
 			// three answers it can give — landed, reclaimable, in doubt — are exactly the three
 			// states a timed-out commit leaves behind.
-			outs, err = sandbox(ctx, r.p.obs, node, sk.Name, cs,
+			outs, err = sandbox(ctx, r.p, node, sk.Name, cs,
 				func(c context.Context, in []connector.Committable) ([]connector.CommitOutcome, error) {
 					return sk.Stale.ResolveStale(c, in)
 				})
 		} else {
-			_, err = sandbox(ctx, r.p.obs, node, sk.Name, cs,
+			_, err = sandbox(ctx, r.p, node, sk.Name, cs,
 				func(c context.Context, in []connector.Committable) (struct{}, error) {
 					return struct{}{}, sk.Committer.AbortStale(c, in)
 				})

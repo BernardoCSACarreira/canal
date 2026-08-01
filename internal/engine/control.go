@@ -273,7 +273,7 @@ func (r *runner) heartbeatQuietLanes(ctx context.Context, id record.NodeID, src 
 			lane record.LaneID
 			idle time.Duration
 		}
-		_, err := sandbox(ctx, r.p.obs, id, src.Name, hb{lane, quiet},
+		_, err := sandbox(ctx, r.p, id, src.Name, hb{lane, quiet},
 			func(c context.Context, h hb) (struct{}, error) {
 				return struct{}{}, src.Heartbeat.Heartbeat(c, h.lane, h.idle)
 			})
@@ -300,7 +300,7 @@ func (r *runner) pollBacklogs(ctx context.Context, id record.NodeID, src *regist
 		return
 	}
 	for _, lane := range r.activity.nextLanes(r.liveLanes(id), maxBacklogPollsPerTick) {
-		got, err := sandbox(ctx, r.p.obs, id, src.Name, lane,
+		got, err := sandbox(ctx, r.p, id, src.Name, lane,
 			func(c context.Context, l record.LaneID) (connector.Backlog, error) {
 				return src.Backlog.Backlog(c, l)
 			})
@@ -338,7 +338,7 @@ func (r *runner) drainNacks(ctx context.Context, id record.NodeID, src *registry
 			lane record.LaneID
 			ns   []connector.Nack
 		}
-		_, err := sandbox(ctx, r.p.obs, id, src.Name, call{lane, ns},
+		_, err := sandbox(ctx, r.p, id, src.Name, call{lane, ns},
 			func(c context.Context, k call) (struct{}, error) {
 				return struct{}{}, src.Nackable.Nack(c, k.lane, k.ns)
 			})

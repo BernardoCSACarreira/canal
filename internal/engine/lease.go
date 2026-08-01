@@ -46,6 +46,21 @@ type leaseTable struct {
 	mu   sync.Mutex
 	held map[record.LaneID]store.Lease
 
+	// fenced is every lane this process has been revoked off, and it is never emptied.
+	//
+	// ONCE FENCED, THIS RUN DOES NOT TAKE THE LANE BACK. Ledger.Revoke sets a flag the ledger never
+	// clears, so a lane that was revoked and then re-claimed would be read normally and acknowledged
+	// NEVER — the upstream would pin its retention forever with nothing to say why. That is worse
+	// than not holding the lane at all.
+	//
+	// The cost is real and bounded: a lease that lapses on a hiccup this process recovers from leaves
+	// its lane unread until another worker takes it, one reassignment delay later — and the delay
+	// exists precisely to make reclaiming your own lane the expected path. A restart clears it,
+	// because a fresh process has a fresh ledger. Clearing it in-process instead needs the ledger to
+	// support un-revoking a lane, which it does not, and which is a change to the fence rather than
+	// to this table.
+	fenced map[record.LaneID]bool
+
 	coord store.Coordinator
 	gen   uint64
 
@@ -56,8 +71,9 @@ type leaseTable struct {
 
 func newLeaseTable(d Deps, s specRefFields, gen uint64) *leaseTable {
 	return &leaseTable{
-		held:  map[record.LaneID]store.Lease{},
-		coord: d.Coordinator, gen: gen,
+		held:   map[record.LaneID]store.Lease{},
+		fenced: map[record.LaneID]bool{},
+		coord:  d.Coordinator, gen: gen,
 		tenant: s.tenant, pipeline: s.pipeline, worker: d.Worker,
 	}
 }
@@ -135,8 +151,9 @@ func (lt *leaseTable) claim(ctx context.Context, log *slog.Logger, rows []store.
 	for _, row := range rows {
 		lt.mu.Lock()
 		l, ok := lt.held[row.ID]
+		gone := lt.fenced[row.ID]
 		lt.mu.Unlock()
-		if ok && l.Valid(now) {
+		if (ok && l.Valid(now)) || gone {
 			continue
 		}
 
@@ -191,6 +208,7 @@ func (lt *leaseTable) renew(ctx context.Context, log *slog.Logger) []record.Lane
 			"lane", lane, "epoch", l.Epoch, "error", err)
 		lt.mu.Lock()
 		delete(lt.held, lane)
+		lt.fenced[lane] = true
 		lt.mu.Unlock()
 		lost = append(lost, lane)
 	}
@@ -353,8 +371,17 @@ func (r *runner) planAndClaim(ctx context.Context, node record.NodeID, lc *laneC
 // advance an upstream to make the overlap go away is specified data loss — and an idempotent sink
 // absorbs the overlap, while nothing recovers the loss.
 func (r *runner) laneRevoked(lane record.LaneID) {
-	st := r.p.ledger.Stats(lane)
-	r.p.obs.revokedUnsettled(lane, st.InFlight)
+	// THE FENCE IS THE LEDGER'S, AND IT WAS NEVER ARMED. Ledger.Revoke has existed with a complete
+	// implementation and no callers: it sets a flag that makes Committed refuse to emit an
+	// acknowledgement for the lane, ever, while letting in-flight records settle so buffers drain and
+	// the accounting stays right. That is the fence the three-phase commit needs, in the one place
+	// that can enforce it permanently — and nothing in the module called it, so the whole multi-worker
+	// safety argument rested on a function no code path reached.
+	//
+	// It also returns the number this metric wants, computed from the groups it already owns, which
+	// is why the hand-rolled Stats(lane).InFlight that used to be here is gone.
+	unsettled := r.p.ledger.Revoke(lane)
+	r.p.obs.revokedUnsettled(lane, unsettled)
 	r.noteOnSource(lane, connector.Event{
 		Kind:     connector.EventLaneRevoked,
 		Severity: fault.TransientInternal,
@@ -377,19 +404,15 @@ func (r *runner) noteOnSource(lane record.LaneID, e connector.Event) {
 
 // commitAllowed reports whether a lane's upstream may be advanced.
 //
-// THIS IS THE FENCE WITH TEETH, AND IT IS NOT YET DEMONSTRATED. Every other check in this file
-// decides what to READ; this one decides what to tell an upstream it may forget. A worker that lost
-// a lane and acknowledged it anyway discards records the new holder has not delivered, and no epoch
-// undoes that, because by then the data is gone from the source.
+// THE SECOND FENCE, AND IT COVERS A WINDOW THE FIRST CANNOT.
 //
-// HONESTLY LABELLED: deleting this check leaves every test in lease_test.go passing, including the
-// one written specifically to isolate it by holding records in flight across a revocation. The read
-// fence gets there first in every scenario constructed so far — Assigned stops offering the lane,
-// the source stops producing, and the ack that would have been refused is never generated. So this
-// is defence in depth that has not been shown to be reachable, which is a different thing from
-// defence that has been shown to work, and it is worth more as a labelled unknown than as an
-// assumed guarantee. Reaching it needs a fixture that can settle records for a lane AFTER the read
-// loop has stopped for it.
+// The first is the ledger's: laneRevoked calls Ledger.Revoke, which refuses an acknowledgement for
+// that lane permanently. It fires when this worker NOTICES the loss, which is on a renew tick.
+//
+// This one is time-based, so it also covers the gap between a lease actually lapsing and the renew
+// tick that discovers it — up to one renew interval in which the ledger still believes the lane is
+// held. Neither subsumes the other: the ledger's survives a lease that flaps back to valid, and this
+// one fires before the ledger's knows anything.
 func (r *runner) commitAllowed(lane record.LaneID) bool {
 	return r.leases.holds(lane, time.Now())
 }

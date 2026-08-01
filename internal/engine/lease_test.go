@@ -388,13 +388,22 @@ func registerLeaseSource(t *testing.T, s *leaseSource) string {
 	return name
 }
 
-// THE COMMIT FENCE, ISOLATED. The test above cannot see it: by the time a lane is revoked there the
-// read fence has already stopped the source, so nothing new settles and no acknowledgement was going
-// to be attempted anyway. Deleting the fence in commitPump left it passing.
+// THE FENCE, WITH RECORDS THAT SETTLE AFTER THE LANE IS GONE.
 //
-// Here the sink parks in Write, so records are IN FLIGHT across the revocation and settle only after
-// it. Those settlements reach the commit pump with the lane already lost, which is the one moment
-// the fence is the only thing standing between a fenced worker and an upstream it must not advance.
+// The sink parks in Write, so records are IN FLIGHT across the revocation and settle only after it.
+// Those settlements are exactly the moment a fenced worker would otherwise tell an upstream it may
+// forget records the new holder has not delivered.
+//
+// IT STILL DOES NOT DEMONSTRATE THE FENCE, and the reason has been narrowed rather than fixed.
+// Deleting commitAllowed, and all three of the ledger's own revoked checks, leaves this passing:
+// after a revocation no acknowledgement is generated for the lane by ANY path this fixture can
+// construct, so there is nothing for a fence to stop. That is a fault in the fixture and not in the
+// code — the read loop has ended and the run is on its way to draining before the held records
+// settle, so the ack that should test the fence is never produced at all.
+//
+// What is needed is a lane that keeps settling records while this worker no longer holds it, which
+// this fixture cannot arrange: it revokes by taking the lane away, and taking the lane away is also
+// what stops the pipeline. Left as an assertion of the observable behaviour, honestly labelled.
 func TestRecordsSettlingAfterARevocationDoNotAdvanceTheUpstream(t *testing.T) {
 	hold := make(chan struct{})
 	f := startLeased(t, hold)
@@ -444,5 +453,70 @@ func TestRecordsSettlingAfterARevocationDoNotAdvanceTheUpstream(t *testing.T) {
 		t.Errorf("the source was told to advance its upstream %d times for a lane this worker had "+
 			"already lost.\n  Each one lets the upstream discard records the new holder has not "+
 			"delivered, and no epoch undoes it because by then the data is gone from the source", got)
+	}
+}
+
+// A LANE THIS RUN WAS FENCED OFF IS NOT TAKEN BACK, and the reason is the ledger.
+//
+// Ledger.Revoke sets a flag nothing clears. So a lane that was revoked and then re-claimed would be
+// read normally and acknowledged NEVER — the upstream pinning its retention forever with nothing in
+// the document to say why. Arming the fence is what made that reachable, and the reassignment delay
+// makes reclaiming your own lane the EXPECTED path: this worker is the one the lapsed lane is
+// reserved for.
+//
+// LIKE THE FENCE TEST ABOVE, THIS DOES NOT YET DISCRIMINATE. Neutralising the check it is written
+// for leaves it passing, because by the time the lane becomes available again this fixture's
+// pipeline has stopped asking for anything — the same fixture limitation, from the same cause. The
+// rule it asserts is right and the reason is verifiable by reading the ledger, where nothing ever
+// clears the flag; the assertion is here so the property is written down and so the fixture that
+// can finally drive it has something to make fail.
+func TestARevokedLaneIsNotReclaimedByTheSameRun(t *testing.T) {
+	f := startLeased(t)
+	ctx := context.Background()
+
+	s := f.p.Status(telemetry.StatusQuery{})
+	as, err := f.coord.Assignments(ctx, s.Tenant, s.Pipeline)
+	if err != nil || len(as) == 0 {
+		t.Fatalf("no assignments (%v)", err)
+	}
+
+	// The lease lapses and another worker takes it, which is what revokes this one.
+	f.now = f.now.Add(store.DefaultLeaseTTL + store.DefaultReassignmentDelay + time.Second)
+	other, err := f.coord.Claim(ctx, as[0].ID, "w2", store.DefaultLeaseTTL)
+	if err != nil {
+		t.Fatalf("the other worker could not take the lane: %v", err)
+	}
+
+	deadline := time.Now().Add(2*store.DefaultRenewInterval + 5*time.Second)
+	for time.Now().Before(deadline) {
+		if f.p.Status(telemetry.StatusQuery{}).Workers[0].LeaseExpires == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if f.p.Status(telemetry.StatusQuery{}).Workers[0].LeaseExpires != nil {
+		t.Fatal("this worker never noticed it lost the lane")
+	}
+
+	// NOW THE LANE BECOMES AVAILABLE AGAIN, which is the case the reassignment delay is built for:
+	// the other holder hands it back and this worker is the natural claimant.
+	if err := f.coord.Release(ctx, other); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	// Two renew ticks is more than enough for replanAndClaim to have tried.
+	time.Sleep(2*store.DefaultRenewInterval + time.Second)
+
+	if got := f.p.Status(telemetry.StatusQuery{}).Workers[0].LeaseExpires; got != nil {
+		t.Errorf("this run took the lane back (lease to %s) after being fenced off it.\n"+
+			"  Ledger.Revoke's flag is never cleared, so every record it now reads would be settled "+
+			"and NEVER acknowledged — an upstream pinning its retention with nothing to say why", got)
+	}
+	rows, err := f.coord.Assignments(ctx, s.Tenant, s.Pipeline)
+	if err != nil {
+		t.Fatalf("Assignments: %v", err)
+	}
+	if rows[0].Worker == "w1" {
+		t.Error("the coordinator shows the lane back on w1")
 	}
 }

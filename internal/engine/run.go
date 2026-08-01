@@ -70,8 +70,9 @@ type runner struct {
 	sinkRT map[record.NodeID]*sinkRuntime
 
 	// status is the read model's own state: the phase, the previous condition set and the rate
-	// samples. See status.go.
-	status statusState
+	// samples. See status.go. activity is the control loop's, see control.go.
+	status   statusState
+	activity *laneActivity
 
 	// mainSinks and failedSinks are the sink nodes split by what their inbound edges carry, computed
 	// once at start because it is a property of the spec and cannot change during a run.
@@ -231,6 +232,7 @@ func (r *runner) run(ctx context.Context) error {
 	if trigger <= 0 {
 		trigger = 1
 	}
+	r.activity = newLaneActivity()
 	r.deferred = newDeferred(trigger)
 	r.checkpointer = newCheckpointer()
 	r.awaiting = newAwaitingCommit()
@@ -287,6 +289,18 @@ func (r *runner) run(ctx context.Context) error {
 		defer close(flushDone)
 		r.flushLoop(ctx, flushStop)
 	}()
+
+	// THE SECOND GOROUTINE PER SOURCE. It takes ctx rather than runCtx so heartbeats keep an
+	// upstream's retention moving while the pipeline drains, and it is stopped by a channel so every
+	// call into a connector has returned before Run does — and therefore before the host calls Close.
+	controlStop := make(chan struct{})
+	for id := range r.p.sources {
+		wg.Add(1)
+		go func(id record.NodeID) {
+			defer wg.Done()
+			r.controlLoop(ctx, id, controlStop)
+		}(id)
+	}
 
 	readers := &sync.WaitGroup{}
 	for id := range r.p.sources {
@@ -363,6 +377,10 @@ func (r *runner) run(ctx context.Context) error {
 	//
 	// It surfaced as canal_records_committed_total intermittently missing from a scrape, which is
 	// exactly the sort of thing that stays invisible until something measures it.
+	// The control loops stop here too, and their last act is to deliver any nack the write path
+	// queued in the final moments — a record already settled and already committed past, which
+	// nothing else will ever tell the upstream about.
+	close(controlStop)
 	close(flushStop)
 	<-flushDone
 	_ = r.p.ledger.Close() // closing the ack channel is what ends the pump
@@ -581,6 +599,13 @@ func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 		readAttempt = attempt{}
 
 		r.p.obs.recordsRead.Add(float64(batch.Len()), r.p.obs.pipeline, laneLabel(lane.ID), src.Name)
+		if batch.Len() > 0 {
+			// A lane that produced records is not quiet, which ends any idleness the control loop had
+			// reported. A ZERO-RECORD POSITIONED BATCH deliberately does not count: it advances the
+			// cursor without producing, so the lane genuinely has nothing to say and a heartbeat is
+			// exactly what should keep holding its slot.
+			r.activity.saw(lane.ID, time.Now())
+		}
 
 		if err := r.p.ledger.Admit(ctx, batch); err != nil {
 			if ctx.Err() != nil {

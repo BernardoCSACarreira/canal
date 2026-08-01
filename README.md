@@ -28,10 +28,11 @@ go run ./cmd/canal check --spec your-pipeline.json
 | Checkpoints | **real.** [`engine.Checkpoint`](internal/engine/checkpoint.go) was a declared shape nothing constructed. It is now written on every flush — committables, lane cursors, writer state and header in ONE atomic batch — and read at open, where committables a previous run left in doubt are handed back to the sink that minted them. |
 | `internal/stress` — eight hostile connectors | **real.** 15,670 lines, kept as an interface-shape regression suite; the audit found five of the eight genuinely catch drift today. |
 | Fault routing | **real.** A connector states a `Class`, a fact; the engine computes the behaviour from (class, capabilities, policy). Throttling never spends a retry attempt, an indeterminate write against a non-idempotent sink fails loud rather than guessing, and a dead letter is delivered before the record is abandoned. |
-| Metrics | **real for fifteen of twenty-six names.** [`internal/metrics`](internal/metrics) accumulates and renders Prometheus text; `canal run --metrics :9090` serves it. An unmeasurable quantity is OMITTED rather than reported as zero, which is what makes `canal_checkpoint_age_seconds` usable as the primary alert. |
+| Metrics | **real for nineteen of twenty-six names.** [`internal/metrics`](internal/metrics) accumulates and renders Prometheus text; `canal run --metrics :9090` serves it. An unmeasurable quantity is OMITTED rather than reported as zero, which is what makes `canal_checkpoint_age_seconds` usable as the primary alert. The seven absent ones measure things that do not exist yet — buffers, dedupe, lane revocation, restart phases, node utilization and blocking. |
+| Read model | **real.** [`engine.Pipeline.Status`](internal/engine/status.go) builds `telemetry.PipelineStatus` and `canal run --metrics` serves it at `GET /status`. Every field the engine cannot measure is a nil pointer, and each omission is named rather than filled with a confident zero. |
 | Buffers, transforms, multi-worker, a frontend, an API | **do not exist.** The interfaces do, and the negotiation refuses a pipeline that asks for one. |
 
-`go build ./...`, `go vet ./...`, `gofmt -l .` and `go test -race ./...` are clean: 222 test
+`go build ./...`, `go vet ./...`, `gofmt -l .` and `go test -race ./...` are clean: 243 test
 functions across 27 packages, 111 of them under `pkg/`. **Every published package now has tests.**
 Writing them found two defects nothing else would have: a retry helper that panics on amd64, and a
 key encoding under which two pipelines in one tenant could overwrite each other's state. [CI](.github/workflows/ci.yml) runs all of that on Linux
@@ -435,9 +436,19 @@ absence somebody has to remember to check for — which is the answer to "did my
 effect". Every field the engine cannot measure is a nil pointer and is named as a gap in §16 rather
 than filled with a confident zero.
 
+**And the source control goroutine exists now.** `build.go` has specified a source node as running
+exactly two goroutines — the read goroutine, and a control goroutine for `Commit`, `Heartbeat`,
+`Backlog`, `Nack` and the assignment refresh — since it was written, and only the read goroutine was
+built. Fifteen implementations across the stress corpus were never called, and the negotiation *refused
+builds* over a heartbeat capability the runtime then ignored, so a source that declared `Heartbeater`
+passed the gate and pinned its upstream's retention anyway.
+[`internal/engine/control.go`](internal/engine/control.go) is that goroutine; `Backlog`, `Idle` and
+`EventTimeLag` in the read model come from it.
+
 **Next** is what the single-worker label in
 [`internal/engine/runtime.go`](internal/engine/runtime.go) holds open: a `store.Coordinator`, leases
-and real epoch fencing, plus transforms and buffers.
+and real epoch fencing — which is also the assignment refresh, the one part of the control goroutine
+still unbuilt — plus transforms and buffers.
 
 Still open, and tracked where they belong rather than here: the twelve decisions in
 [`_completeness-audit.md`](docs/decisions/_completeness-audit.md) that cost a breaking change if

@@ -198,6 +198,21 @@ func (r *runner) progressing(now time.Time, f laneFacts) telemetry.Condition {
 	case f.blocked > 0:
 		return c(telemetry.StatusFalse, telemetry.ReasonBudgetExhausted,
 			fmt.Sprintf("%d lanes are at their in-flight budget; last durable advance %s", f.blocked, since))
+
+	// EVERY LANE REPORTED QUIET BY ITS OWN SOURCE IS NOT A STALL, and this arm is the reason
+	// connector.Heartbeater exists. Without it hundreds of healthy quiet streams each reported a
+	// forever-rising checkpoint age — the design's primary alert signal — for the sole offence of
+	// having nothing to say, and the only way to keep the signal usable was to stop believing it.
+	//
+	// The status stays FALSE, because the durable cursor genuinely is not advancing and the document
+	// does not lie about that. It is the REASON that changes: caught_up is not what an alert fires on
+	// and stalled is. Idle is only ever set from a heartbeat the source actually accepted, so this
+	// cannot be reached by a lane that is merely stuck.
+	case f.idle > 0 && f.idle >= f.total-f.finished:
+		return c(telemetry.StatusFalse, telemetry.ReasonCaughtUp,
+			fmt.Sprintf("all %d unfinished lanes were reported idle by their source; last durable advance %s",
+				f.idle, since))
+
 	case f.caughtUp:
 		return c(telemetry.StatusFalse, telemetry.ReasonCaughtUp,
 			fmt.Sprintf("nothing is outstanding; last durable advance %s", since))

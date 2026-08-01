@@ -31,9 +31,8 @@ import (
 //   - PipelineStatus.Config. The redacted tree needs each component's declared config.Spec to know
 //     which fields are secret, and Build does not keep the redaction it computes. Emitting the raw
 //     tree instead is precisely the leak config.Redacted exists to prevent, so nothing is emitted.
-//   - Backlog, EventTimeLag, Idle, Progress. Each needs a connector capability nothing in this
-//     module declares yet — BacklogReporter, an event-time projection, Heartbeater, and a lane with
-//     scalar bounds respectively.
+//   - LaneStatus.Progress. record.Fraction needs a lane's scalar BOUNDS and a lane declares only its
+//     current Scalar, so there is nothing to divide by.
 //   - NodeStatus.Utilization and .BlockedForSeconds. Neither is measured anywhere in the engine.
 //   - Buffers. There is no buffer node type.
 //   - WorkerStatus.LeaseExpires. There are no leases until store.Coordinator exists.
@@ -196,6 +195,7 @@ type laneFacts struct {
 	total     int
 	finished  int
 	blocked   int
+	idle      int
 	inFlight  uint64
 	admitted  uint64
 	settled   uint64
@@ -307,10 +307,28 @@ func (r *runner) laneStatuses(now time.Time) ([]telemetry.LaneStatus, laneFacts)
 				ls.Resolved = &lbl
 			}
 
-			// EventTimeLag is the source's own observation time differenced against now, which is a
-			// real event-time lag whenever the connector stamps Position.At. A source that does not is
-			// reported unknown rather than as a lag of zero.
-			if st.CommittedOK && !st.Committed.At.IsZero() {
+			// WHAT THE SOURCE REPORTED, through the control goroutine. Idle is true only when a
+			// heartbeat was actually DELIVERED, which is what keeps it meaning "the source says this
+			// lane is quiet" rather than "the core cannot see anything happening" — a stuck lane is
+			// also quiet, and only one of the two is healthy. An idle lane's CheckpointAge is still
+			// reported truthfully; Idle is what tells an alert rule to ignore it.
+			idleSince, backlog, reportedLag := r.activity.observed(id)
+			if !idleSince.IsZero() {
+				ls.Idle = true
+				since := idleSince
+				ls.IdleSince = &since
+				f.idle++
+			}
+			ls.Backlog = backlog
+
+			// The SOURCE'S OWN event-time lag wins, because it knows what it has not read yet and the
+			// core does not. Falling back to differencing the committed position's observation time is
+			// still a real lag, just a weaker one: it says how old the newest thing canal has made
+			// durable is, not how far behind the newest thing that exists.
+			switch {
+			case reportedLag != nil:
+				ls.EventTimeLag = reportedLag
+			case st.CommittedOK && !st.Committed.At.IsZero():
 				lag := now.Sub(st.Committed.At).Seconds()
 				ls.EventTimeLag = &lag
 			}

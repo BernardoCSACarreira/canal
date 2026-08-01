@@ -99,10 +99,10 @@ func (r *runner) writeSet(ctx context.Context, id record.NodeID, records []*reco
 				if err := r.deadLetter(ctx, rec, ferr); err != nil {
 					return err
 				}
-				r.abandon(id, rec, ferr, rt.reason)
+				r.abandon(id, rec, ferr, rt.reason, at, att(rec).count)
 
 			case dispDrop:
-				r.abandon(id, rec, ferr, rt.reason)
+				r.abandon(id, rec, ferr, rt.reason, at, att(rec).count)
 
 			case dispStall:
 				// SCOPE (R10). The specified behaviour is to block THIS LANE and leave the rest of
@@ -214,11 +214,20 @@ func (r *runner) writeOnce(ctx context.Context, id record.NodeID, sk *registry.R
 // what stops a poison record livelocking the lane. It is logged at error level with the class and
 // the reason, because a record leaving the pipeline without reaching its destination is the single
 // most consequential thing this engine can do quietly.
-func (r *runner) abandon(id record.NodeID, rec *record.Record, ferr error, reason string) {
+func (r *runner) abandon(id record.NodeID, rec *record.Record, ferr error, reason string,
+	at record.Position, attempts int,
+) {
 	class := fault.ClassOf(ferr)
 	r.deps.Log.Error("a record will not be delivered",
 		"node", id, "record", rec.Origin().ID, "lane", rec.Origin().Lane,
 		"class", class, "blame", class.Blames(), "reason", reason, "error", ferr)
+
+	// THE SOURCE IS TOLD, if it asked to be. A terminal disposition is the one thing a source can
+	// never infer: the cursor advances past the record exactly as if it had been delivered, so
+	// without a nack a parked-message source parks nothing and an upstream that tracks failures
+	// records a success. Queued rather than called here, because this runs on the write path and
+	// Nack belongs to the source's control goroutine.
+	r.nack(rec, at, ferr, reason, attempts)
 
 	r.p.ledger.Settle([]ledger.Outcome{{
 		Record:      rec.Origin().ID,

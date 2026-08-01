@@ -6676,17 +6676,21 @@ is that every unknown is a nil pointer and never a zero:
 | Absent | Because |
 | --- | --- |
 | `PipelineStatus.Config` | The redacted tree needs each component's declared `config.Spec`, and `Build` does not keep the redaction it computes. It is the one field that can carry a secret, so absent is the safe direction |
-| `Backlog` | No source declares `BacklogReporter` |
 | `LaneStatus.Progress` | `record.Fraction` needs a lane's scalar bounds, and a lane declares only its current `Scalar` |
-| `Idle`, `IdleSince` | No source declares `Heartbeater`, so no lane has REPORTED itself quiet |
 | `NodeStatus.Utilization`, `.BlockedForSeconds` | Not measured anywhere in the engine |
 | `Buffers` | There is no buffer node type |
 | `WorkerStatus.LeaseExpires` | There are no leases until `store.Coordinator` exists |
 
 `LaneStatus.Position` and `.Resolved` are **present**: `record.Position.Label` is connector-authored
 and rendered verbatim, which is how the UI shows a meaningful position for an arbitrary connector with
-no connector-specific code, and `EventTimeLag` differences `Position.At` against now. A connector that
-supplies neither leaves both nil, which renders as unknown rather than as a position of zero.
+no connector-specific code. A connector that supplies neither leaves both nil, which renders as unknown
+rather than as a position of zero.
+
+`Backlog`, `Idle`, `IdleSince` and `EventTimeLag` come from the source's **control goroutine** (§23.1,
+`internal/engine/control.go`). `Idle` is set only when a heartbeat was ACCEPTED, which is what keeps it
+meaning "the source reports this lane quiet" rather than "the core cannot see anything happening" — a
+stuck lane is also quiet, and only one of the two is healthy. `EventTimeLag` prefers the source's own
+answer from `Backlog` and falls back to differencing the committed position's `At`.
 
 `Generation` and `ObservedGeneration` are both the running spec's `Revision`, because in a standalone
 run the spec canal loaded *is* the stored spec and there is no second copy to diverge from. The
@@ -8617,9 +8621,11 @@ sequenceDiagram
 **Most of this ordering is now observed rather than only specified.** `Open`, `Read`, `Commit` and
 `Close` are called in exactly this order by `internal/engine/run.go`, and the concurrency claim —
 `Commit` running while `Read` is blocked — is what the separate commit pump exists to make true.
-Write against the contract regardless: `Heartbeat`, `Backlog`, `Nack` and the assignment refresh have
-no caller yet, so the parts of this diagram that involve them are still specification. The
-interfaces are in `pkg/connector/source.go:15-98` and the enforcement is in `internal/ledger`.
+`Heartbeat`, `Backlog` and `Nack` are called by the source's control goroutine
+(`internal/engine/control.go`). The **assignment refresh** is the one part of this diagram still
+specification: assignments come from `store.Coordinator`, which has no implementation, so the set of
+lanes a worker holds cannot change after `Open` and there is nothing to refresh. The interfaces are in
+`pkg/connector/source.go:15-98` and the enforcement is in `internal/ledger`.
 
 The two consequences that catch every first-time author:
 
@@ -8977,16 +8983,19 @@ Designed and specified, but **not built** — do not plan around them landing on
 
 - the generic renderer. Nothing consumes the read model yet; `GET /status` serves the document and
   there is no UI on the other end of it.
+- the **assignment refresh**, the fourth thing a source's control goroutine is specified to do. It
+  needs `store.Coordinator`, so in this runtime a worker's lane set cannot change after `Open`.
 
   Position rendering, scan progress and the read model itself have come off this list.
   `engine.Pipeline.Status` constructs a `telemetry.PipelineStatus`, `cmd/canal` serves it at
   `GET /status`, cursor labels are rendered from `record.Position.Label`, and scan progress is
   computed from lane weights for any source with no connector code. What the document still cannot
   answer is tabulated in §16 rather than guessed at.
-- eight of the twenty-six metric names. `internal/metrics` exports eighteen; the rest measure things
-  that do not exist yet — buffer depth and refusals, dedupe, lane revocation, restart phases, node
-  utilization and node blocking. They are declared and unemitted, which under omit-don't-zero means
-  simply absent from a scrape.
+- seven of the twenty-six metric names. `internal/metrics` exports nineteen; the seven that remain
+  measure things that do not exist yet — `canal_buffer_depth_records`, `canal_buffer_refused_total`,
+  `canal_records_deduped_total`, `canal_lane_revoked_unsettled_records`,
+  `canal_restore_phase_seconds`, `canal_node_utilization_ratio` and `canal_node_blocked_seconds_total`.
+  They are declared and unemitted, which under omit-don't-zero means simply absent from a scrape.
 
   `canal_condition`, `canal_reconcile_delta_records` and `canal_oldest_pending_age_seconds` have come
   off this list with the read model, because the conditions are metrics as well as document fields —
@@ -9032,6 +9041,20 @@ capacity 2. There is no shared mutable state between nodes; a batch is handed ov
 A **source node** runs two goroutines and only two: the **read goroutine** (`Open`, `Read`, `Close`) and
 the **control goroutine** (`Commit`, `Heartbeat`, `Backlog`, `Nack`, and `Assigned` refreshes). The
 contract states that exactly, once, on `Source.Read`. Every other node kind runs one goroutine.
+
+Both exist. `internal/engine/control.go` is the control goroutine and `Deps.ControlInterval` is its
+cadence, which is also the idleness threshold — one number, because a lane that produced nothing since
+the last tick is quiet and the heartbeat carries the real elapsed duration rather than the interval. It
+is deliberately **not** derived from `FlushInterval`: that one bounds how much data replays after a
+crash, this one bounds how long an upstream pins its own retention with nothing to acknowledge.
+
+`Commit` runs in the shared commit pump rather than per source, because nothing in it is per-source.
+Backlog polling is round-robined under a per-tick cap: `Backlog` may be an expensive remote query and a
+pipeline may hold tens of thousands of lanes, so `Backlog.AsOf` is what makes the resulting staleness
+visible rather than a lie. `Nack` is event-driven, so the write path queues it — under a cap, dropping
+oldest and saying so — and the control goroutine drains it, including once more on the way out: a
+record abandoned in the final moments has already been committed past, and if the upstream is never
+told then nothing will ever tell it.
 
 ### 23.2 Every plugin call is sandboxed
 

@@ -24,13 +24,14 @@ go run ./cmd/canal check --spec your-pipeline.json
 | Durable state store | **real.** [`pkg/store/wal`](pkg/store/wal) is a hand-rolled write-ahead log: CRC32C framing, fsync before return, a torn tail truncated rather than refused, and a flock the kernel drops when the holder dies. |
 | Codecs | **three.** `raw` and `json` encoders, a `newline` framer. json+newline is ndjson; raw+newline is a log tail. |
 | Connectors | **two sources, two sinks.** `line_file` and `stdout` were written alongside the core; [`file`](internal/example/filesink) is a real `Flusher`, and [`http_push`](internal/stress/push-source) — one of the deliberately hostile stress connectors — runs end to end unmodified. |
-| Durability points | **two of four.** A sink is settled when `Write` returns cleanly, or when `Flusher.Flush` makes an accepted batch durable. `Committer` and `TokenSink` are still refused by [`engine.Executable`](internal/engine/build.go) rather than silently under-delivered. |
+| Durability points | **three of four.** A sink is settled when `Write` returns cleanly, when `Flusher.Flush` makes an accepted batch durable, or when the two-phase commit publishes a committable. Only `TokenSink` is still refused by [`engine.Executable`](internal/engine/build.go) rather than silently under-delivered. |
+| Checkpoints | **real.** [`engine.Checkpoint`](internal/engine/checkpoint.go) was a declared shape nothing constructed. It is now written on every flush — committables, lane cursors, writer state and header in ONE atomic batch — and read at open, where committables a previous run left in doubt are handed back to the sink that minted them. |
 | `internal/stress` — eight hostile connectors | **real.** 15,670 lines, kept as an interface-shape regression suite; the audit found five of the eight genuinely catch drift today. |
 | Fault routing | **real.** A connector states a `Class`, a fact; the engine computes the behaviour from (class, capabilities, policy). Throttling never spends a retry attempt, an indeterminate write against a non-idempotent sink fails loud rather than guessing, and a dead letter is delivered before the record is abandoned. |
 | Metrics | **real for fifteen of twenty-six names.** [`internal/metrics`](internal/metrics) accumulates and renders Prometheus text; `canal run --metrics :9090` serves it. An unmeasurable quantity is OMITTED rather than reported as zero, which is what makes `canal_checkpoint_age_seconds` usable as the primary alert. |
 | Buffers, transforms, multi-worker, a frontend, an API | **do not exist.** The interfaces do, and the negotiation refuses a pipeline that asks for one. |
 
-`go build ./...`, `go vet ./...`, `gofmt -l .` and `go test -race ./...` are clean: 149 test functions
+`go build ./...`, `go vet ./...`, `gofmt -l .` and `go test -race ./...` are clean: 152 test functions
 across 20 packages, 41 of them under `pkg/`. [CI](.github/workflows/ci.yml) runs all of that on Linux
 and macOS, cross-compiles for five targets, and verifies the module still has zero third-party
 dependencies.

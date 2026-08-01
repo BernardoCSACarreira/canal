@@ -2,6 +2,8 @@ package engine_test
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,6 +16,7 @@ import (
 	"github.com/BernardoCSACarreira/canal/pkg/record"
 	"github.com/BernardoCSACarreira/canal/pkg/registry"
 	"github.com/BernardoCSACarreira/canal/pkg/spec"
+	"github.com/BernardoCSACarreira/canal/pkg/store"
 	"github.com/BernardoCSACarreira/canal/pkg/store/wal"
 
 	// Registers stress_txn_warehouse, which implements Committer, WriterState and Flusher. It is
@@ -36,12 +39,45 @@ import (
 
 // committerSource is a source with capabilities strong enough that nothing on the source side caps
 // the negotiation. It reads nothing: the point is what Build promises, not what moves.
-type committerSource struct{}
+type committerSource struct{ done bool }
 
-func (*committerSource) Open(context.Context, connector.SourceRuntime) error { return nil }
-func (*committerSource) Read(context.Context, *record.Batch) error           { return fault.ErrEndOfInput }
-func (*committerSource) Commit(context.Context, connector.Ack) error         { return nil }
-func (*committerSource) Close(context.Context) error                         { return nil }
+func (c *committerSource) Open(ctx context.Context, rt connector.SourceRuntime) error {
+	as, err := rt.Lanes().Assigned(ctx)
+	if err != nil {
+		return err
+	}
+	if len(as) > 0 {
+		c.done = true // warm start: this fixture has nothing more to produce
+		return nil
+	}
+	_, err = rt.Lanes().Announce(ctx, connector.LaneSpec{
+		Name: "rows", Stream: "lines", Kind: connector.LaneKindScan,
+		Ordering: connector.OrderingPrefix, Boundedness: connector.Bounded, Group: "scan",
+	})
+	return err
+}
+
+// Read produces one batch and then ends, so the commit protocol has something real to publish.
+func (c *committerSource) Read(_ context.Context, dst *record.Batch) error {
+	if c.done {
+		return fault.ErrEndOfInput
+	}
+	c.done = true
+	dst.Reset()
+	for i := 0; i < 8; i++ {
+		r := dst.Add()
+		if r == nil {
+			break
+		}
+		r.Payload = record.BytesPayload([]byte(fmt.Sprintf("row-%d", i)))
+	}
+	var b [8]byte
+	b[7] = 8
+	dst.Position = record.Position{Token: record.Blob{Version: 1, Bytes: b[:]}, Safe: true, At: time.Now()}
+	return nil
+}
+func (*committerSource) Commit(context.Context, connector.Ack) error { return nil }
+func (*committerSource) Close(context.Context) error                 { return nil }
 
 func init() {
 	registry.AddSource(registry.Default, registry.SourceDef[*committerSource]{
@@ -76,7 +112,8 @@ func exactlyOnceSpec(dir string) spec.Spec {
 		Graph: []spec.Node{
 			{ID: "in", Kind: registry.KindSource, Name: "exactly_once_capable"},
 			{ID: "out", Kind: registry.KindSink, Name: "stress_txn_warehouse",
-				Config: map[string]any{"table": "t", "stage_uri": "file://" + dir},
+				Config: map[string]any{"table": "t", "stage_uri": "file://" + dir,
+					"codec": map[string]any{"encoder": "raw", "framer": "newline"}},
 				Inputs: []spec.Edge{{From: "in"}}},
 		},
 		Streams: []spec.StreamConfig{{
@@ -87,53 +124,74 @@ func exactlyOnceSpec(dir string) spec.Spec {
 	}
 }
 
-func TestRunRefusesAContractThisBuildCannotHonour(t *testing.T) {
+func TestACommitterPipelineRunsThroughTwoPhaseCommit(t *testing.T) {
 	dir := t.TempDir()
 	st, err := wal.Open(filepath.Join(dir, "state"))
 	if err != nil {
 		t.Fatalf("opening the store: %v", err)
 	}
-	defer st.Close()
 
 	p, neg, diags := engine.Build(context.Background(), registry.Default, exactlyOnceSpec(dir),
-		engine.Deps{State: st, Worker: "test", FlushInterval: 10 * time.Millisecond, GracePeriod: time.Second})
+		engine.Deps{State: st, Worker: "test", FlushInterval: 10 * time.Millisecond, GracePeriod: 5 * time.Second})
 	if diags.HasErrors() {
 		t.Fatalf("Build: %v", diags)
 	}
-	defer p.Close(context.Background())
 
-	// The negotiation itself is honest — the components really can do this between them. It is the
-	// ENGINE that cannot, and that is a different fact with a different lifetime.
+	// The negotiation reaches the strongest tier canal offers, and — the part that is new — the
+	// engine no longer refuses to run it.
 	if neg.Guarantee != connector.ExactlyOnce || neg.AckPoint != "commit" {
-		t.Fatalf("negotiated %s at %q; this test needs a commit ack point to be meaningful",
-			neg.Guarantee, neg.AckPoint)
+		t.Fatalf("negotiated %s at %q, want exactly_once at commit", neg.Guarantee, neg.AckPoint)
 	}
-
-	// Build WARNS rather than erroring, so it stays usable as the negotiation entry point.
-	var warned bool
+	if err := engine.Executable(neg); err != nil {
+		t.Fatalf("a commit ack point is implemented now, but Executable refused it: %v", err)
+	}
 	for _, d := range diags {
 		if strings.Contains(d.Message, "never calls connector.Committer") {
-			warned = true
+			t.Errorf("Build still warns that Committer is unimplemented: %v", d)
 		}
-	}
-	if !warned {
-		t.Errorf("Build did not warn that the contract is unexecutable:\n%v", diags)
 	}
 
-	// RUN REFUSES. This is the assertion that matters: nothing may move under a promise this build
-	// cannot keep.
-	err = p.Run(context.Background())
-	if err == nil {
-		t.Fatal("Run executed a pipeline promising exactly-once through a Committer the engine never calls")
+	if err := p.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
 	}
-	for _, want := range []string{"exactly_once", "commit", "connector.Committer"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("the refusal does not mention %q, so it does not say what would have to change:\n%v", want, err)
-		}
+	_ = p.Close(context.Background())
+	_ = st.Close()
+
+	// A checkpoint exists. Nothing in this module had ever constructed one.
+	cp := readCheckpoint(t, filepath.Join(dir, "state"))
+	if cp.Header.Format != engine.CheckpointFormat {
+		t.Errorf("checkpoint format is %d, want %d", cp.Header.Format, engine.CheckpointFormat)
 	}
-	if c := fault.ClassOf(err); c != fault.PermanentContract {
-		t.Errorf("the refusal is class %s, want permanent_contract: retrying cannot help", c)
+	if cp.Header.ID == 0 {
+		t.Error("the checkpoint carries no id; a higher id must subsume every lower one")
 	}
+	if cp.Header.Pipeline != "eo" || cp.Header.Worker != "test" {
+		t.Errorf("the header does not identify the writer: %+v", cp.Header)
+	}
+}
+
+// readCheckpoint decodes the durable checkpoint record.
+func readCheckpoint(t *testing.T, stateDir string) engine.Checkpoint {
+	t.Helper()
+	st, err := wal.Open(stateDir)
+	if err != nil {
+		t.Fatalf("reopening the store: %v", err)
+	}
+	defer st.Close()
+	key := store.CheckpointKey("acme", "eo")
+	got, err := st.Get(context.Background(), []store.Key{key})
+	if err != nil {
+		t.Fatalf("reading the checkpoint: %v", err)
+	}
+	v, ok := got[key.String()]
+	if !ok {
+		t.Fatal("no checkpoint was ever written")
+	}
+	var cp engine.Checkpoint
+	if err := json.Unmarshal(v.Value, &cp); err != nil {
+		t.Fatalf("decoding the checkpoint: %v", err)
+	}
+	return cp
 }
 
 // The complement, and the reason the check is a whitelist of one rather than a blacklist: an

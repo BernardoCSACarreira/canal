@@ -29,7 +29,9 @@ import (
 // Nothing is settled until it is decided. A record that will be retried holds its reference, so the
 // lane's prefix cannot advance past it, which is exactly the backpressure a struggling sink should
 // produce.
-func (r *runner) writeSet(ctx context.Context, id record.NodeID, records []*record.Record) error {
+func (r *runner) writeSet(ctx context.Context, id record.NodeID, records []*record.Record,
+	lane record.LaneID, at record.Position,
+) error {
 	sk := r.p.sinks[id]
 	cc := r.p.codecs[id]
 	policy := r.p.spec.Retry
@@ -47,7 +49,7 @@ func (r *runner) writeSet(ctx context.Context, id record.NodeID, records []*reco
 
 	pending := records
 	for len(pending) > 0 {
-		failed, err := r.writeOnce(ctx, id, sk, cc, pending)
+		failed, err := r.writeOnce(ctx, id, sk, cc, pending, lane, at)
 		if err != nil {
 			return err
 		}
@@ -127,7 +129,7 @@ func (r *runner) writeSet(ctx context.Context, id record.NodeID, records []*reco
 // A returned error is a failure of the ENGINE or a broken contract — never a failure of the write,
 // which is reported through the map so the caller can route it.
 func (r *runner) writeOnce(ctx context.Context, id record.NodeID, sk *registry.ResolvedSink,
-	cc *codecChain, pending []*record.Record,
+	cc *codecChain, pending []*record.Record, lane record.LaneID, at record.Position,
 ) (map[record.RecordID]error, error) {
 	reqs, err := buildRequests(ctx, sk, cc, pending)
 	if err != nil {
@@ -184,7 +186,7 @@ func (r *runner) writeOnce(ctx context.Context, id record.NodeID, sk *registry.R
 			landed = append(landed, rec)
 		}
 		// A sink that earns its acknowledgement later HOLDS instead of settling. See durability.go.
-		r.settleOrHold(id, sk, landed, res)
+		r.settleOrHold(id, sk, landed, res, lane, at)
 		if n := len(res.Duplicates); n > 0 {
 			r.p.obs.recordsDuplicate.Add(float64(n), r.p.obs.pipeline, string(id))
 		}

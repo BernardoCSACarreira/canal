@@ -39,6 +39,12 @@ type deferred struct {
 	mu      sync.Mutex
 	pending map[record.NodeID][]*record.Record
 
+	// covered is the highest position per lane among the records a node is holding. It is the
+	// DURABLE BLAST RADIUS a Committable has to carry: after a restart, "which span of which lane
+	// does this staged artifact cover" is answerable from the checkpoint alone, which is exactly
+	// when a failed commit needs to name what it is withholding.
+	covered map[record.NodeID]map[record.LaneID]record.Position
+
 	// flushing serialises Flush per node. SinkCaps.MaxConcurrency is one for every Flusher in the
 	// module and the contract permits a sink to assume it, so the record-count trigger below must
 	// not be able to run a second Flush alongside the flush loop's.
@@ -51,6 +57,7 @@ type deferred struct {
 func newDeferred(trigger int) *deferred {
 	return &deferred{
 		pending:  map[record.NodeID][]*record.Record{},
+		covered:  map[record.NodeID]map[record.LaneID]record.Position{},
 		flushing: map[record.NodeID]*sync.Mutex{},
 		trigger:  trigger,
 	}
@@ -75,14 +82,31 @@ func (d *deferred) due(node record.NodeID) bool {
 	return d.trigger > 0 && len(d.pending[node]) >= d.trigger
 }
 
-// hold records that a sink has accepted, pending its next successful flush.
-func (d *deferred) hold(node record.NodeID, recs []*record.Record) {
+// hold records that a sink has accepted, pending its next successful flush or commit.
+//
+// at is the position of the batch they arrived in, kept per lane so a committable can name the span
+// it covers.
+func (d *deferred) hold(node record.NodeID, recs []*record.Record, lane record.LaneID, at record.Position) {
 	if len(recs) == 0 {
 		return
 	}
 	d.mu.Lock()
 	d.pending[node] = append(d.pending[node], recs...)
+	if d.covered[node] == nil {
+		d.covered[node] = map[record.LaneID]record.Position{}
+	}
+	// Later batches from one lane arrive in order, so the last one seen is the furthest.
+	d.covered[node][lane] = at
 	d.mu.Unlock()
+}
+
+// takeCovered removes and returns the covered span for a node, alongside take.
+func (d *deferred) takeCovered(node record.NodeID) map[record.LaneID]record.Position {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := d.covered[node]
+	delete(d.covered, node)
+	return out
 }
 
 // take removes and returns everything held for a node, so the flush that follows owns them.
@@ -127,8 +151,13 @@ func (d *deferred) outstanding() map[record.NodeID]int {
 
 // defersDurability reports whether a sink earns its acknowledgement after Write returns.
 func defersDurability(sk *registry.ResolvedSink) bool {
-	return sk.Flusher != nil
+	return sk.Flusher != nil || sk.Committer != nil
 }
+
+// commitsDurability reports whether a sink publishes through the two-phase commit protocol rather
+// than through Flush. A sink implementing both is a Committer: its Flush is a signal carrier, and
+// the acknowledgement is earned at Commit, which is what AckPoint already says.
+func commitsDurability(sk *registry.ResolvedSink) bool { return sk.Committer != nil }
 
 // flushSinks makes every deferring sink's accepted records durable and settles them.
 //
@@ -139,6 +168,25 @@ func defersDurability(sk *registry.ResolvedSink) bool {
 func (r *runner) flushSinks(ctx context.Context, reason connector.FlushReason) {
 	for _, id := range r.mainSinks {
 		sk := r.p.sinks[id]
+		if sk.Flusher == nil {
+			continue
+		}
+
+		// A COMMITTER'S FLUSH IS A SIGNAL, NOT A DURABILITY POINT, and it must still be delivered.
+		//
+		// Its records are published by commit.go, so nothing is settled from the result — that is
+		// what keeps the operator-visible acknowledgement point at "commit" rather than sliding to
+		// "flush" as a side effect of the sink needing one bool. But skipping the CALL is a
+		// different thing entirely: internal/stress/txn-sink sets its finalize flag in Flush and
+		// reads it in the next PrepareCommit, so a skipped flush meant it never sealed an undersized
+		// file, answered RetryLater forever, and hung the drain. Found by running it.
+		if commitsDurability(sk) {
+			if err := r.signalFlush(ctx, id, sk, reason); err != nil {
+				r.fail(err)
+				return
+			}
+			continue
+		}
 		if !defersDurability(sk) {
 			continue
 		}
@@ -184,7 +232,7 @@ func (r *runner) flushSinks(ctx context.Context, reason connector.FlushReason) {
 // whole remaining move.
 func (r *runner) flushIfDue(ctx context.Context, id record.NodeID) {
 	sk := r.p.sinks[id]
-	if !defersDurability(sk) || !r.deferred.due(id) {
+	if !defersDurability(sk) || commitsDurability(sk) || !r.deferred.due(id) {
 		return
 	}
 	m := r.deferred.lock(id)
@@ -199,6 +247,25 @@ func (r *runner) flushIfDue(ctx context.Context, id record.NodeID) {
 	if err := r.flushOne(ctx, id, sk, held, connector.FlushCheckpoint); err != nil {
 		r.fail(err)
 	}
+}
+
+// signalFlush delivers a flush to a Committer purely for its reason.
+//
+// The WriteResult is deliberately discarded: a Committer's durability is earned at Commit, and
+// reading Failed or Deferred here would settle — or refuse to settle — records the commit protocol
+// owns. The only thing that matters is that the sink was told, and that a refusal is loud.
+func (r *runner) signalFlush(ctx context.Context, id record.NodeID, sk *registry.ResolvedSink,
+	reason connector.FlushReason,
+) error {
+	_, err := sandbox(ctx, r.p.obs, id, sk.Name, reason,
+		func(c context.Context, rn connector.FlushReason) (connector.WriteResult, error) {
+			return sk.Flusher.Flush(c, rn)
+		})
+	if err != nil {
+		r.p.obs.fault(id, err)
+		return fmt.Errorf("engine: signalling %s to sink %s: %w", reason, id, err)
+	}
+	return nil
 }
 
 // flushOne flushes one sink and settles what it made durable.
@@ -272,13 +339,13 @@ func (r *runner) reportUndrained() {
 // A sink that is durable on return settles now. One that defers holds, and the ledger keeps its
 // references until the flush that earns them.
 func (r *runner) settleOrHold(id record.NodeID, sk *registry.ResolvedSink,
-	landed []*record.Record, res connector.WriteResult,
+	landed []*record.Record, res connector.WriteResult, lane record.LaneID, at record.Position,
 ) {
 	if len(landed) == 0 {
 		return
 	}
 	if defersDurability(sk) {
-		r.deferred.hold(id, landed)
+		r.deferred.hold(id, landed, lane, at)
 		return
 	}
 	r.p.ledger.Settle(outcomesFor(id, landed, res))

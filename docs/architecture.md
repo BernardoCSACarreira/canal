@@ -8943,13 +8943,18 @@ Designed and specified, but **not built** — do not plan around them landing on
 - eleven of the twenty-six metric names. `internal/metrics` exports fifteen; the rest measure things
   that do not exist yet — buffer depth, dedupe, lane revocation, restart phases, node utilization.
   They are declared and unemitted, which under omit-don't-zero means simply absent from a scrape.
-- Committer, TokenSink and WriterState. All three are resolved by the registry and reported by the
-  negotiation; none has a caller. That gap USED TO BE SILENT — a capable source plus a Committer
-  sink negotiated exactly_once against an engine that settles on Write — and is now guarded by
-  `engine.Executable`, which warns at Build, refuses at Run before anything is opened, and exits
-  non-zero from `canal check`. Flusher came off this list: `internal/engine/durability.go` holds a
-  deferring sink's records until the flush that makes them durable, and flushes before the cursor is
-  persisted so phase two never names a position the destination has not accepted.
+- TokenSink, the strongest tier, where the destination stores canal's token transactionally with
+  the data. It is resolved by the registry, reported by the negotiation and called by nothing, so
+  `engine.Executable` still refuses it: warns at Build, refuses at Run before anything is opened,
+  and exits non-zero from `canal check`. That guard exists because the gap USED TO BE SILENT — a
+  capable source plus a Committer sink negotiated exactly_once against an engine that settled on
+  Write.
+
+  Flusher and Committer have both come off this list. `internal/engine/durability.go` holds a
+  deferring sink's records until the flush that makes them durable; `internal/engine/commit.go` runs
+  the two-phase commit and writes the first `Checkpoint` this module has ever constructed —
+  committables, cursors, writer state and header in one atomic batch, written BEFORE the commit so a
+  crash in that window is resolved at the next open rather than orphaning a staged artifact.
 - an out-of-process deployment. There is no `engine/remote` package.
 
 Retry with classified faults, the dead-letter route and the metric surface are no longer on this

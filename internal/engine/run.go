@@ -640,6 +640,14 @@ func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 			return
 		}
 
+		// A record its own source declared broken is disposed of before admission, for the same
+		// reason: it never takes a settlement reference and the position still advances over it.
+		batch, err = r.routeMarked(deliverCtx, id, batch)
+		if err != nil {
+			r.fail(err)
+			return
+		}
+
 		r.p.obs.recordsRead.Add(float64(batch.Len()), r.p.obs.pipeline, laneLabel(lane.ID), src.Name)
 		if batch.Len() > 0 {
 			// A lane that produced records is not quiet, which ends any idleness the control loop had

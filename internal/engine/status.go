@@ -425,7 +425,7 @@ func (r *runner) laneStatuses(now time.Time) ([]telemetry.LaneStatus, laneFacts)
 				Worker: string(r.deps.Worker),
 
 				RecordsRead:      st.RecordsRead,
-				RecordsCommitted: st.Settled,
+				RecordsCommitted: st.RecordsCommitted,
 				RecordsAbandoned: st.AbandonedTotal,
 				InFlight:         st.InFlight,
 				InFlightBudget:   st.InFlightBudget,

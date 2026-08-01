@@ -3,6 +3,7 @@ package memstore_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -151,30 +152,54 @@ func TestDeleteAdvancesTheStoreRevision(t *testing.T) {
 // about deletions it missed — nothing is retained to replay them from, and inventing one would claim
 // a pipeline was deleted when it may never have existed. That gap is why the interface says a watch
 // is a convenience: the reconcile timer closes it.
+//
+// THE SIZE OF THIS FIXTURE IS THE TEST. The catch-up ranges a Go map, so an implementation that
+// forgets to sort emits whatever order the runtime felt like — and over a handful of entries in one
+// bucket that order is a rotation of the insertion order, one of whose rotations IS sorted. The first
+// version of this used three pipelines and one watch, and deleting the store's sort failed it three
+// times in thirty runs: a test that mostly proves nothing. Twenty entries span several buckets and
+// six independent watches compound it, and the same deletion now fails it a hundred times out of a
+// hundred.
 func TestWatchCatchesUpOnWhatTheStoreStillHolds(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c := memstore.NewConfig()
 
-	c.Put(ctx, sp("acme", "p1"), 0)
-	second, _ := c.Put(ctx, sp("acme", "p2"), 0)
-	third, _ := c.Put(ctx, sp("acme", "p3"), 0)
-
-	// Connect as though the watcher had already seen everything up to p1.
-	events, err := c.Watch(ctx, second-1)
-	if err != nil {
-		t.Fatalf("Watch: %v", err)
+	c.Put(ctx, sp("acme", "p0"), 0)
+	var want []uint64
+	for i := 1; i <= 20; i++ {
+		rev, err := c.Put(ctx, sp("acme", record.PipelineID(fmt.Sprintf("p%02d", i))), 0)
+		if err != nil {
+			t.Fatalf("seeding: %v", err)
+		}
+		want = append(want, rev)
 	}
-	for _, want := range []uint64{second, third} {
-		if e := recv(t, events); e.Revision != want {
-			t.Errorf("caught up with revision %d, want %d in order", e.Revision, want)
+
+	// Connect as though each watcher had already seen everything up to p0.
+	for w := 0; w < 6; w++ {
+		events, err := c.Watch(ctx, want[0]-1)
+		if err != nil {
+			t.Fatalf("Watch: %v", err)
+		}
+		for _, rev := range want {
+			if e := recv(t, events); e.Revision != rev {
+				t.Fatalf("watch %d caught up with revision %d, want %d; the catch-up must be in "+
+					"revision order or a consumer cannot resume from what it last saw", w, e.Revision, rev)
+			}
 		}
 	}
 
-	// And then the live stream.
-	fourth, _ := c.Put(ctx, sp("acme", "p4"), 0)
-	if e := recv(t, events); e.Revision != fourth {
-		t.Errorf("the live event is revision %d, want %d", e.Revision, fourth)
+	// And then the live stream, on a fresh watch that drains its catch-up first.
+	events, err := c.Watch(ctx, 0)
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	for i := 0; i <= len(want); i++ {
+		recv(t, events)
+	}
+	live, _ := c.Put(ctx, sp("acme", "live"), 0)
+	if e := recv(t, events); e.Revision != live {
+		t.Errorf("the live event is revision %d, want %d", e.Revision, live)
 	}
 }
 

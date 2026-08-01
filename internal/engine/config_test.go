@@ -404,6 +404,41 @@ func TestStoppingDoesNotLeaveTheDocumentBlamingTheConfigStore(t *testing.T) {
 	}
 }
 
+// A CALLER WHO SETS Deps.Config AND NOTHING ELSE MUST GET A WORKING PIPELINE. ConfigInterval drives
+// a time.Ticker, and time.NewTicker panics on a non-positive duration — so the default is not a
+// convenience here, it is the difference between the config watch working and the run dying on its
+// first line. Every other test in this file sets the interval explicitly, which is exactly how that
+// would go unnoticed.
+func TestSettingOnlyTheConfigStoreIsEnoughToRun(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "input.txt")
+	writeLines(t, path, 2)
+
+	c := &collector{}
+	name := registerCollector(t, "config_default", c)
+	st, err := wal.Open(filepath.Join(dir, "state"))
+	if err != nil {
+		t.Fatalf("opening the store: %v", err)
+	}
+	defer st.Close()
+
+	p, _, diags := engine.Build(context.Background(), registry.Default, pipelineSpec(name, path),
+		engine.Deps{State: st, Worker: "test", Config: memstore.NewConfig(), GracePeriod: time.Second})
+	if diags.HasErrors() {
+		t.Fatalf("Build: %v", diags)
+	}
+	defer p.Close(context.Background())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := p.Run(ctx); err != nil {
+		t.Fatalf("Run with a config store and no ConfigInterval: %v", err)
+	}
+	if got := len(c.got()); got != 2 {
+		t.Errorf("the pipeline delivered %d of 2 records", got)
+	}
+}
+
 // --- store doubles -------------------------------------------------------------------------------
 
 // cancelAwareConfig answers the first Get and then blocks until its context is cancelled, which is

@@ -43,30 +43,47 @@ func (p *Pipeline) configView() *configView { return p.config.Load() }
 // It is immutable and published by pointer swap, so a status read never sees a half-updated
 // observation and never blocks the goroutine producing them.
 type configView struct {
-	// revision is the stored revision as of at. It is meaningful only when err is nil; when the last
-	// read failed it holds the last revision that WAS known, or zero if none ever was.
+	// revision is the stored revision, and known says whether it is one at all.
+	//
+	// THE FLAG IS NOT REDUNDANT WITH A ZERO REVISION. Zero is a legal stored revision — cmd/canal's
+	// file projection returns whatever the operator wrote in the file, and an operator who has never
+	// touched the field wrote zero — so the number cannot also carry "nothing was ever read". It
+	// stays true across a failed read, because "revision 7, four minutes ago" is worth rendering as
+	// long as the condition beside it says the number is stale; it goes false on a deletion, because
+	// then there genuinely is no stored revision.
 	revision uint64
+	known    bool
 
 	// deleted records that the store answered ErrNoSpec: the pipeline this worker is running is no
 	// longer stored. It is not an error — the store answered — which is why it is its own field.
 	deleted bool
 
-	// err is the last read's failure, if it failed. A view with a non-nil err still carries the last
-	// known revision, because "revision 7 as of four minutes ago" is a more useful thing to render
-	// than nothing at all, as long as the condition says the number is stale.
+	// err is the last read's failure, if it failed.
 	err error
 
-	at time.Time
+	// okAt is when the store last ANSWERED and at is when it was last ASKED. Two fields because the
+	// interesting number when a store is down is how long it has been down, and the time of the read
+	// that just failed is always now.
+	okAt time.Time
+	at   time.Time
 }
 
 // generation reports the stored revision to render, falling back to the applied one.
 //
-// A view that never got an answer has nothing better to offer than the running spec's own revision.
-// That is not a claim the two agree — the condition beside it says whether they do — it is the
-// document's Generation field having to hold a number.
+// A view with no stored revision to report — never read, or read and withdrawn — has nothing better
+// to offer than the running spec's own. That is not a claim the two agree; the condition beside it
+// says whether they do. It is the document's Generation field having to hold a number.
 func (v *configView) generation(applied uint64) uint64 {
-	if v == nil || v.revision == 0 {
+	if v == nil || !v.known {
 		return applied
+	}
+	return v.revision
+}
+
+// cursor is the revision a watch resumes from: what was last observed, or nothing.
+func (v *configView) cursor() uint64 {
+	if v == nil || !v.known {
+		return 0
 	}
 	return v.revision
 }
@@ -100,10 +117,17 @@ func configCondition(hasStore bool, v *configView, applied uint64) telemetry.Con
 			Message: fmt.Sprintf("revision %d is running but the pipeline is no longer stored", applied)}
 
 	case v.err != nil:
+		// MEASURED FROM THE LAST ANSWER, NOT THE LAST ATTEMPT. The read that just failed happened
+		// now, so timing from it would report every outage as a second old however long it had been
+		// going on — which is the one number an operator reads this message for.
+		since := "never"
+		if !v.okAt.IsZero() {
+			since = time.Since(v.okAt).Round(time.Second).String() + " ago"
+		}
 		return telemetry.Condition{Status: telemetry.StatusUnknown,
 			Reason: telemetry.ReasonConfigStoreUnreachable,
-			Message: fmt.Sprintf("revision %d is running; the config store last answered %s ago: %v",
-				applied, time.Since(v.at).Round(time.Second), v.err)}
+			Message: fmt.Sprintf("revision %d is running; the config store last answered %s: %v",
+				applied, since, v.err)}
 	}
 	return specApplied(v.revision, applied)
 }
@@ -143,7 +167,7 @@ func (r *runner) configLoop(ctx context.Context) {
 	// The watch resumes from the revision just observed, so a change between that read and this call
 	// is delivered rather than skipped.
 	var events <-chan store.ConfigEvent
-	if ch, err := r.deps.Config.Watch(ctx, r.p.configView().generation(0)); err != nil {
+	if ch, err := r.deps.Config.Watch(ctx, r.p.configView().cursor()); err != nil {
 		// LOGGED ONCE, AT DEBUG. A store with no watch is a supported deployment — the file-projected
 		// config store in cmd/canal is one — so this is not a warning, and repeating it every tick
 		// would make the log useless.
@@ -189,15 +213,18 @@ func (r *runner) readConfig(ctx context.Context) {
 		return
 	}
 
+	now := time.Now()
 	prev := r.p.configView()
-	v := &configView{at: time.Now()}
+	v := &configView{at: now}
 	if prev != nil {
-		v.revision = prev.revision
+		v.revision, v.known, v.okAt = prev.revision, prev.known, prev.okAt
 	}
 
 	switch {
 	case errors.Is(err, store.ErrNoSpec):
-		v.deleted = true
+		// THE STORE ANSWERED, so this counts as an answer — and there is no stored revision left to
+		// carry forward, which is what separates a withdrawal from a stale reading.
+		v.deleted, v.known, v.okAt = true, false, now
 	case err != nil:
 		v.err = err
 	case s.Tenant != r.p.spec.Tenant || s.ID != r.p.spec.ID:
@@ -207,7 +234,7 @@ func (r *runner) readConfig(ctx context.Context) {
 		v.err = fmt.Errorf("the config store answered %s/%s for a read of %s/%s",
 			s.Tenant, s.ID, r.p.spec.Tenant, r.p.spec.ID)
 	default:
-		v.revision = rev
+		v.revision, v.known, v.okAt = rev, true, now
 	}
 	r.p.config.Store(v)
 }

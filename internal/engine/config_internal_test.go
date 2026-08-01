@@ -2,6 +2,7 @@ package engine
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,10 +38,25 @@ func TestConfigConditionSeparatesTheFourWaysThereIsNoComparison(t *testing.T) {
 			"opposite states and a reader cannot act on either without telling them apart")
 	}
 
-	down := configCondition(true, &configView{revision: 4, err: errors.New("boom"), at: now}, 5)
+	down := configCondition(true, &configView{
+		revision: 4, known: true, err: errors.New("boom"),
+		okAt: now.Add(-90 * time.Minute), at: now,
+	}, 5)
 	if down.Status != telemetry.StatusUnknown || down.Reason != telemetry.ReasonConfigStoreUnreachable {
 		t.Errorf("with an unreachable store: %s/%s, want unknown/config_store_unreachable",
 			down.Status, down.Reason)
+	}
+	// TIMED FROM THE LAST ANSWER, NOT THE LAST ATTEMPT. The read that failed happened now, so a
+	// message timed from it reports every outage as seconds old however long it has been going on —
+	// and how long it has been going on is the one thing this message is read for.
+	if !strings.Contains(down.Message, "1h30m0s") {
+		t.Errorf("the message %q does not say the store has been unreachable for an hour and a "+
+			"half; timing from the failed read would make an old outage look brand new", down.Message)
+	}
+	// A store that has never once answered says so rather than claiming a duration.
+	never := configCondition(true, &configView{err: errors.New("boom"), at: now}, 5)
+	if !strings.Contains(never.Message, "never") {
+		t.Errorf("the message %q invents an age for a store that has never answered", never.Message)
 	}
 
 	gone := configCondition(true, &configView{deleted: true, at: now}, 5)
@@ -49,10 +65,10 @@ func TestConfigConditionSeparatesTheFourWaysThereIsNoComparison(t *testing.T) {
 	}
 
 	// And with an actual observation it delegates to the arithmetic rather than reimplementing it.
-	if got := configCondition(true, &configView{revision: 5, at: now}, 5); got != specApplied(5, 5) {
+	if got := configCondition(true, &configView{revision: 5, known: true, at: now}, 5); got != specApplied(5, 5) {
 		t.Errorf("an observed matching revision gave %v, not specApplied's own answer", got)
 	}
-	if got := configCondition(true, &configView{revision: 6, at: now}, 5); got != specApplied(6, 5) {
+	if got := configCondition(true, &configView{revision: 6, known: true, at: now}, 5); got != specApplied(6, 5) {
 		t.Errorf("an observed divergent revision gave %v, not specApplied's own answer", got)
 	}
 }
@@ -69,10 +85,27 @@ func TestGenerationFallsBackToTheRunningRevision(t *testing.T) {
 	}
 	// A view that failed AFTER a good read keeps the last number it knew: "revision 4, four minutes
 	// ago" is more useful than nothing, and the condition beside it says the number is stale.
-	if got := (&configView{revision: 4, err: errors.New("boom")}).generation(7); got != 4 {
+	stale := &configView{revision: 4, known: true, err: errors.New("boom")}
+	if got := stale.generation(7); got != 4 {
 		t.Errorf("a view holding a stale revision gave generation %d, want the last known 4", got)
 	}
-	if got := (&configView{revision: 9}).generation(7); got != 9 {
+	if got := (&configView{revision: 9, known: true}).generation(7); got != 9 {
 		t.Errorf("an observed revision gave generation %d, want 9", got)
+	}
+	// A WITHDRAWN SPEC HAS NO STORED REVISION AT ALL, so the last one it had is not the answer.
+	if got := (&configView{revision: 4, deleted: true}).generation(7); got != 7 {
+		t.Errorf("a deleted spec reported generation %d; nothing is stored, so the last revision "+
+			"that was is not a stored revision", got)
+	}
+
+	// ZERO IS A LEGAL STORED REVISION, which is why the view carries a flag and not just a number.
+	// cmd/canal's file projection returns whatever the operator wrote, and an operator who never
+	// touched the field wrote zero. Inferring "never read" from a zero would report the running
+	// revision as the stored one for exactly the pipelines whose config is being ignored.
+	if got := (&configView{revision: 0, known: true}).generation(7); got != 0 {
+		t.Errorf("an observed revision of 0 reported generation %d, want 0", got)
+	}
+	if c := configCondition(true, &configView{revision: 0, known: true}, 7); c.Status != telemetry.StatusFalse {
+		t.Errorf("a stored revision of 0 against a running 7 is %s, want false", c.Status)
 	}
 }

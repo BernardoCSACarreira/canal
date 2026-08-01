@@ -4,15 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"sync/atomic"
 	"time"
 
 	"github.com/BernardoCSACarreira/canal/internal/engine"
 	"github.com/BernardoCSACarreira/canal/internal/metrics"
+	"github.com/BernardoCSACarreira/canal/pkg/record"
+	"github.com/BernardoCSACarreira/canal/pkg/telemetry"
 )
 
 // statusSource hands the listener a pipeline once there is one.
@@ -92,7 +96,12 @@ func observabilityMux(reg *metrics.Registry, src *statusSource, log *slog.Logger
 			http.Error(w, "the pipeline has not been built yet", http.StatusServiceUnavailable)
 			return
 		}
-		st := p.Status()
+		q, qerr := parseStatusQuery(r.URL.Query())
+		if qerr != nil {
+			http.Error(w, qerr.Error(), http.StatusBadRequest)
+			return
+		}
+		st := p.Status(q)
 		body, err := json.MarshalIndent(st, "", "  ")
 		if err != nil {
 			// Before the status line, so this one CAN be a 500 — and it means a field of the read model
@@ -117,4 +126,32 @@ func observabilityMux(reg *metrics.Registry, src *statusSource, log *slog.Logger
 		http.Error(w, "canal exposes /metrics and /status and nothing else", http.StatusNotFound)
 	})
 	return mux
+}
+
+// parseStatusQuery reads the selection parameters off the URL.
+//
+// THE QUERY IS IMPLEMENTED, not merely declared. telemetry.StatusQuery exists so the document's
+// shape can absorb pagination later without a wire break — and a selector nothing honours is the
+// declared-and-inert pattern that has produced most of this repository's defects, so /status honours
+// it now against the one worker it has.
+//
+//	?stream=orders   only that stream's lanes
+//	?limit=50        page size; 0 asks for none, which is what a health banner wants
+//	?cursor=<opaque> continue from a previous response's lanesCursor
+//
+// A BAD PARAMETER IS A 400, never a silent default. "limit=fifty" quietly becoming the default page
+// is how an operator concludes the endpoint ignores them.
+func parseStatusQuery(v url.Values) (telemetry.StatusQuery, error) {
+	q := telemetry.StatusQuery{
+		Stream:     record.StreamName(v.Get("stream")),
+		LaneCursor: v.Get("cursor"),
+	}
+	if raw := v.Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			return q, fmt.Errorf("limit must be a non-negative integer, got %q", raw)
+		}
+		q.LaneLimit = &n
+	}
+	return q, nil
 }

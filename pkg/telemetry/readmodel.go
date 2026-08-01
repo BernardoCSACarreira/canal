@@ -33,6 +33,15 @@ type PipelineStatus struct {
 	// Missing names the worker ids not heard from.
 	Missing []string `json:"missing,omitempty"`
 
+	// StaleAfterSeconds is the age past which a worker's last report stops counting, and it is what
+	// makes Complete falsifiable.
+	//
+	// "We heard from every worker" is not a claim until "heard from" has a definition. Without a
+	// stated threshold an aggregator can call a document complete on reports of any age, and the one
+	// field that exists to admit partial knowledge quietly stops admitting anything. Nil means no
+	// threshold applies — a single worker reporting on itself has heard from every worker there is.
+	StaleAfterSeconds *float64 `json:"staleAfterSeconds"`
+
 	Phase      Phase       `json:"phase"`
 	Conditions []Condition `json:"conditions,omitempty"`
 
@@ -49,12 +58,27 @@ type PipelineStatus struct {
 	Buffers    []BufferStatus `json:"buffers,omitempty"`
 	Workers    []WorkerStatus `json:"workers,omitempty"`
 
+	// Streams is the per-stream rollup, and it is what makes a large pipeline answerable at all.
+	//
+	// ScanProgress used to be the only rollup in this document, so a UI asking "which of my 900
+	// tables is behind" had to download every lane to find out. Streams is bounded by the number of
+	// STREAMS rather than by the number of lanes, which is the difference between 900 rows and the
+	// 29,000 a 900-table snapshot at 32-way chunking produces.
+	Streams []StreamStatus `json:"streams,omitempty"`
+
 	// LaneCount is how many lanes EXIST; Lanes carries at most one page of them and LanesTruncated
 	// says so. A source with 900 streams or 10^5 scan chunks makes an unpaginated lane array the
 	// largest thing in the document and the slowest thing in the UI, and a silently short array is
 	// the same lie as a status document that omits a worker.
 	LaneCount      int  `json:"laneCount"`
 	LanesTruncated bool `json:"lanesTruncated"`
+
+	// LanesCursor continues the lane list, and it is empty when this page is the last.
+	//
+	// OPAQUE ON PURPOSE. It is a keyset today — the id of the last lane on this page — and nothing
+	// outside the producer may parse it, so the implementation can become an index, a shard key or a
+	// per-worker fan-out cursor without a wire change. Feed it back as [StatusQuery.LaneCursor].
+	LanesCursor string `json:"lanesCursor,omitempty"`
 
 	// Scan is nil when no scan lane exists, so the UI stops showing a scan bar without anything
 	// switching on a phase.
@@ -65,6 +89,64 @@ type PipelineStatus struct {
 
 	// Config is the REDACTED config tree. It is the only form that ever leaves the process.
 	Config map[string]any `json:"config,omitempty"`
+}
+
+// StatusQuery selects which part of the read model to materialise.
+//
+// IT EXISTS BEFORE PAGINATION DOES, and that is the whole point. PipelineStatus is a pinned wire
+// contract with an ETag/SSE protocol built on Version; splitting the document later would change the
+// document, the stream and [store.StatusStore] at the same moment. Deciding the SHAPE now costs a
+// struct, and every implementation that arrives later fits inside it.
+//
+// The zero query is the default view and is what a scrape or a first page asks for.
+type StatusQuery struct {
+	// Stream narrows Lanes to one stream. It is the drill-down half of the Streams rollup: read the
+	// rollup to find which of 900 tables is behind, then ask for that one table's lanes.
+	Stream record.StreamName `json:"stream,omitempty"`
+
+	// LaneCursor continues from a previous page's [PipelineStatus.LanesCursor]. Opaque; a caller
+	// echoes it back and never constructs one.
+	LaneCursor string `json:"laneCursor,omitempty"`
+
+	// LaneLimit is how many lanes to return. Nil is the producer's default; 0 asks for NONE, which is
+	// what a health banner wants — it needs the phase, the conditions and the rollup, and downloading
+	// lanes to render none of them is the cost this field removes.
+	//
+	// A pointer because nil and 0 are different requests, which is this package's rule everywhere
+	// else and is exactly the distinction a plain int cannot make.
+	LaneLimit *int `json:"laneLimit,omitempty"`
+}
+
+// StreamStatus is one stream's lanes, rolled up.
+//
+// AGGREGATION IS BY MAX FOR AGES AND BY SUM FOR COUNTS, and the choice is not cosmetic: the alert on
+// a stream is its WORST lane, so an average would hide one stuck chunk behind thirty-one healthy
+// ones. Every pointer here is nil when no lane could answer, never zero.
+type StreamStatus struct {
+	Stream record.StreamName `json:"stream"`
+
+	Lanes         int `json:"lanes"`
+	LanesFinished int `json:"lanesFinished"`
+	LanesBlocked  int `json:"lanesBlocked"`
+
+	// LanesIdle counts the lanes a source has REPORTED quiet, which is what lets a rollup distinguish
+	// a stream with nothing to say from one that is stuck.
+	LanesIdle int `json:"lanesIdle"`
+
+	RecordsRead      uint64 `json:"recordsRead"`
+	RecordsCommitted uint64 `json:"recordsCommitted"`
+	RecordsAbandoned uint64 `json:"recordsAbandoned"`
+	InFlight         uint64 `json:"inFlight"`
+
+	// MaxCheckpointAge is the oldest durable cursor among this stream's lanes: the number an alert
+	// fires on. MaxEventTimeLag is the same idea for event time.
+	MaxCheckpointAge *float64 `json:"maxCheckpointAgeSeconds"`
+	MaxEventTimeLag  *float64 `json:"maxEventTimeLagSeconds"`
+
+	// Backlog is summed across the stream's lanes, and only when EVERY lane could answer. A partial
+	// sum reads as a small backlog rather than as an unknown one, which is the more dangerous of the
+	// two mistakes.
+	Backlog *Backlog `json:"backlog"`
 }
 
 // Throughput is the pipeline-level rate summary. Every field is a pointer because a pipeline that has

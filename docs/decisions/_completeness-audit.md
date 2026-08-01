@@ -253,6 +253,27 @@ plus the secret reference format (G7).
 
 ## G5. The read model does not survive the effort's own scale targets
 
+> **Shape decided and built** (`pkg/telemetry/readmodel.go`, `internal/engine/status.go`,
+> `cmd/canal/serve.go`). The minimum decision this item asked for was the *shape*, so that pagination
+> could arrive without a breaking change; what landed is the shape plus a working single-worker
+> implementation, because a selector nothing honours is the declared-and-inert pattern that has
+> produced most of this repository's defects.
+>
+> - `telemetry.StatusQuery{Stream, LaneCursor, LaneLimit}` selects. `LaneLimit` is a pointer because
+>   nil (the producer's default) and 0 (a health banner that wants no lanes at all) are different
+>   requests.
+> - `PipelineStatus.LanesCursor` continues the list, **keyset not offset**, documented opaque so it
+>   can become an index or a per-worker fan-out token later.
+> - `PipelineStatus.Streams` is the per-stream rollup: bounded by stream count, max for ages, sum for
+>   counts, computed from every lane before filtering.
+> - `PipelineStatus.StaleAfterSeconds` gives `Complete` a definition.
+> - `store.StatusStore.Aggregate` takes the query. Nothing implements it yet, which is exactly why
+>   changing the signature was free.
+>
+> Still open from this item: no per-group rollup, and `Aggregate`'s O(workers x lanes) merge is
+> unwritten rather than solved.
+
+
 `telemetry.PipelineStatus` inlines `Lanes []LaneStatus`, `Nodes`, `Buffers`, `Workers` and `RecentEvents`
 as complete slices. `LaneStatus` is ~30 fields. There is no pagination, no filter, no projection, no
 per-stream or per-group rollup, and no cap.

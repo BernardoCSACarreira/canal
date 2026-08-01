@@ -19,6 +19,16 @@ type StatusStore interface {
 	//
 	// It MUST set Complete false and populate Missing when it did not hear from every known worker. A
 	// status document that silently omits a worker is the same lie as a health check returning 200 for
-	// a broken pipeline, and it is the one thing an aggregator is uniquely able to get wrong.
-	Aggregate(ctx context.Context, t record.TenantID, id record.PipelineID) (telemetry.PipelineStatus, error)
+	// a broken pipeline, and it is the one thing an aggregator is uniquely able to get wrong. It MUST
+	// also set StaleAfterSeconds to the age past which it stops counting a worker's last report,
+	// because "heard from" is not a claim until it has a definition.
+	//
+	// THE QUERY IS HERE BEFORE ANY IMPLEMENTATION IS. This signature took no cursor, offset or limit,
+	// against an effort whose own targets are 900 runtime-discovered streams at 32-way chunking —
+	// ~29,000 lanes in one pipeline — and 400 pipelines across 40 pods, which is 16,000 whole
+	// documents in flight with an O(workers x lanes) merge per read. Adding selection later would
+	// change this interface, the document and the SSE protocol in one breaking step. Adding it now,
+	// while nothing implements it, costs one parameter.
+	Aggregate(ctx context.Context, t record.TenantID, id record.PipelineID,
+		q telemetry.StatusQuery) (telemetry.PipelineStatus, error)
 }

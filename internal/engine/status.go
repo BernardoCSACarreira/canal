@@ -89,7 +89,7 @@ type nodeTally struct {
 // It is safe to call at any time, including before Run and after it returns — a completed bounded
 // pipeline still has to be able to say what it did, and a pipeline that has never started reports
 // [telemetry.PhasePending] rather than an empty document.
-func (p *Pipeline) Status() telemetry.PipelineStatus {
+func (p *Pipeline) Status(q telemetry.StatusQuery) telemetry.PipelineStatus {
 	now := time.Now()
 	s := telemetry.PipelineStatus{
 		Tenant:   p.spec.Tenant,
@@ -112,13 +112,18 @@ func (p *Pipeline) Status() telemetry.PipelineStatus {
 		Negotiated: p.negotiated,
 	}
 
+	// A SINGLE WORKER REPORTING ON ITSELF HAS NO STALENESS THRESHOLD, and nil says so rather than
+	// inventing a number. The field starts meaning something when store.StatusStore.Aggregate exists
+	// and has to decide whose last report still counts.
+	s.StaleAfterSeconds = nil
+
 	r := p.active.Load()
 	if r == nil {
 		s.Phase = telemetry.PhasePending
 		s.Conditions = pendingConditions(now, p.spec.Revision)
 		return s
 	}
-	r.fillStatus(&s, now)
+	r.fillStatus(&s, now, q)
 	return s
 }
 
@@ -148,7 +153,7 @@ func pendingConditions(now time.Time, gen uint64) []telemetry.Condition {
 }
 
 // fillStatus completes a document from live runner state.
-func (r *runner) fillStatus(s *telemetry.PipelineStatus, now time.Time) {
+func (r *runner) fillStatus(s *telemetry.PipelineStatus, now time.Time, q telemetry.StatusQuery) {
 	r.status.mu.Lock()
 	phase := r.status.phase
 	stopping, deadline := r.status.stoppingSince, r.status.drainDeadline
@@ -164,14 +169,14 @@ func (r *runner) fillStatus(s *telemetry.PipelineStatus, now time.Time) {
 	}
 
 	lanes, facts := r.laneStatuses(now)
+
+	// THE ROLLUP IS COMPUTED FROM EVERY LANE, before any filtering or paging. A per-stream summary
+	// that only summarised the page would be worse than none: it would look like an answer and be a
+	// statement about an arbitrary subset.
+	s.Streams = rollUpStreams(lanes)
 	s.LaneCount = len(lanes)
-	if len(lanes) > maxLanesPerDocument {
-		// A SILENTLY SHORT ARRAY IS THE SAME LIE AS AN OMITTED WORKER. The cut is announced even
-		// though — as the architecture says of this exact field — no API can yet page through the
-		// rest.
-		lanes = lanes[:maxLanesPerDocument]
-		s.LanesTruncated = true
-	}
+
+	lanes, s.LanesCursor, s.LanesTruncated = pageLanes(lanes, q)
 	s.Lanes = lanes
 	s.Nodes = r.nodeStatuses(facts)
 	s.Scan = r.scanProgress(now, facts)
@@ -185,9 +190,166 @@ func (r *runner) fillStatus(s *telemetry.PipelineStatus, now time.Time) {
 	s.Conditions = r.conditions(now, facts)
 }
 
-// maxLanesPerDocument bounds the lane array. A source with a lane per scan chunk makes an
-// unpaginated array the largest thing in the document and the slowest thing in the renderer.
+// maxLanesPerDocument is the DEFAULT page, not a hard cap: a caller that wants more asks for more,
+// and a caller that asks for nothing gets one page rather than a source's whole scan-chunk table.
 const maxLanesPerDocument = 200
+
+// pageLanes applies a StatusQuery to the full, sorted lane list.
+//
+// KEYSET, NOT OFFSET. The cursor is the id of the last lane on the page and the next page is
+// everything after it, so a lane finishing between two reads shifts nothing: an offset would skip a
+// row every time the list shrank behind the reader. The list is sorted by id in laneStatuses, which
+// is what makes this well defined.
+//
+// The cursor is documented as opaque so this can become an index, a shard key or a per-worker
+// fan-out token later without a wire change.
+func pageLanes(all []telemetry.LaneStatus, q telemetry.StatusQuery) (page []telemetry.LaneStatus,
+	cursor string, truncated bool,
+) {
+	if q.Stream != "" {
+		kept := make([]telemetry.LaneStatus, 0, len(all))
+		for _, l := range all {
+			if l.Stream == string(q.Stream) {
+				kept = append(kept, l)
+			}
+		}
+		all = kept
+	}
+	if q.LaneCursor != "" {
+		for i, l := range all {
+			if string(l.ID) > q.LaneCursor {
+				all = all[i:]
+				break
+			}
+			if i == len(all)-1 {
+				all = nil
+			}
+		}
+	}
+
+	limit := maxLanesPerDocument
+	if q.LaneLimit != nil {
+		limit = *q.LaneLimit
+	}
+	if limit < 0 {
+		limit = 0
+	}
+	if len(all) <= limit {
+		return all, "", false
+	}
+
+	// A SILENTLY SHORT ARRAY IS THE SAME LIE AS AN OMITTED WORKER, so the cut is announced — and now
+	// it is also followable, which is what LanesTruncated used to admit it was not.
+	page = all[:limit]
+	truncated = true
+	if limit > 0 {
+		cursor = string(page[limit-1].ID)
+	} else if len(all) > 0 {
+		// Asked for no lanes at all: the caller wants the banner and the rollup. The cursor still
+		// points at the start of the list so the same query can be paged from without a second round
+		// trip to discover where to begin.
+		cursor = ""
+	}
+	return page, cursor, truncated
+}
+
+// rollUpStreams summarises every lane by stream.
+//
+// Sorted by stream name so two reads of an unchanged pipeline produce the same document.
+func rollUpStreams(lanes []telemetry.LaneStatus) []telemetry.StreamStatus {
+	if len(lanes) == 0 {
+		return nil
+	}
+	type acc struct {
+		st        telemetry.StreamStatus
+		backlog   telemetry.Backlog
+		haveAll   bool
+		anyAnswer bool
+	}
+	byStream := map[string]*acc{}
+	order := make([]string, 0, 8)
+
+	for i := range lanes {
+		l := &lanes[i]
+		a, ok := byStream[l.Stream]
+		if !ok {
+			a = &acc{st: telemetry.StreamStatus{Stream: record.StreamName(l.Stream)}, haveAll: true}
+			byStream[l.Stream] = a
+			order = append(order, l.Stream)
+		}
+		a.st.Lanes++
+		if l.Finished {
+			a.st.LanesFinished++
+		}
+		if l.Blocked {
+			a.st.LanesBlocked++
+		}
+		if l.Idle {
+			a.st.LanesIdle++
+		}
+		a.st.RecordsRead += l.RecordsRead
+		a.st.RecordsCommitted += l.RecordsCommitted
+		a.st.RecordsAbandoned += l.RecordsAbandoned
+		a.st.InFlight += l.InFlight
+
+		// MAX, not mean. The alert on a stream is its worst lane, and an average hides one stuck
+		// chunk behind thirty-one healthy ones.
+		if l.CheckpointAge != nil && (a.st.MaxCheckpointAge == nil || *l.CheckpointAge > *a.st.MaxCheckpointAge) {
+			v := *l.CheckpointAge
+			a.st.MaxCheckpointAge = &v
+		}
+		if l.EventTimeLag != nil && (a.st.MaxEventTimeLag == nil || *l.EventTimeLag > *a.st.MaxEventTimeLag) {
+			v := *l.EventTimeLag
+			a.st.MaxEventTimeLag = &v
+		}
+
+		// A SUM OVER SOME OF THE LANES IS NOT A BACKLOG. One lane that cannot answer makes the stream's
+		// total unknown, because a partial sum reads as a small backlog rather than as an absent one —
+		// and of the two mistakes that is the dangerous one.
+		if l.Backlog == nil {
+			a.haveAll = false
+			continue
+		}
+		a.anyAnswer = true
+		if l.Backlog.Records != nil && a.backlog.Records == nil {
+			var z uint64
+			a.backlog.Records = &z
+		}
+		if l.Backlog.Records != nil {
+			*a.backlog.Records += *l.Backlog.Records
+		} else {
+			a.haveAll = false
+		}
+		if l.Backlog.Bytes != nil {
+			if a.backlog.Bytes == nil {
+				var z uint64
+				a.backlog.Bytes = &z
+			}
+			*a.backlog.Bytes += *l.Backlog.Bytes
+		}
+		// Exact only if every contributing lane was exact, and AsOf is the OLDEST reading, because a
+		// sum is only as fresh as its stalest term.
+		if a.st.Lanes == 1 || a.backlog.AsOf.After(l.Backlog.AsOf) {
+			a.backlog.AsOf = l.Backlog.AsOf
+		}
+		a.backlog.Exact = a.backlog.Exact || a.st.Lanes == 1
+		if !l.Backlog.Exact {
+			a.backlog.Exact = false
+		}
+	}
+
+	sort.Strings(order)
+	out := make([]telemetry.StreamStatus, 0, len(order))
+	for _, name := range order {
+		a := byStream[name]
+		if a.haveAll && a.anyAnswer {
+			b := a.backlog
+			a.st.Backlog = &b
+		}
+		out = append(out, a.st)
+	}
+	return out
+}
 
 // laneFacts is what one pass over the lanes learned, so the conditions, the node rollup, the scan
 // bar and the rates are all computed from ONE observation rather than from four that disagree.

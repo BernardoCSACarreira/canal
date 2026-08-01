@@ -18,9 +18,10 @@ import (
 // guarantee as the read model grows.
 func documents() []any {
 	return []any{
-		PipelineStatus{}, Negotiated{}, NodeStatus{}, LaneStatus{},
+		PipelineStatus{}, Negotiated{}, NodeStatus{}, LaneStatus{}, StreamStatus{},
 		BufferStatus{}, WorkerStatus{}, Throughput{}, ScanProgress{},
 		Condition{}, Event{}, FaultInfo{}, DefaultNote{}, Downgrade{}, NodeContract{},
+		StatusQuery{},
 	}
 }
 
@@ -106,6 +107,7 @@ func TestPopulatedCollectionsStillAppear(t *testing.T) {
 		Lanes:        []LaneStatus{{}},
 		Buffers:      []BufferStatus{{}},
 		Workers:      []WorkerStatus{{}},
+		Streams:      []StreamStatus{{}},
 		RecentEvents: []Event{{}},
 		Negotiated:   Negotiated{Why: []string{"because"}, Defaults: []DefaultNote{{}}},
 	}
@@ -115,7 +117,7 @@ func TestPopulatedCollectionsStillAppear(t *testing.T) {
 	}
 	for _, want := range []string{
 		`"missing":`, `"conditions":`, `"nodes":`, `"lanes":`,
-		`"buffers":`, `"workers":`, `"recentEvents":`, `"why":`, `"defaults":`,
+		`"buffers":`, `"workers":`, `"streams":`, `"recentEvents":`, `"why":`, `"defaults":`,
 	} {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("populated collection %s vanished from the document: %s", want, b)

@@ -132,7 +132,7 @@ func TestConnectedNeverImpliesProgressing(t *testing.T) {
 	var s telemetry.PipelineStatus
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
-		s = p.Status()
+		s = p.Status(telemetry.StatusQuery{})
 		src := conditionOf(t, s, telemetry.CondSourceReady)
 		prog := conditionOf(t, s, telemetry.CondProgressing)
 		if src.Status == telemetry.StatusTrue && prog.Status != telemetry.StatusUnknown {
@@ -193,7 +193,7 @@ func TestABuiltPipelineIsPendingAndAdmitsWhatItDoesNotKnow(t *testing.T) {
 	}
 	defer p.Close(context.Background())
 
-	s := p.Status()
+	s := p.Status(telemetry.StatusQuery{})
 	if s.Phase != telemetry.PhasePending {
 		t.Errorf("phase is %s, want pending", s.Phase)
 	}
@@ -212,7 +212,7 @@ func TestABuiltPipelineIsPendingAndAdmitsWhatItDoesNotKnow(t *testing.T) {
 		}
 	}
 	// The version is a cursor, so it must move.
-	if next := p.Status().Version; next <= s.Version {
+	if next := p.Status(telemetry.StatusQuery{}).Version; next <= s.Version {
 		t.Errorf("version went %d -> %d; it is the SSE cursor and must be monotonic", s.Version, next)
 	}
 }
@@ -244,7 +244,7 @@ func TestAFinishedRunIsCompletedAndNotStalled(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	s := p.Status()
+	s := p.Status(telemetry.StatusQuery{})
 	if s.Phase != telemetry.PhaseCompleted {
 		t.Errorf("phase is %s, want completed", s.Phase)
 	}
@@ -305,7 +305,7 @@ func TestUnmeasuredFieldsMarshalAsNullAndNotZero(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	s := p.Status()
+	s := p.Status(telemetry.StatusQuery{})
 	body, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -384,9 +384,9 @@ func TestTransitionTimesDoNotMoveWhileNothingChanges(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	first := p.Status()
+	first := p.Status(telemetry.StatusQuery{})
 	time.Sleep(20 * time.Millisecond)
-	second := p.Status()
+	second := p.Status(telemetry.StatusQuery{})
 
 	for _, a := range first.Conditions {
 		b := conditionOf(t, second, a.Type)
@@ -491,7 +491,7 @@ func TestAFailedRunReportsItsFault(t *testing.T) {
 		t.Fatal("Run succeeded against a sink that refuses every write")
 	}
 
-	s := p.Status()
+	s := p.Status(telemetry.StatusQuery{})
 	if s.Phase != telemetry.PhaseFailed {
 		t.Errorf("phase is %s, want failed", s.Phase)
 	}
@@ -549,7 +549,7 @@ func TestConnectorEventsReachTheDocument(t *testing.T) {
 	}
 
 	// linefile notes one event per lane it announces.
-	s := p.Status()
+	s := p.Status(telemetry.StatusQuery{})
 	if len(s.RecentEvents) == 0 {
 		t.Fatal("no connector events reached the document although the source announces a lane")
 	}
@@ -612,7 +612,7 @@ func TestStatusIsSafeToReadWhileThePipelineIsStillOpening(t *testing.T) {
 					default:
 						// The document must be well-formed at every instant, not merely eventually:
 						// a half-built one is what a scrape would render.
-						if s := p.Status(); len(s.Conditions) != len(telemetry.ConditionTypes) {
+						if s := p.Status(telemetry.StatusQuery{}); len(s.Conditions) != len(telemetry.ConditionTypes) {
 							t.Errorf("a document read mid-open carried %d conditions, want the whole "+
 								"closed set of %d", len(s.Conditions), len(telemetry.ConditionTypes))
 							return

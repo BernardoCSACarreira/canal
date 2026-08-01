@@ -452,8 +452,12 @@ func TestSettingOnlyTheConfigStoreIsEnoughToRun(t *testing.T) {
 // contradicting itself in exactly the field pair this whole feature exists to produce.
 //
 // The store hands back a new revision on every call and the watch runs flat out, so the two loads
-// land on different observations constantly rather than once in a blue moon. Reverting Status to two
-// loads fails this within a few dozen reads.
+// land on different observations constantly rather than once in a blue moon. Putting the second load
+// back where it was — Generation at the top of Status, the condition's inside computeLocked — fails
+// this twenty times out of twenty. Moving the two loads onto ADJACENT LINES instead fails it once in
+// twenty, which is worth knowing: the size of the window is the whole difference between a race this
+// catches and one it does not, so an injection has to reproduce the real distance and not just the
+// shape.
 func TestOneDocumentReportsOneStoredRevision(t *testing.T) {
 	cfg := &advancingConfig{spec: spec.Spec{Tenant: "acme", ID: "p1"}}
 	f := startConfigFixture(t, cfg, spec.Spec{Tenant: "acme", ID: "p1", Revision: 1},

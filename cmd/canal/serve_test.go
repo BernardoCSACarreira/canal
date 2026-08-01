@@ -148,3 +148,49 @@ func builtPipeline(t *testing.T) *engine.Pipeline {
 	t.Cleanup(func() { _ = p.Close(context.Background()) })
 	return p
 }
+
+// THE QUERY IS HONOURED, not merely accepted. telemetry.StatusQuery exists so the document can grow
+// pagination without a wire break, and a selector nothing acts on is the declared-and-inert pattern
+// that has produced most of this repository's defects.
+func TestStatusHonoursItsSelectionParameters(t *testing.T) {
+	p := builtPipeline(t)
+	src := &statusSource{}
+	src.set(p)
+	h := mux(t, src)
+
+	get := func(t *testing.T, query string) telemetry.PipelineStatus {
+		t.Helper()
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/status"+query, nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET /status%s is %d: %s", query, w.Code, w.Body.String())
+		}
+		var s telemetry.PipelineStatus
+		if err := json.Unmarshal(w.Body.Bytes(), &s); err != nil {
+			t.Fatalf("decoding: %v", err)
+		}
+		return s
+	}
+
+	// A pipeline that has not run has no lanes, so what is asserted here is that the parameters reach
+	// the projection at all rather than being dropped on the floor.
+	if s := get(t, "?limit=0"); len(s.Lanes) != 0 {
+		t.Errorf("limit=0 returned %d lanes", len(s.Lanes))
+	}
+	if s := get(t, "?stream=orders&cursor=lane-1&limit=5"); s.Phase == "" {
+		t.Error("a fully parameterised query produced a document with no phase")
+	}
+
+	// A BAD PARAMETER IS A 400, NEVER A SILENT DEFAULT. "limit=fifty" quietly becoming the default
+	// page is how an operator concludes the endpoint ignores them.
+	for _, bad := range []string{"?limit=fifty", "?limit=-1", "?limit=1.5"} {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/status"+bad, nil))
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("GET /status%s returned %d, want 400", bad, w.Code)
+		}
+		if !strings.Contains(w.Body.String(), "limit") {
+			t.Errorf("the 400 for %s does not name the parameter: %q", bad, w.Body.String())
+		}
+	}
+}

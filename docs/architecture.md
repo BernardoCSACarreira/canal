@@ -379,7 +379,7 @@ github.com/BernardoCSACarreira/canal
     │                    imports: connector, fault, record
     ├── engine/          Build, Deps, Pipeline, Run, codec resolution, Checkpoint, Header, LaneState.
     │                    Run drives read, admit, write, settle, flush and commit for one worker.
-    │                    Checkpoint and Header are declared; nothing constructs one yet.
+    │                    Checkpoint and Header are written on every flush; see §16 and commit.go.
     │                    imports: internal/ledger, and every pkg/ package except connectortest
     ├── example/         linefile (a source), stdoutsink (a sink), memstore (an in-memory store.StateStore)
     └── stress/          eight deliberately hostile connectors kept as a regression suite:
@@ -388,7 +388,11 @@ github.com/BernardoCSACarreira/canal
 ```
 
 Plus `cmd/canal`: `run` and `check`, and nothing else — the composition root holds wiring, never
-policy. There is no `api/`, no `ui/`, and no `buffers/`, `transforms/` or `connectors/` directory: the
+policy. It imports `internal/engine`, `internal/metrics`, the example connectors and `pkg/codec` for
+their registrations, and `pkg/{codec,config,record,registry,spec,store,store/wal,telemetry,fault}`;
+`pkg/record` is there because parsing wire input into domain types is a composition-root job —
+`/status?stream=orders` becomes a `record.StreamName` inside a `telemetry.StatusQuery`. The table is
+enforced by `TestDependencyDirection` in `internal/arch`, which fails in both directions. There is no `api/`, no `ui/`, and no `buffers/`, `transforms/` or `connectors/` directory: the
 HTTP surface and those two stage libraries are unwritten, and `store/` has no bbolt or Postgres
 implementation for the coordinated shape. Everything above compiles, `go vet` is clean, and eighteen
 test packages pass including a `kill -9` test that runs the real binary.
@@ -6814,9 +6818,30 @@ flowchart LR
 
 Every widget is driven by a core-computed field, so a UI that has never heard of the connector still
 renders per-lane and per-stream progress; `LaneStatus.Label` and `LaneStatus.Stream` are the only two
-connector-authored strings and are rendered verbatim (`pkg/telemetry/readmodel.go`). Two honest gaps:
-the renderer does not exist, and `LanesTruncated` announces a cut list that no API can page through —
-`store.StatusStore.Aggregate` takes no cursor, offset or limit.
+connector-authored strings and are rendered verbatim (`pkg/telemetry/readmodel.go`). One honest gap
+remains: the renderer does not exist.
+
+`LanesTruncated` used to announce a cut list that no API could page through. It is followable now.
+`telemetry.StatusQuery` selects `{Stream, LaneCursor, LaneLimit}`, `PipelineStatus.LanesCursor`
+continues the list, `store.StatusStore.Aggregate` takes the query, and `GET /status` honours
+`?stream=`, `?limit=` and `?cursor=` against the one worker it has. The cursor is **keyset, not
+offset** — the id of the last lane on the page — so a scan chunk finishing between two reads shifts
+nothing, where an offset would skip a row every time the list shrank behind the reader.
+
+`PipelineStatus.Streams` is the per-stream rollup, and it is what makes the scale targets answerable.
+`ScanProgress` was the only rollup, so "which of my 900 tables is behind" meant downloading every
+lane; `Streams` is bounded by stream count rather than lane count, which is 900 rows instead of the
+29,000 a 900-table snapshot at 32-way chunking produces. It aggregates **max for ages and sum for
+counts** — the alert on a stream is its worst lane, and a mean hides one stuck chunk behind
+thirty-one healthy ones — and it is computed from every lane BEFORE filtering or paging, because a
+summary of one page is a statement about an arbitrary subset. A stream's backlog is summed only when
+every one of its lanes could answer: a partial sum reads as a small backlog rather than an absent
+one, and of the two mistakes that is the dangerous one.
+
+`StaleAfterSeconds` is what makes `Complete` falsifiable. "We heard from every worker" is not a claim
+until "heard from" has a definition, and without a stated threshold an aggregator can call a document
+complete on reports of any age. It is nil for a single worker reporting on itself, which is the
+honest answer rather than an invented number.
 
 The legacy operator vocabulary `healthy → degraded → paused → terminal` maps onto this without a second
 enum (R9): `healthy` = `PhaseRunning` with no `Degraded: True`; `degraded` = `PhaseRunning` with

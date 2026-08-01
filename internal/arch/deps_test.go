@@ -63,9 +63,14 @@ var declared = map[string][]string{
 	//
 	// The blank imports of the example connectors and pkg/codec are what make this build's
 	// catalogue, and they are why this row is longer than any other. Nothing imports cmd.
+	//
+	// pkg/record is here because the composition root parses wire input into domain types: /status
+	// takes ?stream=orders and a telemetry.StatusQuery holds a record.StreamName. It is not a new
+	// direction — cmd/canal already handles record types through every spec.Spec it loads — it is
+	// naming one it was already carrying transitively.
 	"cmd/canal": {"internal/engine", "internal/example/filesink", "internal/example/linefile", "internal/example/stdoutsink",
-		"internal/metrics", "pkg/codec", "pkg/config", "pkg/registry", "pkg/spec", "pkg/store",
-		"pkg/store/wal", "pkg/telemetry", "pkg/fault"},
+		"internal/metrics", "pkg/codec", "pkg/config", "pkg/record", "pkg/registry", "pkg/spec",
+		"pkg/store", "pkg/store/wal", "pkg/telemetry", "pkg/fault"},
 }
 
 // connectorPrefixes are the trees that stand in for third-party code: the worked examples and the

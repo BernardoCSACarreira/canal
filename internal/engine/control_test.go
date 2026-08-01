@@ -257,7 +257,7 @@ func TestAQuietLaneIsHeartbeatedAndReportsItselfIdle(t *testing.T) {
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
 		if beats, _, _ := src.seen(); len(beats) >= 2 {
-			s = p.Status()
+			s = p.Status(telemetry.StatusQuery{})
 			if len(s.Lanes) == 1 && s.Lanes[0].Idle {
 				break
 			}
@@ -346,7 +346,7 @@ func TestALaneThatIsProducingIsNotHeartbeated(t *testing.T) {
 	before := -1
 	gate := time.Now().Add(30 * time.Second)
 	for time.Now().Before(gate) {
-		if s := p.Status(); len(s.Lanes) == 1 && s.Lanes[0].RecordsRead > 0 {
+		if s := p.Status(telemetry.StatusQuery{}); len(s.Lanes) == 1 && s.Lanes[0].RecordsRead > 0 {
 			beats, _, _ := src.seen()
 			before = len(beats)
 			break
@@ -363,7 +363,7 @@ func TestALaneThatIsProducingIsNotHeartbeated(t *testing.T) {
 	// heartbeat a lane that is plainly not quiet.
 	time.Sleep(6 * iv)
 	beats, _, _ := src.seen()
-	s := p.Status()
+	s := p.Status(telemetry.StatusQuery{})
 	cancel()
 	<-done
 
@@ -414,7 +414,7 @@ func TestAFailedHeartbeatDoesNotMarkTheLaneIdle(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	s := p.Status()
+	s := p.Status(telemetry.StatusQuery{})
 	beats, _, _ := src.seen()
 	close(src.release)
 	cancel()
@@ -473,7 +473,7 @@ func TestASourceThatDeclaresNothingIsNeverAskedAnything(t *testing.T) {
 
 	// A source with no Heartbeater can never report a lane idle, which is the honest answer: nobody
 	// has confirmed the lane is quiet rather than stuck.
-	s := p.Status()
+	s := p.Status(telemetry.StatusQuery{})
 	for _, l := range s.Lanes {
 		if l.Idle {
 			t.Errorf("lane %s is reported idle although its source cannot heartbeat", l.ID)
@@ -515,7 +515,7 @@ func TestABacklogReachesTheDocumentWithAnAsOf(t *testing.T) {
 	var got *telemetry.Backlog
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
-		s := p.Status()
+		s := p.Status(telemetry.StatusQuery{})
 		if len(s.Lanes) == 1 && s.Lanes[0].Backlog != nil {
 			got = s.Lanes[0].Backlog
 			break
@@ -681,3 +681,197 @@ func TestAPrefixLaneIsNackedByPosition(t *testing.T) {
 		t.Errorf("a prefix lane's nack carries a delivery handle %q; handles are for discrete lanes", n.Handle)
 	}
 }
+
+// --- many lanes ---------------------------------------------------------------------------------
+
+// fanSource announces several lanes across two streams, then parks. Only the first is read — this
+// runtime reads one lane per source — which is enough: the point is a document describing a lane
+// table larger than one page.
+type fanSource struct {
+	lanes   int
+	release chan struct{}
+	done    bool
+}
+
+func (s *fanSource) Open(ctx context.Context, rt connector.SourceRuntime) error {
+	as, err := rt.Lanes().Assigned(ctx)
+	if err != nil || len(as) > 0 {
+		return err
+	}
+	specs := make([]connector.LaneSpec, 0, s.lanes)
+	for i := 0; i < s.lanes; i++ {
+		stream := "orders"
+		if i%2 == 1 {
+			stream = "customers"
+		}
+		specs = append(specs, connector.LaneSpec{
+			Name: fmt.Sprintf("chunk-%03d", i), Stream: record.StreamName(stream),
+			Kind: connector.LaneKindScan, Ordering: connector.OrderingPrefix,
+			Boundedness: connector.Bounded, Group: "scan", Weight: uint64(10 * (i + 1)),
+			Label: fmt.Sprintf("chunk %d of %d", i+1, s.lanes),
+		})
+	}
+	_, err = rt.Lanes().AnnounceMany(ctx, specs)
+	return err
+}
+
+func (s *fanSource) Read(ctx context.Context, dst *record.Batch) error {
+	if s.done {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.release:
+			return fault.ErrEndOfInput
+		}
+	}
+	s.done = true
+	dst.Reset()
+	for i := 0; i < 3; i++ {
+		if r := dst.Add(); r != nil {
+			r.Payload = record.BytesPayload([]byte("row"))
+		}
+	}
+	var b [8]byte
+	b[7] = 3
+	dst.Position = record.Position{Token: record.Blob{Version: 1, Bytes: b[:]}, Order: b[:],
+		Safe: true, At: time.Now(), Label: "row 3"}
+	return nil
+}
+
+func (s *fanSource) Commit(context.Context, connector.Ack) error { return nil }
+func (s *fanSource) Close(context.Context) error                 { return nil }
+
+func registerFanSource(t *testing.T, s *fanSource) string {
+	t.Helper()
+	name := fmt.Sprintf("fan_source_%d", controlSeq.Add(1))
+	registry.AddSource(registry.Default, registry.SourceDef[*fanSource]{
+		Meta: registry.Meta{
+			Name: name, Version: "1.0.0", Title: "Fan source",
+			Summary: "Announces many lanes across two streams.",
+			Notes:   "Origin.Key is the chunk index, stable across re-reads.",
+			Support: registry.SupportCommunity,
+		},
+		Spec: config.NewSpec(),
+		Caps: connector.SourceCaps{
+			Caps:              connector.Caps{APIVersion: connector.APIVersion},
+			DefaultOrdering:   connector.OrderingPrefix,
+			Boundedness:       []connector.Boundedness{connector.Bounded},
+			LaneKinds:         []connector.LaneKind{connector.LaneKindScan},
+			MaxLanes:          256,
+			StableKeys:        true,
+			Replayable:        true,
+			UpstreamRetention: connector.RetentionUnbounded,
+		},
+		New: func(context.Context, *config.Config) (*fanSource, error) { return s, nil },
+	})
+	return name
+}
+
+func fanSpec(srcName, sinkName string) spec.Spec {
+	s := controlSpec(srcName, sinkName)
+	s.Streams = []spec.StreamConfig{
+		{Stream: "orders", Read: []connector.LaneKind{connector.LaneKindScan}, Write: connector.DestAppend},
+		{Stream: "customers", Read: []connector.LaneKind{connector.LaneKindScan}, Write: connector.DestAppend},
+	}
+	return s
+}
+
+// THE ROLLUP DESCRIBES EVERY LANE, THE PAGE DESCRIBES ONE PAGE, and conflating them would make the
+// summary a statement about an arbitrary subset — which looks like an answer and is not one.
+//
+// This is the end-to-end half: a real pipeline with a real lane table, paged through the real
+// projection. The arithmetic itself is asserted directly in scale_internal_test.go.
+func TestTheRollupCoversEveryLaneEvenWhenThePageDoesNot(t *testing.T) {
+	const lanes = 12
+	src := &fanSource{lanes: lanes, release: make(chan struct{})}
+	srcName := registerFanSource(t, src)
+	sinkName := registerProbe(t, "fan_sink", &probeSink{})
+
+	dir := t.TempDir()
+	st, err := wal.Open(filepath.Join(dir, "state"))
+	if err != nil {
+		t.Fatalf("opening the store: %v", err)
+	}
+	defer st.Close()
+
+	p, _, diags := engine.Build(context.Background(), registry.Default, fanSpec(srcName, sinkName),
+		engine.Deps{State: st, Worker: "test", FlushInterval: 5 * time.Millisecond,
+			ControlInterval: time.Second, GracePeriod: 2 * time.Second})
+	if diags.HasErrors() {
+		t.Fatalf("Build: %v", diags)
+	}
+	defer p.Close(context.Background())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- p.Run(ctx) }()
+
+	deadline := time.Now().Add(8 * time.Second)
+	var full telemetry.PipelineStatus
+	for time.Now().Before(deadline) {
+		full = p.Status(telemetry.StatusQuery{})
+		if full.LaneCount == lanes {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if full.LaneCount != lanes {
+		t.Fatalf("the lane table holds %d lanes, want %d", full.LaneCount, lanes)
+	}
+
+	// One page of three, and the rollup still covers all twelve.
+	page := p.Status(telemetry.StatusQuery{LaneLimit: ptrTo(3)})
+	if len(page.Lanes) != 3 {
+		t.Fatalf("asked for 3 lanes and got %d", len(page.Lanes))
+	}
+	if !page.LanesTruncated || page.LanesCursor == "" {
+		t.Error("a cut page did not carry a cursor, so the rest is unreachable")
+	}
+	if page.LaneCount != lanes {
+		t.Errorf("LaneCount is %d on a paged document, want the true total %d", page.LaneCount, lanes)
+	}
+	if len(page.Streams) != 2 {
+		t.Fatalf("%d streams in the rollup, want 2", len(page.Streams))
+	}
+	var rolled int
+	for _, s := range page.Streams {
+		rolled += s.Lanes
+	}
+	if rolled != lanes {
+		t.Errorf("the rollup covers %d lanes on a 3-lane page, want all %d: a summary of the page is "+
+			"a statement about an arbitrary subset", rolled, lanes)
+	}
+
+	// The banner case: no lanes at all, and the rollup is still there.
+	banner := p.Status(telemetry.StatusQuery{LaneLimit: ptrTo(0)})
+	if len(banner.Lanes) != 0 {
+		t.Errorf("a zero limit returned %d lanes", len(banner.Lanes))
+	}
+	if len(banner.Streams) != 2 || banner.LaneCount != lanes {
+		t.Errorf("the banner lost the rollup: %d streams, laneCount %d", len(banner.Streams), banner.LaneCount)
+	}
+
+	// Drill down, which is what the rollup is for.
+	only := p.Status(telemetry.StatusQuery{Stream: "orders"})
+	if len(only.Lanes) != lanes/2 {
+		t.Errorf("the orders drill-down returned %d lanes, want %d", len(only.Lanes), lanes/2)
+	}
+	for _, l := range only.Lanes {
+		if l.Stream != "orders" {
+			t.Errorf("lane %s is on stream %s and came back from an orders filter", l.ID, l.Stream)
+		}
+	}
+
+	// A single worker reporting on itself has no staleness threshold, and nil says so.
+	if full.StaleAfterSeconds != nil {
+		t.Errorf("StaleAfterSeconds is %v for a single worker; nil is what means no threshold applies",
+			*full.StaleAfterSeconds)
+	}
+
+	close(src.release)
+	cancel()
+	<-done
+}
+
+func ptrTo[T any](v T) *T { return &v }

@@ -132,6 +132,31 @@ func TestAZeroLimitReturnsNoLanesAndStillCountsThem(t *testing.T) {
 	}
 }
 
+// A ZERO-LIMIT RESPONSE HAS CONSUMED NOTHING, so its cursor is empty and that is not an end marker.
+//
+// The two fields have to agree on one reading: LanesTruncated answers "is there more", and the
+// cursor is a continuation token whose empty value means "start from the beginning" — which is also
+// what a first request sends. Reading the cursor as the terminator instead would make a banner
+// response look like an empty pipeline, and the field's own doc comment said exactly that until this
+// case was written down.
+func TestAZeroLimitCursorIsAStartAndNotAnEnd(t *testing.T) {
+	all := []telemetry.LaneStatus{lane("a", "s"), lane("b", "s"), lane("c", "s")}
+
+	_, cursor, truncated := pageLanes(all, telemetry.StatusQuery{LaneLimit: ptr(0)})
+	if !truncated {
+		t.Fatal("a zero-limit response over three lanes reported nothing more to fetch")
+	}
+	if cursor != "" {
+		t.Errorf("cursor is %q; a caller that consumed no lanes has nothing to continue after", cursor)
+	}
+
+	// Feeding that cursor back must return the FIRST page, not nothing.
+	page, _, _ := pageLanes(all, telemetry.StatusQuery{LaneCursor: cursor, LaneLimit: ptr(2)})
+	if got := ids(page); len(got) != 2 || got[0] != "a" {
+		t.Errorf("continuing from a zero-limit response gave %v, want the first page [a b]", got)
+	}
+}
+
 func TestTheStreamFilterIsTheDrillDown(t *testing.T) {
 	all := []telemetry.LaneStatus{
 		lane("a", "orders"), lane("b", "customers"), lane("c", "orders"),

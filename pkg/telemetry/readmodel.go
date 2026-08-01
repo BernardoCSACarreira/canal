@@ -73,7 +73,11 @@ type PipelineStatus struct {
 	LaneCount      int  `json:"laneCount"`
 	LanesTruncated bool `json:"lanesTruncated"`
 
-	// LanesCursor continues the lane list, and it is empty when this page is the last.
+	// LanesCursor continues the lane list. Empty means START FROM THE BEGINNING, which is also what a
+	// first request sends — so it is LanesTruncated, and never this field, that answers "is there
+	// more". A caller that asked for no lanes at all gets LanesTruncated true and an empty cursor,
+	// because it has consumed nothing; reading the cursor as an end marker would make that response
+	// look like an empty pipeline.
 	//
 	// OPAQUE ON PURPOSE. It is a keyset today — the id of the last lane on this page — and nothing
 	// outside the producer may parse it, so the implementation can become an index, a shard key or a

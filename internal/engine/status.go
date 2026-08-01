@@ -216,15 +216,12 @@ func pageLanes(all []telemetry.LaneStatus, q telemetry.StatusQuery) (page []tele
 		all = kept
 	}
 	if q.LaneCursor != "" {
-		for i, l := range all {
-			if string(l.ID) > q.LaneCursor {
-				all = all[i:]
-				break
-			}
-			if i == len(all)-1 {
-				all = nil
-			}
-		}
+		// Binary search rather than a scan: the list is sorted by id, and walking it per page makes
+		// paging the whole table quadratic — 145 pages over 29,000 lanes is four million comparisons
+		// to hand back what a search finds in fifteen. The scale this field exists for is the scale
+		// that makes the difference matter.
+		i := sort.Search(len(all), func(i int) bool { return string(all[i].ID) > q.LaneCursor })
+		all = all[i:]
 	}
 
 	limit := maxLanesPerDocument
@@ -244,12 +241,10 @@ func pageLanes(all []telemetry.LaneStatus, q telemetry.StatusQuery) (page []tele
 	truncated = true
 	if limit > 0 {
 		cursor = string(page[limit-1].ID)
-	} else if len(all) > 0 {
-		// Asked for no lanes at all: the caller wants the banner and the rollup. The cursor still
-		// points at the start of the list so the same query can be paged from without a second round
-		// trip to discover where to begin.
-		cursor = ""
 	}
+	// limit == 0 leaves the cursor empty, which is correct rather than a gap: an empty cursor means
+	// START FROM THE BEGINNING, and a caller that asked for no lanes has not consumed any. It is
+	// LanesTruncated, not the cursor, that says whether more exist.
 	return page, cursor, truncated
 }
 

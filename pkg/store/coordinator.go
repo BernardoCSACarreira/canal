@@ -125,7 +125,14 @@ type Assignment struct {
 
 	Lane LaneRow `json:"lane"`
 
-	// Worker and Epoch are empty and zero while the row is unclaimed.
+	// Worker and Epoch are empty and zero while the row has never been claimed, and are cleared by
+	// Release. THEY ARE NOT CLEARED WHEN A LEASE MERELY EXPIRES: a lapsed row goes on naming its
+	// previous holder, because that identity is what DefaultReassignmentDelay reserves it for. So
+	// LeaseExpires is the discriminator and not Worker — a row whose expiry has passed names whoever
+	// held it last, not whoever holds it now, and [Lease.Valid] is the comparison to make.
+	//
+	// Reading Worker as "the current holder" without checking the expiry is therefore wrong in
+	// exactly the situation an operator is most likely to be looking: a worker that just died.
 	Worker WorkerID `json:"worker,omitempty"`
 	Epoch  uint64   `json:"epoch,omitempty"`
 

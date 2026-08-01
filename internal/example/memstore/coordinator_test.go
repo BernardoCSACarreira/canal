@@ -462,6 +462,36 @@ func TestLeadershipIsAdvisoryAndTheLoserKnowsAtOnce(t *testing.T) {
 	}
 }
 
+// A LAPSED ROW GOES ON NAMING ITS PREVIOUS HOLDER, and the expiry is the discriminator. That
+// identity is what the reassignment delay reserves the lane for, so it cannot be cleared — which
+// means a reader that treats Worker as "the current holder" is wrong in exactly the situation an
+// operator is most likely to be looking at: a worker that just died.
+func TestALapsedRowStillNamesItsPreviousHolderAndSaysSoThroughTheExpiry(t *testing.T) {
+	f := newFixture(t)
+	f.claim(t, "lane-a", "w1")
+	f.advance(store.DefaultLeaseTTL + time.Second)
+
+	row := assignmentsByID(t, f)[f.id("lane-a")]
+	if row.Worker != "w1" {
+		t.Errorf("the lapsed row names %q; the previous holder's identity is what the reassignment "+
+			"delay reserves the lane for and it cannot be cleared", row.Worker)
+	}
+	if (store.Lease{Expires: row.LeaseExpires}).Valid(f.now) {
+		t.Error("the row reports a valid lease after its TTL; the expiry is the only thing that " +
+			"tells a reader the named worker is the previous one")
+	}
+
+	// And after a clean release there is no holder at all, which is the state Worker being empty
+	// actually means.
+	l := f.claim(t, "lane-b", "w1")
+	if err := f.c.Release(context.Background(), l); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if got := assignmentsByID(t, f)[f.id("lane-b")]; got.Worker != "" || got.Epoch != 0 {
+		t.Errorf("a released row still names %s at epoch %d", got.Worker, got.Epoch)
+	}
+}
+
 // A finished lane is not claimable: there is nothing left to read, and handing it out would have a
 // worker open a source for a lane that is already done.
 func TestAFinishedLaneIsNotClaimable(t *testing.T) {

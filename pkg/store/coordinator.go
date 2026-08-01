@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/BernardoCSACarreira/canal/pkg/record"
@@ -88,6 +90,27 @@ type Coordinator interface {
 
 	// Assignments returns the current assignment rows for a pipeline.
 	Assignments(ctx context.Context, t record.TenantID, id record.PipelineID) ([]Assignment, error)
+}
+
+// AssignmentIDFor derives the id of one lane's assignment in one pipeline generation.
+//
+// IT LIVES HERE BECAUSE BOTH SIDES NEED THE SAME ANSWER. [Coordinator] takes an AssignmentID and
+// never says where one comes from, so a planner and a worker that derived it differently would plan
+// rows nobody could claim — and the symptom would be a pipeline that starts, reports every lane
+// gated on nothing, and reads no records. One function, used by every implementation and by the
+// engine.
+//
+// STABLE ACROSS RE-PLANS, DISTINCT ACROSS GENERATIONS, which is exactly what [AssignmentID] says it
+// identifies: the first half lets a planner run on a timer without dropping the claims it already
+// made, the second is what makes "an assignment from an older generation is not claimed" enforceable
+// at all, because the row simply is not the same row.
+//
+// It escapes the same way record.DeriveLaneID does, so a tenant containing a separator cannot
+// address another tenant's assignment.
+func AssignmentIDFor(t record.TenantID, p record.PipelineID, gen uint64, lane record.LaneID) AssignmentID {
+	esc := strings.NewReplacer("%", "%25", "/", "%2F")
+	return AssignmentID(esc.Replace(string(t)) + "/" + esc.Replace(string(p)) + "/" +
+		strconv.FormatUint(gen, 10) + "/" + esc.Replace(string(lane)))
 }
 
 // LaneRow is a lane as the coordinator sees it: identity, gating and opaque bytes.

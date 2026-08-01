@@ -42,6 +42,7 @@ type obs struct {
 	staleness     *metrics.Gauge
 	oldestPending *metrics.Gauge
 	reconcile     *metrics.Gauge
+	revoked       *metrics.Gauge
 	conditions    *metrics.Gauge
 
 	commitLatency *metrics.Histogram
@@ -140,6 +141,7 @@ func newObs(r *metrics.Registry, s spec.Spec) (*obs, error) {
 	o.staleness = gauge(telemetry.MStateStaleness, P)
 	o.oldestPending = gauge(telemetry.MOldestPending, P, L)
 	o.reconcile = gauge(telemetry.MReconcileDelta, P)
+	o.revoked = gauge(telemetry.MRevokedUnsettled, P, L)
 	o.conditions = gauge(telemetry.MConditions, P, telemetry.LabelCondition, telemetry.LabelStatus)
 
 	if err == nil {

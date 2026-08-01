@@ -263,6 +263,12 @@ func (r *runner) run(ctx context.Context) error {
 	runCtx, stopReading := context.WithCancel(ctx)
 	defer stopReading()
 
+	// THE CONFIG WATCH STARTS BEFORE ANYTHING IS OPENED, and takes ctx rather than runCtx so it keeps
+	// answering through the drain. "Did my config take effect" is asked most often while a pipeline is
+	// stuck opening against an unreachable upstream, which is exactly the window a watch started after
+	// the opens would miss. It touches no record and holds no lock this function takes; see config.go.
+	defer r.watchConfig(ctx)()
+
 	// Sinks open before sources. A source that produces before its sink can accept is a batch with
 	// nowhere to go, held against the lane budget for nothing.
 	if err := r.openSinks(runCtx); err != nil {

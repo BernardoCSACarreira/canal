@@ -54,6 +54,10 @@ func (r *runner) conditions(now time.Time, f laneFacts) []telemetry.Condition {
 	if r.status.conditions == nil {
 		r.status.conditions = map[telemetry.ConditionType]telemetry.Condition{}
 	}
+	// ObservedGeneration is the APPLIED revision on every condition, including the one that reports
+	// the stored revision differs. A condition stamped with the generation it was computed against is
+	// how a stale condition is identifiable as stale, and the generation this process computed
+	// against is the one it is running.
 	gen := r.p.spec.Revision
 	fresh := r.computeLocked(now, f)
 
@@ -87,12 +91,11 @@ func (r *runner) computeLocked(now time.Time, f laneFacts) map[telemetry.Conditi
 	out[telemetry.CondConfigured] = cond(telemetry.StatusTrue, telemetry.ReasonApplied,
 		"the spec was validated and negotiated")
 
-	// SPEC APPLIED compares the stored revision with the applied one. Both are the running spec's
-	// today, for the reason PipelineStatus.Generation records — so the call below is trivially equal
-	// and the projection it calls is not. specApplied is where the answer lives, it is tested with
-	// divergent revisions, and the day a control plane can hold a revision this process has not
-	// applied it is already correct.
-	out[telemetry.CondSpecApplied] = specApplied(r.p.spec.Revision, r.p.spec.Revision)
+	// SPEC APPLIED compares the STORED revision with the APPLIED one, and the stored one now comes
+	// from somewhere else: the config watch's last observation of store.ConfigStore. A worker with no
+	// config store still gets true, because the spec it loaded is the only revision in existence —
+	// but it is no longer true by construction, and that is the whole difference. See config.go.
+	out[telemetry.CondSpecApplied] = configCondition(r.deps.Config != nil, r.p.configView(), r.p.spec.Revision)
 
 	switch {
 	case f.total == 0:

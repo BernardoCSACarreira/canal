@@ -123,6 +123,19 @@ const (
 	ReasonAssigned = "assigned"
 	ReasonStalled  = "stalled"
 	ReasonHealthy  = "healthy"
+
+	// ReasonConfigStoreUnreachable and ReasonSpecDeleted were added when store.ConfigStore acquired a
+	// reader, for the same reason as the three above: [CondSpecApplied] had exactly two reasons —
+	// applied and pending — which is enough vocabulary for a process that compares a number with
+	// itself and not enough for one that has to ask another system.
+	//
+	// They are separate because the operator response is opposite. Unreachable means canal does not
+	// know whether the config took effect and the control plane is what to look at; deleted means it
+	// knows, the answer is that the config it is running has been withdrawn, and this worker is what
+	// to look at. Reporting both as "pending" would say a change is on its way in the one case where
+	// nothing is coming.
+	ReasonConfigStoreUnreachable = "config_store_unreachable"
+	ReasonSpecDeleted            = "spec_deleted"
 )
 
 // Condition is one orthogonal fact about a pipeline.

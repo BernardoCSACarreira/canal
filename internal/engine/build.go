@@ -64,6 +64,17 @@ type Deps struct {
 	// acknowledge. The default is deliberately short of the ten-second-ish window a logical-decoding
 	// upstream expects before it considers a subscriber gone.
 	ControlInterval time.Duration
+
+	// ConfigInterval is how often the config watch re-reads the stored revision, and it is a THIRD
+	// cadence rather than a reuse of either above because it is the only one that is not on a data
+	// path. Nothing waits for it: it bounds how stale the answer to "did my config take effect" may
+	// be, and its cost is one config-store read per pipeline per tick. Borrowing ControlInterval's
+	// five seconds would put a deployment of four hundred pipelines at eighty config reads a second
+	// to answer a question nobody asks that often.
+	//
+	// It is the reconcile timer store.ConfigStore.Watch names when it says a watch is a convenience
+	// and never a correctness dependency, so it applies whether or not the store offers one.
+	ConfigInterval time.Duration
 }
 
 // withDefaults fills the values an operator did not set, and records where each came from so the
@@ -92,6 +103,10 @@ func (d Deps) withDefaults() (Deps, []telemetry.DefaultNote) {
 	if d.ControlInterval <= 0 {
 		d.ControlInterval = 5 * time.Second
 		notes = append(notes, telemetry.DefaultNote{Path: []string{"source", "control_interval"}, Value: "5s", From: "core default"})
+	}
+	if d.ConfigInterval <= 0 {
+		d.ConfigInterval = 30 * time.Second
+		notes = append(notes, telemetry.DefaultNote{Path: []string{"config", "config_interval"}, Value: "30s", From: "core default"})
 	}
 	return d, notes
 }
@@ -133,6 +148,13 @@ type Pipeline struct {
 	// pipeline that completed still has to be able to say what it did; clearing the pointer at the end
 	// of Run would make a finished pipeline report the same empty document as one that never started.
 	active atomic.Pointer[runner]
+
+	// config is the last observation of the control plane's stored revision, or nil when this worker
+	// has no store.ConfigStore or has not looked yet. See config.go.
+	//
+	// It lives on the Pipeline rather than the runner because Status does, and a document read after
+	// Run returned still has to report the last generation this process knew about.
+	config atomic.Pointer[configView]
 
 	// version is the read model's monotonic revision, and it is both the ETag and the SSE cursor.
 	//

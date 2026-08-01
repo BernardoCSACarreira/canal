@@ -1,4 +1,4 @@
-// Package memstore is an in-memory store.StateStore for tests.
+// Package memstore is an in-memory store.StateStore and store.ConfigStore for tests.
 //
 // It is SCAFFOLDING AND IT IS LABELLED AS SUCH (design rule R10): it declares
 // FlushIsDurable false-by-honesty in one respect — a process crash loses everything — and

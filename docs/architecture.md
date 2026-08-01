@@ -6696,11 +6696,18 @@ meaning "the source reports this lane quiet" rather than "the core cannot see an
 stuck lane is also quiet, and only one of the two is healthy. `EventTimeLag` prefers the source's own
 answer from `Backlog` and falls back to differencing the committed position's `At`.
 
-`Generation` and `ObservedGeneration` are both the running spec's `Revision`, because in a standalone
-run the spec canal loaded *is* the stored spec and there is no second copy to diverge from. The
-comparison behind `CondSpecApplied` is real and tested with divergent revisions
-(`engine.specApplied`); it starts reporting something the day a control plane can hold a revision this
-process has not applied.
+`Generation` and `ObservedGeneration` are **two numbers**: the stored config revision and the applied
+one. The stored one comes from the engine's config watch over `store.ConfigStore`
+(`internal/engine/config.go`), which is what makes `CondSpecApplied` able to be false at all — before
+it existed the engine compared the running revision with itself and reported applied every time. A
+worker with no config store still reports one revision twice, because the spec it loaded is the only
+one in existence, and says so in the condition's message rather than implying a comparison happened.
+
+The condition has four answers arithmetic cannot give, separated because the operator response to each
+differs: no store to compare against (`true`/`applied`), a store nobody has read yet
+(`unknown`/`starting`), a store that did not answer (`unknown`/`config_store_unreachable`), and a
+store that answered that the pipeline is gone (`false`/`spec_deleted`). `store.ErrNoSpec` is the
+sentinel that keeps the last two apart.
 
 ```go
 // Package telemetry owns metric naming, the closed label vocabulary, and the single
@@ -7065,11 +7072,20 @@ flowchart TB
 
 The four interfaces are defined in `pkg/store/config_store.go`, `state_store.go`, `coordinator.go` and
 `status_store.go`, and they reach the engine as the first four fields of `engine.Deps`
-(`internal/engine/build.go:25`) — that struct is the whole seam. Three of the four are still design and
-not code: the module contains no implementation of `ConfigStore`, `Coordinator` or `StatusStore`. The
-`StateStore` is real — `pkg/store/wal` declares `connector.DurabilityNode` and fsyncs before `Set`
-returns, alongside the in-memory `internal/example/memstore` that labels itself as scaffolding — and
-`cmd/canal` runs a pipeline from a spec file. There is no `canal serve`: the control API is unwritten.
+(`internal/engine/build.go:25`) — that struct is the whole seam. Two of the four are still design and
+not code: the module contains no implementation of `Coordinator` or `StatusStore`. The `StateStore` is
+real — `pkg/store/wal` declares `connector.DurabilityNode` and fsyncs before `Set` returns, alongside
+the in-memory `internal/example/memstore` that labels itself as scaffolding — and `cmd/canal` runs a
+pipeline from a spec file. There is no `canal serve`: the control API is unwritten.
+
+`ConfigStore` has two implementations and one reader. `internal/example/memstore` is the revisioned,
+watchable reference; `cmd/canal`'s `specFile` projects the `--spec` file read-only, declining `Watch`
+outright — which is what makes "a watch is a convenience, never a correctness dependency" a tested
+claim rather than a comment. The reader is the engine's config watch (`internal/engine/config.go`): it
+polls the stored revision of its own pipeline and publishes what it last saw, so `CondSpecApplied` can
+finally be false. It **reports rather than applies** — applying a revision means re-negotiating a
+guarantee and restarting lanes, which is `Pipeline` lifecycle work — and every failure in it is inert
+on the data path.
 
 **Four interfaces. If a fifth appears, the abstraction is wrong.** This is the only thing that differs
 between a laptop and a cluster.

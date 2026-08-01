@@ -391,11 +391,38 @@ func (l *laneCtl) commit(ctx context.Context, positions map[record.LaneID]record
 	if len(positions) == 0 {
 		return nil
 	}
+	batch := store.NewBatch(singleWorkerEpoch)
+	done, err := l.stage(batch, positions)
+	if err != nil {
+		done(false)
+		return err
+	}
+	if batch.Len() == 0 {
+		done(false)
+		return nil
+	}
+	if err := l.deps.State.Set(ctx, *batch); err != nil {
+		done(false)
+		return err
+	}
+	done(true)
+	return nil
+}
+
+// stage adds this node's lane rows to a batch and returns the function that finishes the write.
+//
+// It exists so a CHECKPOINT AND THE CURSORS IT COVERS GO INTO ONE store.Batch. A committable
+// persisted separately from the cursor it covers can be orphaned by a crash between the two writes,
+// which is the failure the checkpoint envelope exists to prevent — so the batch has to be assembled
+// above the per-node lane tables rather than inside them.
+//
+// The returned func MUST be called: it holds this node's write lock until it is. Pass true when the
+// batch landed and false when it did not, which is the difference between advancing the in-memory
+// view and leaving it alone.
+func (l *laneCtl) stage(batch *store.Batch, positions map[record.LaneID]record.Position) (func(bool), error) {
 	l.writeMu.Lock()
-	defer l.writeMu.Unlock()
 
 	l.mu.Lock()
-	batch := store.NewBatch(singleWorkerEpoch)
 	staged := make(map[record.LaneID]record.Position, len(positions))
 	for id, pos := range positions {
 		rec, ok := l.lanes[id]
@@ -407,27 +434,26 @@ func (l *laneCtl) commit(ctx context.Context, positions map[record.LaneID]record
 		body, err := json.Marshal(&next)
 		if err != nil {
 			l.mu.Unlock()
-			return fmt.Errorf("engine: encoding lane %s: %w", id, err)
+			l.writeMu.Unlock()
+			return func(bool) {}, fmt.Errorf("engine: encoding lane %s: %w", id, err)
 		}
 		batch.Put(store.LaneKey(l.fields.tenant, l.fields.pipeline, id), body, l.versions[id])
 		staged[id] = pos
 	}
 	l.mu.Unlock()
 
-	if batch.Len() == 0 {
-		return nil
-	}
-	if err := l.deps.State.Set(ctx, *batch); err != nil {
-		return err
-	}
-
-	l.mu.Lock()
-	for id, pos := range staged {
-		l.lanes[id].Cursor = pos
-		l.versions[id]++
-	}
-	l.mu.Unlock()
-	return nil
+	return func(landed bool) {
+		defer l.writeMu.Unlock()
+		if !landed {
+			return
+		}
+		l.mu.Lock()
+		for id, pos := range staged {
+			l.lanes[id].Cursor = pos
+			l.versions[id]++
+		}
+		l.mu.Unlock()
+	}, nil
 }
 
 // mutate applies f to one lane row and persists the result.

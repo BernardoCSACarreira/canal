@@ -70,6 +70,13 @@ type runner struct {
 	// deferred holds records accepted by a sink that has not yet made them durable.
 	deferred *deferred
 
+	// checkpointer owns the monotonic checkpoint id and the pending committable set; awaiting holds
+	// the records those committables cover until a commit answers for them; checkpointVersion is the
+	// store's compare-and-set version for the checkpoint key.
+	checkpointer      *checkpointer
+	awaiting          *awaitingCommit
+	checkpointVersion uint64
+
 	mu       sync.Mutex
 	firstErr error
 
@@ -200,10 +207,19 @@ func (r *runner) run(ctx context.Context) error {
 		trigger = 1
 	}
 	r.deferred = newDeferred(trigger)
+	r.checkpointer = newCheckpointer()
+	r.awaiting = newAwaitingCommit()
 
 	// Sinks open before sources. A source that produces before its sink can accept is a batch with
 	// nowhere to go, held against the lane budget for nothing.
 	if err := r.openSinks(runCtx); err != nil {
+		return err
+	}
+	// RECOVERY BEFORE ANY RECORD MOVES. A previous run may have left staged artifacts the
+	// destination has and this process does not know about; resolving them after starting to read
+	// would let a new checkpoint advance a cursor past records nobody published. It runs after the
+	// sinks are open because only an open sink can answer for its own committables.
+	if err := r.recoverCheckpoint(runCtx); err != nil {
 		return err
 	}
 	if err := r.openSources(runCtx); err != nil {
@@ -253,6 +269,19 @@ func (r *runner) run(ctx context.Context) error {
 	// whole grace period — thirty seconds by default — for an outcome that is already known. It is
 	// also not free of consequence, so it is logged and the leak is reported below: those records
 	// replay on restart, which at-least-once permits and an operator should be told about.
+	// THE TERMINAL FLUSH COMES BEFORE THE DRAIN, not after.
+	//
+	// The drain waits for the ledger to empty, and for a deferring sink the only thing that can
+	// empty it is a flush or a commit. Draining first therefore waits for settlement that only the
+	// step after it can produce — a deadlock by construction, and for a staging sink that seals only
+	// at end of input it is guaranteed rather than occasional. Found by running a Committer through
+	// the drain and watching it time out with the commit still pending.
+	terminal := connector.FlushEndOfInput
+	if ctx.Err() != nil {
+		terminal = connector.FlushDrain
+	}
+	r.flushOnce(context.WithoutCancel(ctx), terminal)
+
 	var drainErr error
 	if r.firstError() != nil {
 		r.deps.Log.Warn("the pipeline is stopping on a fault, so it is not draining; in-flight records will replay",
@@ -263,17 +292,12 @@ func (r *runner) run(ctx context.Context) error {
 		drainErr = r.p.ledger.Drain(drainCtx)
 	}
 
-	// One final flush, so anything that settled during the drain is durable before we stop.
-	//
-	// THE REASON IS THE INTERESTING PART. A bounded pipeline that reached the end of its input is
-	// finalising for good, and a staging sink has to seal the 4 MB file it was hoping would reach
-	// 128 MB; a pipeline stopped by a signal is draining and may well be restarted, so the same
-	// sink is right to keep waiting. ctx.Err() is exactly that distinction, already available.
-	finalReason := connector.FlushEndOfInput
-	if ctx.Err() != nil {
-		finalReason = connector.FlushDrain
-	}
-	r.flushOnce(context.WithoutCancel(ctx), finalReason)
+	// And one more after the drain, so anything that settled while it ran reaches the store. The
+	// reason is the same one the pre-drain flush used: a bounded pipeline that reached the end of
+	// its input is finalising for good, and a staging sink has to seal the 4 MB file it was hoping
+	// would reach 128 MB; a pipeline stopped by a signal may well be restarted, and the same sink is
+	// right to keep waiting.
+	r.flushOnce(context.WithoutCancel(ctx), terminal)
 
 	// And one final gauge refresh, so the last scrape describes the state the pipeline actually
 	// stopped in. Without it a run shorter than the flush interval published no gauges at all, and
@@ -612,7 +636,7 @@ func finish(cc *codecChain, body []byte, refs []record.Ref, count int) (*connect
 // whole stream.
 func (r *runner) deliver(ctx context.Context, batch *record.Batch) error {
 	for _, id := range r.mainSinks {
-		if err := r.writeSet(ctx, id, batch.Records); err != nil {
+		if err := r.writeSet(ctx, id, batch.Records, batch.Lane, batch.Position); err != nil {
 			return err
 		}
 		// A deferring sink holds what it was just given, so this is where the pipeline finds out it
@@ -697,34 +721,90 @@ func (r *runner) flushLoop(ctx context.Context, stop <-chan struct{}) {
 func (r *runner) flushOnce(ctx context.Context, reason connector.FlushReason) {
 	r.flushSinks(ctx, reason)
 
+	// A Committer stages on Write and publishes on Commit, so it mints its committables here —
+	// BEFORE the checkpoint is written, because the checkpoint has to carry them.
+	id := r.checkpointer.next()
+	minted, err := r.prepare(ctx, connector.CommitPoint{
+		ID:       id,
+		Reason:   reason,
+		Deadline: time.Now().Add(r.deps.GracePeriod),
+	})
+	if err != nil {
+		r.fail(err)
+		return
+	}
+	r.checkpointer.stage(id, minted)
+
 	flushable := r.p.ledger.Flushable()
-	if len(flushable) == 0 {
+
+	// Nothing to record at all: no cursor moved and no committable was minted. Skipping keeps an
+	// idle pipeline from writing a checkpoint per tick.
+	if len(flushable) == 0 && len(minted) == 0 && !r.checkpointer.hasPending() {
 		return
 	}
 
-	for node, lc := range r.lanes {
-		mine := map[record.LaneID]record.Position{}
+	cp, err := r.buildCheckpoint(ctx, id)
+	if err != nil {
+		r.fail(err)
+		return
+	}
+	r.fillLaneStates(cp, flushable)
+
+	// ONE ATOMIC WRITE: every lane cursor plus the checkpoint carrying the committables that cover
+	// them. See commit.go for why they cannot be two writes.
+	start := time.Now()
+	if err := r.persistCheckpoint(ctx, cp, flushable); err != nil {
+		r.fail(err)
+		return
+	}
+	r.p.obs.commitLatency.ObserveSince(start, r.p.obs.pipeline, telemetry.CommitPhasePersist)
+	r.markCheckpointed(flushable)
+
+	// Step three of the two-phase commit, and only after the checkpoint is durable. A crash here
+	// leaves committables recovery will offer back to the sink, which is the whole reason they are
+	// written first.
+	if offer := r.checkpointer.offerable(); len(offer) > 0 {
+		if err := r.publish(ctx, id, offer); err != nil {
+			r.fail(err)
+			return
+		}
+	}
+
+	// ONLY NOW may the ledger emit acknowledgements for these positions. Calling Committed before
+	// the write returned would tell a source to advance past data canal has no durable record of,
+	// which is design rule R4's original violation.
+	if len(flushable) > 0 {
+		r.p.ledger.Committed(flushable)
+	}
+}
+
+// fillLaneStates copies the lane table into the checkpoint envelope.
+//
+// The cursors are ALSO written as their own rows in the same batch, which is not a second
+// representation so much as two readers: the lane rows are what a warm start reads to answer
+// Assigned, and the envelope is what makes a committable and the span it covers one atomic record.
+func (r *runner) fillLaneStates(cp *Checkpoint, positions map[record.LaneID]record.Position) {
+	for _, lc := range r.lanes {
 		lc.mu.Lock()
-		for lane, pos := range flushable {
-			if _, ok := lc.lanes[lane]; ok {
-				mine[lane] = pos
+		for id, rec := range lc.lanes {
+			cursor := rec.Cursor
+			if pos, ok := positions[id]; ok {
+				cursor = pos
+			}
+			cp.Lanes[id] = LaneState{
+				Cursor:     cursor,
+				Group:      rec.Spec.Group,
+				After:      rec.Spec.StartAfter,
+				Kind:       rec.Spec.Kind,
+				Ordering:   rec.Spec.Ordering,
+				Bounded:    rec.Spec.Boundedness == connector.Bounded,
+				Finished:   rec.Finished,
+				FinishedAt: rec.FinishedAt,
+				Label:      rec.Spec.Label,
+				Version:    lc.versions[id],
 			}
 		}
 		lc.mu.Unlock()
-		if len(mine) == 0 {
-			continue
-		}
-		start := time.Now()
-		if err := lc.commit(ctx, mine); err != nil {
-			r.fail(fmt.Errorf("engine: persisting lane cursors for %s: %w", node, err))
-			return
-		}
-		r.p.obs.commitLatency.ObserveSince(start, r.p.obs.pipeline, telemetry.CommitPhasePersist)
-		r.markCheckpointed(mine)
-		// ONLY NOW may the ledger emit acknowledgements for these positions. Calling Committed
-		// before the write returned would tell a source to advance past data canal has no durable
-		// record of, which is design rule R4's original violation.
-		r.p.ledger.Committed(mine)
 	}
 }
 

@@ -363,18 +363,19 @@ const defaultLaneBudget = 1000
 // refuses before opening anything, and `canal check` exits non-zero. Nothing can move a record under
 // a contract this build cannot keep.
 //
-// SCOPE (R10). This engine settles at two points: Sink.Write returning cleanly, and Flusher.Flush
-// making an accepted batch durable. Committer and TokenSink are resolved by the registry, reported
-// by the negotiation, and called by nothing, so ack points "commit" and "token" are still promises
-// this build cannot keep. As each is implemented its ack point comes off this list and the
-// pipelines that were refused start running.
+// SCOPE (R10). This engine settles at three points: Sink.Write returning cleanly, Flusher.Flush
+// making an accepted batch durable, and the two-phase commit publishing a committable. TokenSink is
+// resolved by the registry, reported by the negotiation, and called by nothing, so ack point
+// "token" is still a promise this build cannot keep. When it is implemented this function has
+// nothing left to refuse and should be deleted rather than left as a check that never fires.
 func Executable(n telemetry.Negotiated) error {
 	for _, id := range slices.Sorted(maps.Keys(n.Nodes)) {
 		c := n.Nodes[id]
 		switch c.AckPoint {
-		case "write", "flush":
-			// "write" settles when Write returns; "flush" holds the records and settles when
-			// Flusher.Flush makes them durable. Both are implemented — see durability.go.
+		case "write", "flush", "commit":
+			// "write" settles when Write returns; "flush" holds until Flusher.Flush makes the batch
+			// durable; "commit" holds until the two-phase commit publishes it. All three are
+			// implemented — see durability.go and commit.go.
 			continue
 		}
 		return fmt.Errorf(

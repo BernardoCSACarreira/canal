@@ -492,6 +492,76 @@ func TestALapsedRowStillNamesItsPreviousHolderAndSaysSoThroughTheExpiry(t *testi
 	}
 }
 
+// A REJECTED PLAN LEAVES NO PARTIAL STATE, which is the rule StateStore.Set states in this same
+// package and gives the reason for. Validating inside the apply loop meant a plan whose fifth row
+// was malformed had already written the first four and had not yet deleted anything, so the table
+// held half of one plan and half of the last.
+func TestARejectedPlanChangesNothing(t *testing.T) {
+	f := newFixture(t)
+	before := assignmentsByID(t, f)
+
+	bad := []store.LaneRow{
+		{ID: "lane-a", Name: "a", Weight: 42},
+		{ID: "lane-c", Name: "c"},
+		{ID: "", Name: "nameless"},
+	}
+	if err := f.c.Plan(context.Background(), tenant, pipe, gen, bad); err == nil {
+		t.Fatal("a plan containing a row with no id was accepted")
+	}
+
+	after := assignmentsByID(t, f)
+	if len(after) != len(before) {
+		t.Errorf("the rejected plan left %d rows, was %d; it was applied up to the bad row",
+			len(after), len(before))
+	}
+	if _, ok := after[f.id("lane-c")]; ok {
+		t.Error("a row from the rejected plan was written")
+	}
+	if got := after[f.id("lane-a")].Lane.Weight; got != 0 {
+		t.Errorf("lane-a carries weight %d from the rejected plan; the rows before the bad one were "+
+			"applied", got)
+	}
+	if _, ok := after[f.id("lane-b")]; !ok {
+		t.Error("lane-b is gone although the plan that would have withdrawn it was rejected")
+	}
+
+	// TWO ROWS FOR ONE LANE IS A PLANNER BUG. Taking the last silently makes it a bug that surfaces
+	// later as a lane whose gate or weight keeps changing for no reason anybody can trace.
+	dup := []store.LaneRow{{ID: "lane-a", Name: "a"}, {ID: "lane-a", Name: "a-again"}}
+	if err := f.c.Plan(context.Background(), tenant, pipe, gen, dup); err == nil {
+		t.Error("a plan naming one lane twice was accepted")
+	}
+}
+
+// A store that hands out its own maps is a store a caller can edit by accident.
+func TestWorkerLabelsAreCopiedInAndOut(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	labels := map[string]string{"zone": "eu-west-1a"}
+	m, err := f.c.Join(ctx, store.WorkerInfo{ID: "w1", Version: "1.0.0", Labels: labels})
+	if err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+
+	labels["zone"] = "edited-after-joining"
+	got, err := m.Workers(ctx)
+	if err != nil {
+		t.Fatalf("Workers: %v", err)
+	}
+	if got[0].Labels["zone"] != "eu-west-1a" {
+		t.Errorf("the store's copy became %q when the caller edited the map it passed to Join",
+			got[0].Labels["zone"])
+	}
+
+	got[0].Labels["zone"] = "edited-after-reading"
+	again, _ := m.Workers(ctx)
+	if again[0].Labels["zone"] != "eu-west-1a" {
+		t.Errorf("the store's copy became %q when a caller edited what Workers returned",
+			again[0].Labels["zone"])
+	}
+}
+
 // A finished lane is not claimable: there is nothing left to read, and handing it out would have a
 // worker open a source for a lane that is already done.
 func TestAFinishedLaneIsNotClaimable(t *testing.T) {

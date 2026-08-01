@@ -3,6 +3,7 @@ package memstore
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 	"sync"
@@ -60,11 +61,12 @@ type assignmentRow struct {
 
 	// ttl is remembered because Renew does not take one: renewing extends the lease the claim asked
 	// for, not some default the store picked.
+	//
+	// There is deliberately no second field for WHEN the lease lapsed. The reassignment delay runs
+	// from the lease's own expiry, and that is already on the row — a separate copy could only ever
+	// hold the same value or a wrong one, and stamping it took a mutation inside a function whose
+	// name promised a query.
 	ttl time.Duration
-
-	// lapsed is when this row's lease expired while still held, and it is what the reassignment delay
-	// is measured from. Zero while the row is unclaimed or the lease is live.
-	lapsed time.Time
 }
 
 // NewCoordinator returns an empty coordinator.
@@ -100,6 +102,11 @@ func (c *Coordinator) Join(_ context.Context, w store.WorkerInfo) (store.Members
 		return nil, fault.Contract(fault.OpOpen,
 			fmt.Errorf("memstore: a worker needs an id to join"))
 	}
+	// LABELS ARE COPIED IN AND OUT. They are the one map on the interface, and a store that hands out
+	// its own is a store a caller can edit by accident — the deployment's zone tag changing because
+	// somebody ranged over what Workers returned and normalised it in place.
+	w.Labels = maps.Clone(w.Labels)
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.workers[w.ID] = w
@@ -123,6 +130,7 @@ func (m *membership) Workers(context.Context) ([]store.WorkerInfo, error) {
 	defer m.c.mu.Unlock()
 	out := make([]store.WorkerInfo, 0, len(m.c.workers))
 	for _, w := range m.c.workers {
+		w.Labels = maps.Clone(w.Labels)
 		out = append(out, w)
 	}
 	// Ordered, because a caller rendering a worker list must not have it reshuffle on every read.
@@ -232,6 +240,10 @@ func (c *Coordinator) Plan(_ context.Context, t record.TenantID, id record.Pipel
 		}
 	}
 
+	// CHECKED IN FULL BEFORE ANYTHING IS WRITTEN, which is the same two-pass shape StateStore.Set
+	// uses and states the reason for: a rejected write must leave no partial state. Validating inside
+	// the apply loop meant a plan whose fifth row was malformed had already written the first four
+	// and had not yet deleted anything, so the table held half of one plan and half of the last.
 	keep := make(map[store.AssignmentID]bool, len(rows))
 	for _, lr := range rows {
 		if lr.ID == "" {
@@ -239,8 +251,17 @@ func (c *Coordinator) Plan(_ context.Context, t record.TenantID, id record.Pipel
 				fmt.Errorf("memstore: a lane row needs an id to be planned"))
 		}
 		aid := AssignmentIDFor(t, id, gen, lr.ID)
+		if keep[aid] {
+			// TWO ROWS FOR ONE LANE IS A PLANNER BUG, and taking the last one silently would make it
+			// a bug that shows up later as a lane whose gate or weight keeps changing for no reason.
+			return fault.Contract(fault.OpPersist,
+				fmt.Errorf("memstore: lane %s appears twice in one plan", lr.ID))
+		}
 		keep[aid] = true
+	}
 
+	for _, lr := range rows {
+		aid := AssignmentIDFor(t, id, gen, lr.ID)
 		row, ok := c.rows[aid]
 		if !ok {
 			row = &assignmentRow{a: store.Assignment{
@@ -295,9 +316,17 @@ func (c *Coordinator) regateLocked(t record.TenantID, id record.PipelineID, gen 
 				break
 			}
 		}
-		// A GATE THAT CLOSES ON A HELD LANE DOES NOT SNATCH IT BACK. Nothing here clears the lease:
-		// the holder finds out through Renew or through its own read of Assignments, and yanking the
-		// row underneath a worker that is mid-batch is the one thing the epoch cannot make safe.
+		// A GATE THAT CLOSES ON A HELD LANE DOES NOT SNATCH IT BACK. Nothing here clears the lease,
+		// and yanking a row from underneath a worker that is mid-batch is the one thing the epoch
+		// cannot make safe.
+		//
+		// SO THE HOLDER LEARNS FROM Assignments AND NOT FROM Renew. Renew deliberately checks only
+		// that the row is still this worker's at this epoch, because the two things that genuinely
+		// invalidate a holding — the row being withdrawn from the plan, and the generation being
+		// superseded — both delete the row and are caught by that check. A gate re-closing inside one
+		// generation means the planner reported a finished predecessor as unfinished, which is a
+		// planner bug rather than a placement change, and fencing a mid-batch worker over it would
+		// turn that bug into lost progress.
 	}
 }
 
@@ -360,7 +389,7 @@ func (c *Coordinator) Claim(_ context.Context, a store.AssignmentID, w store.Wor
 	c.epoch++
 	row.a.Worker, row.a.Epoch = w, c.epoch
 	row.a.LeaseExpires = now.Add(ttl)
-	row.ttl, row.lapsed = ttl, time.Time{}
+	row.ttl = ttl
 	return leaseOf(row), nil
 }
 
@@ -381,12 +410,10 @@ func (c *Coordinator) holderLocked(row *assignmentRow, now time.Time) (store.Wor
 	if now.Before(row.a.LeaseExpires) {
 		return row.a.Worker, row.a.LeaseExpires
 	}
-	// Expired. Record when, the first time anybody notices, so the delay is measured from the lease's
-	// own expiry rather than from whenever a claimant happened to ask.
-	if row.lapsed.IsZero() {
-		row.lapsed = row.a.LeaseExpires
-	}
-	if until := row.lapsed.Add(store.DefaultReassignmentDelay); now.Before(until) {
+	// Expired, and the delay runs from the LEASE'S OWN EXPIRY rather than from whenever a claimant
+	// happened to ask — a delay restarted by each attempt would be extended by every attempt, so a
+	// busy cluster would never reassign anything.
+	if until := row.a.LeaseExpires.Add(store.DefaultReassignmentDelay); now.Before(until) {
 		return row.a.Worker, until
 	}
 	return "", time.Time{}
@@ -443,7 +470,7 @@ func (c *Coordinator) Release(_ context.Context, l store.Lease) error {
 	// vanished; one that hands a lane back has said it is not coming for it, and making the cluster
 	// wait two minutes on a clean shutdown would make every rolling deploy a two-minute stall.
 	row.a.Worker, row.a.Epoch = "", 0
-	row.a.LeaseExpires, row.lapsed = time.Time{}, time.Time{}
+	row.a.LeaseExpires = time.Time{}
 	return nil
 }
 

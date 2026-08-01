@@ -5,18 +5,24 @@
 // about durability at the destination was being tested against a file descriptor the test harness
 // happened to own.
 //
-// # A clean return means durable, and there is no option to make that false
+// # Durability is earned at Flush, and it is declared, not configured
 //
-// Every Write flushes the buffer and fsyncs the file before returning. There is deliberately no
-// `sync: false` for throughput, and the reason is that [connector.SinkCaps] is fixed at
-// REGISTRATION while config is per node: a sink that is durable-on-return under one config and not
-// under another cannot describe itself honestly to the negotiation, and the negotiation is the
-// whole mechanism by which canal avoids promising a guarantee it cannot keep. Design rule R4 says
-// an acknowledgement means durable; a config flag that quietly turns that off is R4's original
-// violation with a knob on it.
+// This sink implements [connector.Flusher]. Write appends to a buffer and returns; Flush writes it
+// through and fsyncs. The core knows — SinkCaps.Flushes says so — and therefore does NOT settle a
+// record when Write returns. It holds the record, and its ledger reference with it, until the flush
+// that makes it safe. That is the whole point of the capability: the durability boundary is where
+// the sink says it is, and the engine's accounting follows.
 //
-// The cost is one fsync per request, and the answer to it is batching: a framed codec puts a whole
-// batch in one request, so the fsync amortises over as many records as the batch holds.
+// It fsynced on every Write before the engine could drive a Flusher. That was correct and very
+// slow: one fsync per request, which for a framed codec is one per batch and for an unframed one is
+// one per record. Now it is one per checkpoint interval, and the records in between are explicitly
+// not-yet-durable rather than quietly assumed to be.
+//
+// There is deliberately no `sync: false` and no way to turn any of this off, because
+// [connector.SinkCaps] is fixed at REGISTRATION while config is per node: a sink that is durable at
+// one point under one config and another point under another cannot describe itself honestly to the
+// negotiation, and the negotiation is the whole mechanism by which canal avoids promising a
+// guarantee it cannot keep.
 //
 // # Append only
 //
@@ -82,6 +88,10 @@ func Register(r *registry.Registry) {
 			// A write either lands whole or does not land: there is no per-record failure a
 			// filesystem reports, so there is nothing honest to put in WriteResult.Failed.
 			PartialFailure: false,
+
+			// Durability is earned here, not when Write returns. The engine holds every record
+			// until the flush that covers it.
+			Flushes: true,
 		},
 		New: func(_ context.Context, cfg *config.Config) (*sink, error) {
 			path, err := config.Get[string](cfg, "path")
@@ -145,19 +155,38 @@ func (s *sink) Write(_ context.Context, req *connector.Request) (connector.Write
 		return connector.WriteResult{}, fault.Unknown(fault.OpWrite,
 			fmt.Errorf("writing to %s: %w", s.path, err))
 	}
+
+	// ACCEPTED, NOT DURABLE. A clean return here means the bytes are in this process's buffer and
+	// nothing more. Because SinkCaps.Flushes is declared, the core reads it that way and withholds
+	// settlement until Flush; a sink that returned this WITHOUT declaring Flushes would be telling
+	// the engine to advance a cursor past data still in userspace.
+	return connector.AllWritten(req.Count), nil
+}
+
+// Flush writes the buffer through and fsyncs. Only after it returns cleanly are the records it
+// covers durable, and only then does the core settle them.
+//
+// reason is not consulted. A file has nothing to finalise differently at end of input — no manifest
+// to write, no undersized artifact to seal — so every reason means the same thing here. A staging
+// sink is where the distinction earns its place.
+func (s *sink) Flush(_ context.Context, _ connector.FlushReason) (connector.WriteResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.w == nil {
+		return connector.WriteResult{}, fault.Bug(fault.OpFlush,
+			fmt.Errorf("filesink: Flush before Open"))
+	}
 	if err := s.w.Flush(); err != nil {
-		return connector.WriteResult{}, fault.Unknown(fault.OpWrite,
+		return connector.WriteResult{}, fault.Unknown(fault.OpFlush,
 			fmt.Errorf("flushing %s: %w", s.path, err))
 	}
 	if err := s.f.Sync(); err != nil {
-		return connector.WriteResult{}, fault.Unknown(fault.OpWrite,
+		return connector.WriteResult{}, fault.Unknown(fault.OpFlush,
 			fmt.Errorf("syncing %s: %w", s.path, err))
 	}
-
-	// Only NOW is a clean return honest. Returning before the fsync would tell the core these
-	// records are durable while they sit in a page cache, and the core would advance a cursor past
-	// them — design rule R4 in one function.
-	return connector.AllWritten(req.Count), nil
+	// An empty WriteResult means "everything you were holding is durable". The core knows which
+	// records those are; this sink does not track them, and does not need to.
+	return connector.WriteResult{}, nil
 }
 
 // Close flushes and closes. It is safe on a sink that was never opened, which the core relies on

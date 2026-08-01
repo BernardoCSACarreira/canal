@@ -299,11 +299,18 @@ func Build(ctx context.Context, r *registry.Registry, s spec.Spec, d Deps) (*Pip
 
 	budget := s.LaneBudget
 	if budget <= 0 {
-		budget = 1000
+		budget = defaultLaneBudget
 		neg.Defaults = append(neg.Defaults,
 			telemetry.DefaultNote{Path: []string{config.FieldLaneBudget}, Value: budget, From: "core default"})
 		neg.ReplayBudget = budget
 	}
+	// The EFFECTIVE budget is written back, so everything downstream reads one number instead of
+	// re-deriving the default. The flush trigger got this wrong by reading the spec's zero and
+	// capping at FlushRecords=10000, which a budget of 1000 makes unreachable — so the trigger never
+	// fired and a Flusher pipeline ran at budget-per-tick until its drain timed out. p.Spec() now
+	// reports what is in force rather than what was submitted, which is the more useful answer and
+	// is already disclosed as a default note.
+	s.LaneBudget = budget
 
 	ob, err := newObs(deps.Metrics, s.ID)
 	if err != nil {
@@ -335,6 +342,9 @@ func Build(ctx context.Context, r *registry.Registry, s spec.Spec, d Deps) (*Pip
 	return p, neg, diags
 }
 
+// defaultLaneBudget is the in-flight bound a spec that names none gets.
+const defaultLaneBudget = 1000
+
 // Executable reports whether THIS BUILD can honour a negotiated contract.
 //
 // WHY THIS EXISTS. Negotiation is a pure function of COMPONENT capabilities: it works out what the
@@ -353,14 +363,18 @@ func Build(ctx context.Context, r *registry.Registry, s spec.Spec, d Deps) (*Pip
 // refuses before opening anything, and `canal check` exits non-zero. Nothing can move a record under
 // a contract this build cannot keep.
 //
-// SCOPE (R10). This engine settles on exactly one thing: Sink.Write returning cleanly, which is ack
-// point "write". Flusher, Committer and TokenSink are resolved by the registry, reported by the
-// negotiation, and called by nothing. As each is implemented its ack point comes off this list and
-// the pipelines that were refused start running.
+// SCOPE (R10). This engine settles at two points: Sink.Write returning cleanly, and Flusher.Flush
+// making an accepted batch durable. Committer and TokenSink are resolved by the registry, reported
+// by the negotiation, and called by nothing, so ack points "commit" and "token" are still promises
+// this build cannot keep. As each is implemented its ack point comes off this list and the
+// pipelines that were refused start running.
 func Executable(n telemetry.Negotiated) error {
 	for _, id := range slices.Sorted(maps.Keys(n.Nodes)) {
 		c := n.Nodes[id]
-		if c.AckPoint == "write" {
+		switch c.AckPoint {
+		case "write", "flush":
+			// "write" settles when Write returns; "flush" holds the records and settles when
+			// Flusher.Flush makes them durable. Both are implemented — see durability.go.
 			continue
 		}
 		return fmt.Errorf(

@@ -67,6 +67,9 @@ type runner struct {
 	mainSinks   []record.NodeID
 	failedSinks []record.NodeID
 
+	// deferred holds records accepted by a sink that has not yet made them durable.
+	deferred *deferred
+
 	mu       sync.Mutex
 	firstErr error
 
@@ -178,6 +181,25 @@ func (r *runner) run(ctx context.Context) error {
 	r.started = time.Now()
 	r.lastPersist = r.started
 	r.mainSinks, r.failedSinks = partitionSinks(r.p.spec, r.p.sinks)
+	// THE TRIGGER MUST FIRE BEFORE ADMISSION BLOCKS, which is why it is half the budget and not the
+	// whole of it.
+	//
+	// With a Flusher every un-durable record counts against the lane budget, so a trigger equal to
+	// the budget is unreachable: the read loop fills the budget, Admit blocks, and the flush that
+	// would release it never happens because the batch that would have triggered it is stuck in
+	// admission. Measured at 3,450 records/s — the budget divided by the tick interval — where half
+	// the budget gives 92,000/s on the same input.
+	//
+	// Half leaves room for at least one more read batch, which is all the margin the invariant
+	// needs. FlushRecords caps it lower when an operator wants a tighter durability window.
+	trigger := r.deps.FlushRecords
+	if half := r.p.spec.LaneBudget / 2; half > 0 && half < trigger {
+		trigger = half
+	}
+	if trigger <= 0 {
+		trigger = 1
+	}
+	r.deferred = newDeferred(trigger)
 
 	// Sinks open before sources. A source that produces before its sink can accept is a batch with
 	// nowhere to go, held against the lane budget for nothing.
@@ -242,7 +264,16 @@ func (r *runner) run(ctx context.Context) error {
 	}
 
 	// One final flush, so anything that settled during the drain is durable before we stop.
-	r.flushOnce(context.WithoutCancel(ctx))
+	//
+	// THE REASON IS THE INTERESTING PART. A bounded pipeline that reached the end of its input is
+	// finalising for good, and a staging sink has to seal the 4 MB file it was hoping would reach
+	// 128 MB; a pipeline stopped by a signal is draining and may well be restarted, so the same
+	// sink is right to keep waiting. ctx.Err() is exactly that distinction, already available.
+	finalReason := connector.FlushEndOfInput
+	if ctx.Err() != nil {
+		finalReason = connector.FlushDrain
+	}
+	r.flushOnce(context.WithoutCancel(ctx), finalReason)
 
 	// And one final gauge refresh, so the last scrape describes the state the pipeline actually
 	// stopped in. Without it a run shorter than the flush interval published no gauges at all, and
@@ -265,6 +296,8 @@ func (r *runner) run(ctx context.Context) error {
 	_ = r.p.ledger.Close() // closing the ack channel is what ends the pump
 	<-pumpDone
 	wg.Wait()
+
+	r.reportUndrained()
 
 	if leaks := r.p.ledger.Leaks(); len(leaks) > 0 {
 		// A drain that did not complete is a DIFFERENT event from a completed drain, because it
@@ -582,6 +615,9 @@ func (r *runner) deliver(ctx context.Context, batch *record.Batch) error {
 		if err := r.writeSet(ctx, id, batch.Records); err != nil {
 			return err
 		}
+		// A deferring sink holds what it was just given, so this is where the pipeline finds out it
+		// has accumulated enough un-durable work to be worth flushing now.
+		r.flushIfDue(ctx, id)
 	}
 	return nil
 }
@@ -644,7 +680,7 @@ func (r *runner) flushLoop(ctx context.Context, stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-t.C:
-			r.flushOnce(context.WithoutCancel(ctx))
+			r.flushOnce(context.WithoutCancel(ctx), connector.FlushCheckpoint)
 			// Unconditionally, even when nothing was flushable: a stalled pipeline produces no
 			// flushes, and that is precisely when its checkpoint age has to keep climbing.
 			r.refreshGauges()
@@ -653,7 +689,14 @@ func (r *runner) flushLoop(ctx context.Context, stop <-chan struct{}) {
 }
 
 // flushOnce performs one phase-two write.
-func (r *runner) flushOnce(ctx context.Context) {
+//
+// SINKS FLUSH FIRST. A cursor is only allowed to name a position whose records are durable AT THE
+// DESTINATION, so every deferring sink is given the chance to earn its acknowledgement before the
+// ledger is asked what has resolved. Asking first and flushing second would persist a position for
+// records still sitting in a sink's buffer, which is the failure ADR 0006 exists to prevent.
+func (r *runner) flushOnce(ctx context.Context, reason connector.FlushReason) {
+	r.flushSinks(ctx, reason)
+
 	flushable := r.p.ledger.Flushable()
 	if len(flushable) == 0 {
 		return

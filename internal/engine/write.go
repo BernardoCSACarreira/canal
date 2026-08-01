@@ -183,10 +183,8 @@ func (r *runner) writeOnce(ctx context.Context, id record.NodeID, sk *registry.R
 			}
 			landed = append(landed, rec)
 		}
-		if len(landed) > 0 {
-			r.p.ledger.Settle(outcomesFor(id, landed, res))
-			r.p.obs.recordsWritten.Add(float64(len(landed)), r.p.obs.pipeline, string(id), sk.Name)
-		}
+		// A sink that earns its acknowledgement later HOLDS instead of settling. See durability.go.
+		r.settleOrHold(id, sk, landed, res)
 		if n := len(res.Duplicates); n > 0 {
 			r.p.obs.recordsDuplicate.Add(float64(n), r.p.obs.pipeline, string(id))
 		}

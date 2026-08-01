@@ -352,7 +352,12 @@ func TestUnmeasuredFieldsMarshalAsNullAndNotZero(t *testing.T) {
 	}
 	// Config is deliberately absent rather than raw: it is the only field that could carry a secret,
 	// and the redaction it needs is not plumbed. Absent is the safe direction.
-	if strings.Contains(string(body), `"config"`) {
+	//
+	// Matched as a KEY and not as a substring. `"config"` alone also matches any string value
+	// containing the word — a default note's path, a condition message, a connector name — and this
+	// assertion fired on the first of those the moment one existed. A test that fails on prose is a
+	// test people learn to edit rather than read.
+	if strings.Contains(string(body), `"config":`) {
 		t.Errorf("the document carries a config tree, which is the one field that can leak a secret:\n%s", body)
 	}
 }

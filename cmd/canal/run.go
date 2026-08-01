@@ -128,6 +128,12 @@ func cmdRun(args []string) int {
 		FlushInterval: o.flush,
 		GracePeriod:   o.grace,
 	}
+	// A SPEC READ FROM A PIPE HAS NO STORED COPY, so there is nothing to compare the running revision
+	// against and no config store to supply. The condition reports true for that run and says why —
+	// "no config store holds another" — rather than claiming a comparison nobody could have made.
+	if o.spec != "-" {
+		deps.Config = newSpecFile(o.spec, s)
+	}
 
 	// Signals are wired up BEFORE Build so a Ctrl-C during a slow build is not ignored, and the
 	// handler is installed before anything can block.
@@ -270,6 +276,22 @@ func loadSpec(path string, log *slog.Logger) (spec.Spec, error) {
 		return spec.Spec{}, fmt.Errorf("reading the spec: %w", err)
 	}
 
+	s, err := decodeSpec(data, path)
+	if err != nil {
+		return spec.Spec{}, err
+	}
+	if s.Retry == (fault.RetryPolicy{}) {
+		s.Retry = fault.DefaultRetry
+		log.Debug("spec has no retry policy; using the default", "max_attempts", s.Retry.MaxAttempts)
+	}
+	return s, nil
+}
+
+// decodeSpec parses a spec, and applies NO defaults.
+//
+// It is separate from loadSpec because specFile re-reads the same bytes to answer "what revision is
+// stored", and a store filling in the engine's defaults would be a store editing what it stores.
+func decodeSpec(data []byte, path string) (spec.Spec, error) {
 	var s spec.Spec
 	dec := json.NewDecoder(bytes.NewReader(data))
 	// An unknown field is a typo, and a typo silently ignored is a setting the operator believes
@@ -277,11 +299,6 @@ func loadSpec(path string, log *slog.Logger) (spec.Spec, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&s); err != nil {
 		return spec.Spec{}, fmt.Errorf("parsing %s: %w", path, err)
-	}
-
-	if s.Retry == (fault.RetryPolicy{}) {
-		s.Retry = fault.DefaultRetry
-		log.Debug("spec has no retry policy; using the default", "max_attempts", s.Retry.MaxAttempts)
 	}
 	return s, nil
 }

@@ -37,8 +37,6 @@ import (
 //
 // Removing an entry is how a field graduates. Adding one should feel like a decision.
 var unreadFields = map[string]string{
-	"Deps.Config": "store.ConfigStore is the control plane's spec store; nothing in the standalone " +
-		"shape holds a second revision to read. It is what makes CondSpecApplied able to be false.",
 	"Deps.Coordinator": "store.Coordinator is leases and assignment planning for the multi-worker " +
 		"shape. A single worker holds every lane from Open and there is nothing to claim.",
 	"Deps.Status": "store.StatusStore.Report publishes the read model per worker and Aggregate " +

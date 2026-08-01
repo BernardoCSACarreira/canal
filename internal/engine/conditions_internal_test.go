@@ -6,14 +6,13 @@ import (
 	"github.com/BernardoCSACarreira/canal/pkg/telemetry"
 )
 
-// specApplied is the projection behind CondSpecApplied, and it is tested here rather than through a
-// pipeline for a reason worth stating: this build cannot PRODUCE divergent revisions.
+// specApplied is the arithmetic behind CondSpecApplied: two revisions in, one condition out.
 //
-// PipelineStatus.Generation is the stored config revision and ObservedGeneration is the applied one;
-// in a standalone run canal loaded the stored spec, so there is one revision and the engine's call
-// site compares it with itself. That makes the call trivially equal and the function not. The
-// comparison is the part that has to be right before there is anything to compare, and the day a
-// control plane can hold a revision this process has not applied, this is already correct.
+// It was written before anything could produce divergent revisions and tested here for that reason —
+// the comparison had to be right before there was anything to compare. There is now: config.go
+// watches store.ConfigStore for the stored revision, config_test.go drives the divergence through a
+// real pipeline, and configCondition covers the answers arithmetic cannot give. This stays as the
+// table for the arithmetic itself.
 func TestSpecAppliedAnswersTheConfigQuestion(t *testing.T) {
 	same := specApplied(9, 9)
 	if same.Status != telemetry.StatusTrue || same.Reason != telemetry.ReasonApplied {

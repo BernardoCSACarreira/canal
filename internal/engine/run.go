@@ -229,7 +229,7 @@ func (r *runner) refreshGauges() {
 	}
 
 	o.reconcile.Set(float64(int64(facts.admitted)-int64(facts.settled)-int64(facts.abandoned)), o.pipeline)
-	r.publishConditions(r.conditions(now, facts))
+	r.publishConditions(r.conditions(now, facts, r.p.configView()))
 }
 
 func (r *runner) fail(err error) {
@@ -262,6 +262,12 @@ func (r *runner) run(ctx context.Context) error {
 	// that cancellation, or the final flush is cancelled at exactly the moment it matters most.
 	runCtx, stopReading := context.WithCancel(ctx)
 	defer stopReading()
+
+	// THE CONFIG WATCH STARTS BEFORE ANYTHING IS OPENED, and takes ctx rather than runCtx so it keeps
+	// answering through the drain. "Did my config take effect" is asked most often while a pipeline is
+	// stuck opening against an unreachable upstream, which is exactly the window a watch started after
+	// the opens would miss. It touches no record and holds no lock this function takes; see config.go.
+	defer r.watchConfig(ctx)()
 
 	// Sinks open before sources. A source that produces before its sink can accept is a batch with
 	// nowhere to go, held against the lane budget for nothing.

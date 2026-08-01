@@ -47,15 +47,19 @@ func (r *runner) progressWindow() time.Duration {
 // Transition times are preserved across calls: a condition whose status and reason are unchanged
 // keeps the moment it last CHANGED, which is the only thing that field can usefully mean. Computing
 // it as "now" would make every scrape look like a transition.
-func (r *runner) conditions(now time.Time, f laneFacts) []telemetry.Condition {
+func (r *runner) conditions(now time.Time, f laneFacts, cfg *configView) []telemetry.Condition {
 	r.status.mu.Lock()
 	defer r.status.mu.Unlock()
 
 	if r.status.conditions == nil {
 		r.status.conditions = map[telemetry.ConditionType]telemetry.Condition{}
 	}
+	// ObservedGeneration is the APPLIED revision on every condition, including the one that reports
+	// the stored revision differs. A condition stamped with the generation it was computed against is
+	// how a stale condition is identifiable as stale, and the generation this process computed
+	// against is the one it is running.
 	gen := r.p.spec.Revision
-	fresh := r.computeLocked(now, f)
+	fresh := r.computeLocked(now, f, cfg)
 
 	out := make([]telemetry.Condition, 0, len(telemetry.ConditionTypes))
 	for _, t := range telemetry.ConditionTypes {
@@ -73,7 +77,9 @@ func (r *runner) conditions(now time.Time, f laneFacts) []telemetry.Condition {
 }
 
 // computeLocked evaluates every condition. It runs under status.mu.
-func (r *runner) computeLocked(now time.Time, f laneFacts) map[telemetry.ConditionType]telemetry.Condition {
+func (r *runner) computeLocked(now time.Time, f laneFacts,
+	cfg *configView,
+) map[telemetry.ConditionType]telemetry.Condition {
 	cond := func(s telemetry.Status, reason, msg string) telemetry.Condition {
 		return telemetry.Condition{Status: s, Reason: reason, Message: msg}
 	}
@@ -87,12 +93,11 @@ func (r *runner) computeLocked(now time.Time, f laneFacts) map[telemetry.Conditi
 	out[telemetry.CondConfigured] = cond(telemetry.StatusTrue, telemetry.ReasonApplied,
 		"the spec was validated and negotiated")
 
-	// SPEC APPLIED compares the stored revision with the applied one. Both are the running spec's
-	// today, for the reason PipelineStatus.Generation records — so the call below is trivially equal
-	// and the projection it calls is not. specApplied is where the answer lives, it is tested with
-	// divergent revisions, and the day a control plane can hold a revision this process has not
-	// applied it is already correct.
-	out[telemetry.CondSpecApplied] = specApplied(r.p.spec.Revision, r.p.spec.Revision)
+	// SPEC APPLIED compares the STORED revision with the APPLIED one, and the stored one now comes
+	// from somewhere else: the config watch's last observation of store.ConfigStore. A worker with no
+	// config store still gets true, because the spec it loaded is the only revision in existence —
+	// but it is no longer true by construction, and that is the whole difference. See config.go.
+	out[telemetry.CondSpecApplied] = configCondition(r.deps.Config != nil, cfg, r.p.spec.Revision)
 
 	switch {
 	case f.total == 0:

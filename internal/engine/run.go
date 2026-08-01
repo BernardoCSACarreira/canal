@@ -475,6 +475,19 @@ func (r *runner) deliver(ctx context.Context, batch *record.Batch) error {
 }
 
 // outcomesFor turns one WriteResult into the ledger's outcomes.
+//
+// IT IS CALLED WITH THE RECORDS THAT LANDED, never the whole request. Its one caller —
+// [runner.writeOnce] — has already removed everything res.Failed names, because a named failure
+// belongs to the routing tree in retry.go: it may deserve a retry, and settling it here would
+// advance the cursor past a record the policy was about to re-present.
+//
+// The failed arm below is therefore UNREACHABLE, and it stays for one reason: if a future caller
+// ever passes the full set, abandoning a failed record is wrong but reporting it Delivered is
+// catastrophic. It is the safe floor under a mistake, not a live path.
+//
+// Passing everything to this function IS the defect this PR fixed. Every named failure was settled
+// Abandoned on first sight, so a sink rejecting one record of a batch for a transient reason lost
+// it permanently. Read the arm as a tombstone.
 func outcomesFor(node record.NodeID, records []*record.Record, res connector.WriteResult) []ledger.Outcome {
 	failed := make(map[record.RecordID]*fault.Fault, len(res.Failed))
 	for i := range res.Failed {

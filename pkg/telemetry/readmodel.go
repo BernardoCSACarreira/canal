@@ -160,9 +160,13 @@ type Throughput struct {
 	RecordsPerSecondOut *float64 `json:"recordsPerSecondOut"`
 	BytesPerSecondOut   *float64 `json:"bytesPerSecondOut"`
 
-	// ReconcileDelta is records in minus records out for the last checkpoint. A persistent divergence
-	// is the only cheap way to notice a sink that silently drops, and it is CHECKED, not merely
-	// recorded.
+	// ReconcileDelta is records in minus records out for the last checkpoint, where OUT is settled
+	// PLUS abandoned. A persistent divergence is the only cheap way to notice a sink that silently
+	// drops, and it is CHECKED, not merely recorded.
+	//
+	// Abandoned records count as out because they left by an ACCOUNTED route — a dead letter, a drop,
+	// a lane shed under when_full. Excluding them made this permanently non-zero the first time any
+	// of those fired, so the signal could no longer report the unaccounted loss it exists for.
 	ReconcileDelta *int64 `json:"reconcileDelta"`
 }
 

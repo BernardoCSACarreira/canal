@@ -295,6 +295,7 @@ type floodResult struct {
 	produced int
 	dropped  int
 	metric   float64
+	delta    *int64
 }
 
 // runFlood drives a flooding source into a wedged sink until the lane is well past its budget.
@@ -364,6 +365,7 @@ func runFlood(t *testing.T, w connector.WhenFull, nodeOverride string) floodResu
 	if len(s.Lanes) == 1 {
 		res.dropped = int(s.Lanes[0].RecordsAbandoned)
 	}
+	res.delta = s.Throughput.ReconcileDelta
 	res.metric = sumAbandonedFor(t, scrape(t, reg), telemetry.ReasonBufferFull)
 	return res
 }
@@ -395,4 +397,72 @@ func sumAbandonedFor(t *testing.T, body, reason string) float64 {
 		total += v
 	}
 	return total
+}
+
+// RECORDS OUT IS SETTLED PLUS ABANDONED, and getting that wrong destroys the signal the reconcile
+// delta exists for.
+//
+// The delta is documented as the cheap way to notice a sink that silently drops: a QUIESCENT
+// pipeline whose in and out counts disagree has lost records nobody accounted for. Counting only the
+// settled ones as "out" meant an abandoned record — a dead letter, a drop, a lane shed — read as
+// missing, so the delta went permanently non-zero the first time any of those fired and could never
+// report anything again. Shedding twenty thousand records made that impossible to miss; it was
+// already true of a single dead letter.
+func TestTheReconcileDeltaCountsAnAbandonedRecordAsAccountedFor(t *testing.T) {
+	got := runFlood(t, connector.WhenFullReject, "")
+	if got.dropped == 0 {
+		t.Fatalf("nothing was shed over %d produced records, so this test proves nothing", got.produced)
+	}
+	if got.delta == nil {
+		t.Fatal("no reconcile delta in the document")
+	}
+	// Everything read either settled or was shed. Nothing is unexplained, so the delta must not carry
+	// the shed count — and before the fix it carried all twenty thousand of them.
+	if int64(got.dropped) <= *got.delta {
+		t.Errorf("the reconcile delta is %d against %d deliberately shed records: a configured loss is "+
+			"an ACCOUNTED loss, and a delta that absorbs it can never report an unaccounted one",
+			*got.delta, got.dropped)
+	}
+}
+
+// IDENTICAL BUILDS MUST PRODUCE IDENTICAL DIAGNOSTICS. This package already carries the scar: 200
+// identical Builds of one graph produced four different DurabilityEdge values because a single-valued
+// answer was assigned inside a map-range loop. A diagnostic LIST built by ranging a map has the same
+// defect in a different costume, and an operator diffing two runs of `canal check` sees it.
+func TestRepeatedBuildsProduceTheSameDiagnosticsInTheSameOrder(t *testing.T) {
+	dir := t.TempDir()
+	st, err := wal.Open(filepath.Join(dir, "state"))
+	if err != nil {
+		t.Fatalf("opening the store: %v", err)
+	}
+	defer st.Close()
+
+	src := &floodSource{perBatch: 2, release: make(chan struct{})}
+	srcName := registerFloodSource(t, src)
+	sinkName := registerProbe(t, "order_sink", &probeSink{})
+
+	// BOTH nodes ask to overflow, so there are two diagnostics whose order can differ.
+	s := floodSpec(srcName, sinkName, connector.WhenFullOverflow, "overflow")
+	s.Graph[1].Config["when_full"] = "overflow"
+
+	var first string
+	for i := 0; i < 30; i++ {
+		_, _, diags := engine.Build(context.Background(), registry.Default, s,
+			engine.Deps{State: st, Worker: "test", GracePeriod: time.Second})
+		var b strings.Builder
+		for _, d := range diags {
+			fmt.Fprintf(&b, "%s|%s\n", d.Node, d.Message)
+		}
+		if i == 0 {
+			first = b.String()
+			if !strings.Contains(first, "overflow") {
+				t.Fatalf("no overflow diagnostic was produced:\n%s", first)
+			}
+			continue
+		}
+		if b.String() != first {
+			t.Fatalf("build %d produced different diagnostics:\n--- first ---\n%s--- now ---\n%s",
+				i, first, b.String())
+		}
+	}
 }

@@ -730,7 +730,7 @@ func (l *Ledger) Stats(lane record.LaneID) LaneStats {
 		}
 	}
 	tracker := st.tracker
-	out.Admitted = st.recordsRead
+	out.RecordsRead = st.recordsRead
 	shed := st.shed
 	out.AbandonedTotal = shed
 	l.mu.Unlock()
@@ -760,7 +760,10 @@ type LaneStats struct {
 	Committed   record.Position
 	CommittedOK bool
 
-	Admitted       uint64
+	// RecordsRead is everything the source produced for this lane, INCLUDING records shed at
+	// admission. It was called Admitted, which stopped being true the moment a shed could count: a
+	// shed record is read and deliberately not admitted.
+	RecordsRead    uint64
 	Settled        uint64
 	AbandonedTotal uint64
 	InFlight       uint64

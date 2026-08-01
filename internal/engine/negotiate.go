@@ -541,7 +541,13 @@ func refuseOverflow(s *spec.Spec, res resolved, d config.Diagnostics) config.Dia
 	if s.WhenFull == connector.WhenFullOverflow {
 		d = append(d, capDiag("", msg("the pipeline"), fix, "connector.Buffer"))
 	}
-	for id, cfg := range res.configs {
+	// IN GRAPH ORDER, NOT MAP ORDER. Ranging res.configs would make the diagnostic list reshuffle
+	// between identical builds of the same spec — which is the defect this package already carries a
+	// comment about, where 200 identical Builds of one graph produced four DurabilityEdge values.
+	// An operator comparing two runs of `canal check` must see the same output.
+	for i := range s.Graph {
+		id := s.Graph[i].ID
+		cfg := res.configs[id]
 		if cfg == nil || !cfg.Has(config.FieldWhenFull) {
 			continue
 		}

@@ -165,8 +165,8 @@ func TestGroupIDReuseIsRefused(t *testing.T) {
 	if st.PendingGroups != 1 {
 		t.Errorf("pending groups = %d, want 1: the refused Admit leaked or dropped a ticket", st.PendingGroups)
 	}
-	if st.Admitted != uint64(first.Len()) {
-		t.Errorf("admitted = %d, want %d: the refused batch was counted as admitted", st.Admitted, first.Len())
+	if st.RecordsRead != uint64(first.Len()) {
+		t.Errorf("admitted = %d, want %d: the refused batch was counted as admitted", st.RecordsRead, first.Len())
 	}
 }
 

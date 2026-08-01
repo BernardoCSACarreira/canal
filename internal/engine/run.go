@@ -228,7 +228,7 @@ func (r *runner) refreshGauges() {
 		}
 	}
 
-	o.reconcile.Set(float64(int64(facts.admitted)-int64(facts.settled)), o.pipeline)
+	o.reconcile.Set(float64(int64(facts.admitted)-int64(facts.settled)-int64(facts.abandoned)), o.pipeline)
 	r.publishConditions(r.conditions(now, facts))
 }
 
@@ -572,6 +572,10 @@ func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 	lane := assigned[0]
 	alloc := record.NewAllocator(r.p.spec.Tenant, r.p.spec.ID, id, lane.ID, lane.Spec.Stream, 1, 1)
 
+	// Resolved once. It cannot change during a run, and the shed path logs it on a line that can fire
+	// twenty thousand times a second.
+	policy := r.whenFullFor(id)
+
 	// readAttempt is RESET after every successful read. Carrying it across successes would make
 	// MaxAttempts a lifetime budget rather than a per-failure one, so a source that hiccuped four
 	// times over a week would stop on the fourth — a week apart, and correctly reported as
@@ -654,7 +658,7 @@ func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 			if shed {
 				r.deps.Log.Error("records were dropped because the lane is full and its policy sheds",
 					"node", id, "lane", lane.ID, "records", batch.Len(),
-					"when_full", r.whenFullFor(id), "budget", r.p.spec.LaneBudget)
+					"when_full", policy, "budget", r.p.spec.LaneBudget)
 				r.p.obs.recordsAbandoned.Add(float64(batch.Len()), r.p.obs.pipeline,
 					laneLabel(lane.ID), telemetry.ReasonBufferFull)
 			}

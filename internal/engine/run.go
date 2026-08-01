@@ -22,15 +22,15 @@ import (
 //
 // What it does NOT do yet, and where each would go:
 //
-//   - CODECS. Build does not resolve the stage-standard codec field into an encoder chain yet, so a
-//     request carries the source's payload bytes unchanged, one record at a time. See buildRequests
-//     for why one at a time is the only correct choice without a framer.
 //   - TRANSFORMS AND BUFFERS. No component of either kind is registered anywhere in the module, so
 //     there is no node to run. The ledger already models the fan-out they need through Expand.
 //   - MULTI-WORKER COORDINATION. See the note in runtime.go.
 //
-// None of these is a hidden gap: each is a component kind with no instances, and the negotiation
-// refuses a pipeline that asks for one.
+// Neither is a hidden gap: each is a component kind with no instances, and the negotiation refuses
+// a pipeline that asks for one.
+//
+// Codecs used to be on this list. They are resolved now — see codec.go — which is what let the
+// one-encoded-record-per-request fallback become the no-framer case rather than the only case.
 
 // Run executes the pipeline until ctx is cancelled, the input ends, or a terminal fault occurs.
 func (p *Pipeline) Run(ctx context.Context) error {
@@ -208,6 +208,20 @@ func (r *runner) openSinks(ctx context.Context) error {
 			}); err != nil {
 			return fmt.Errorf("engine: opening sink %s: %w", id, err)
 		}
+
+		// The encoder opens with its sink and through the same sandbox. A codec is third-party code
+		// on the hot path like any other component: it can panic, and a panic in it must become a
+		// classified fault rather than take the host down.
+		cc := r.p.codecs[id]
+		if cc == nil {
+			continue
+		}
+		if _, err := sandbox(ctx, sk.Name, rt,
+			func(c context.Context, rt *sinkRuntime) (struct{}, error) {
+				return struct{}{}, cc.open(c, rt)
+			}); err != nil {
+			return fmt.Errorf("engine: opening the codec for sink %s: %w", id, err)
+		}
 	}
 	return nil
 }
@@ -311,16 +325,11 @@ type request struct {
 // A STRUCTURED sink is handed the whole batch as Rows: the records themselves, no encoding, no
 // framing, no ambiguity about where one ends.
 //
-// A BYTE sink gets ONE RECORD PER REQUEST, and that is a correctness choice rather than an
-// oversight. Concatenating several payloads into one Body without a framer produces a blob with no
-// boundaries in it — the first version of this function did exactly that, and three lines arrived at
-// the sink as "line-00000line-00001line-00002". A framer is what defines the boundary, Build does
-// not resolve one yet, and inventing a delimiter here would be the core guessing at somebody's data
-// format.
-//
-// The cost is one Write per record, which is bad for throughput and honest about it. When codec
-// resolution lands, a framed chain batches again and this becomes the no-framer fallback.
-func buildRequests(sk *registry.ResolvedSink, batch *record.Batch) []request {
+// A BYTE sink is encoded by its resolved chain. Whether the batch becomes ONE request or one per
+// record is decided by [codecChain.batches], and the rule it encodes — a framer is what makes
+// batching legal — is a correctness constraint, not a tuning knob. See that method for the blob
+// this used to produce without one.
+func buildRequests(ctx context.Context, sk *registry.ResolvedSink, cc *codecChain, batch *record.Batch) ([]request, error) {
 	if sk.Structured != nil {
 		req := &connector.Request{
 			Count:   batch.Len(),
@@ -330,30 +339,75 @@ func buildRequests(sk *registry.ResolvedSink, batch *record.Batch) []request {
 		for _, rec := range batch.Records {
 			req.Records = append(req.Records, rec.Ref())
 		}
-		return []request{{req: req, records: batch.Records}}
+		return []request{{req: req, records: batch.Records}}, nil
+	}
+
+	if cc.batches() {
+		var body []byte
+		refs := make([]record.Ref, 0, batch.Len())
+		for _, rec := range batch.Records {
+			var err error
+			if body, err = cc.encode(ctx, body, rec); err != nil {
+				return nil, fault.Permanent(fault.OpEncode, fmt.Errorf("encoding record %v: %w", rec.Origin().ID, err))
+			}
+			refs = append(refs, rec.Ref())
+		}
+		// The terminator closes the request rather than any single record — a JSON array's "]".
+		// Appended once, after the last frame, exactly as the Framer contract says.
+		body = append(body, cc.framer.Terminator()...)
+		req, err := finish(cc, body, refs, batch.Len())
+		if err != nil {
+			return nil, err
+		}
+		return []request{{req: req, records: batch.Records}}, nil
 	}
 
 	out := make([]request, 0, batch.Len())
 	for _, rec := range batch.Records {
-		b, _ := rec.Payload.Bytes()
-		out = append(out, request{
-			req: &connector.Request{
-				Count:             1,
-				Records:           []record.Ref{rec.Ref()},
-				Body:              b,
-				UncompressedBytes: len(b),
-				ContentType:       "application/octet-stream",
-			},
-			records: []*record.Record{rec},
-		})
+		body, err := cc.encode(ctx, nil, rec)
+		if err != nil {
+			return nil, fault.Permanent(fault.OpEncode, fmt.Errorf("encoding record %v: %w", rec.Origin().ID, err))
+		}
+		req, err := finish(cc, body, []record.Ref{rec.Ref()}, 1)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, request{req: req, records: []*record.Record{rec}})
 	}
-	return out
+	return out, nil
+}
+
+// finish compresses a body if the chain has a compressor and assembles the request.
+//
+// UncompressedBytes is recorded BEFORE compression, because it is what the sink's own byte-size
+// limits are expressed against and what makes a compression ratio computable at all.
+func finish(cc *codecChain, body []byte, refs []record.Ref, count int) (*connector.Request, error) {
+	uncompressed := len(body)
+	if cc.compressor != nil {
+		out, err := cc.compressor.Compress(nil, body)
+		if err != nil {
+			return nil, fault.Permanent(fault.OpEncode, fmt.Errorf("compressing a request: %w", err))
+		}
+		body = out
+	}
+	return &connector.Request{
+		Count:             count,
+		Records:           refs,
+		Body:              body,
+		UncompressedBytes: uncompressed,
+		ContentType:       cc.contentType,
+		ContentEncoding:   cc.contentEncoding,
+	}, nil
 }
 
 // deliver writes one batch to every sink and settles the outcomes.
 func (r *runner) deliver(ctx context.Context, batch *record.Batch) error {
 	for id, sk := range r.p.sinks {
-		for _, rq := range buildRequests(sk, batch) {
+		reqs, err := buildRequests(ctx, sk, r.p.codecs[id], batch)
+		if err != nil {
+			return fmt.Errorf("engine: encoding for sink %s: %w", id, err)
+		}
+		for _, rq := range reqs {
 			res, err := sandbox(ctx, sk.Name, rq.req,
 				func(c context.Context, q *connector.Request) (connector.WriteResult, error) {
 					return sk.Sink.Write(c, q)

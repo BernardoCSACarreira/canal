@@ -20,6 +20,10 @@ type resolved struct {
 	sources map[record.NodeID]*registry.ResolvedSource
 	sinks   map[record.NodeID]*registry.ResolvedSink
 	buffers map[record.NodeID]connector.BufferCaps
+
+	// codecs is the resolved wire format per byte sink, and nil for a structured one. Negotiation
+	// does not read it; Build carries it here so Run does not have to resolve anything.
+	codecs map[record.NodeID]*codecChain
 }
 
 // negotiate computes the honest delivery tier and every reason for it, and appends a diagnostic for

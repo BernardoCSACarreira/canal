@@ -12,6 +12,10 @@ import (
 	"github.com/BernardoCSACarreira/canal/pkg/fault"
 	"github.com/BernardoCSACarreira/canal/pkg/registry"
 	"github.com/BernardoCSACarreira/canal/pkg/spec"
+
+	// A byte sink needs an encoder, and this build refuses one that has none registered. Linking
+	// the shipped codecs is the same choice a deployment makes; see cmd/canal.
+	_ "github.com/BernardoCSACarreira/canal/pkg/codec"
 )
 
 // TestRegistrationIsClean asserts that registering the trivial connectors passes the

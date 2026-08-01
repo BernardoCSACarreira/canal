@@ -24,12 +24,12 @@ flowchart TB
         P5["internal/stress — 8 hostile connectors, 8 passing test packages<br/>internal/example — linefile, stdoutsink, memstore"]
     end
 
-    subgraph MISSING["NOT BUILT — no record has ever moved through canal"]
+    subgraph MISSING["NOT BUILT — the breadth beyond the one running path"]
         direction TB
-        RUN["engine.Pipeline.Run<br/>a one-line error return: no node loops,<br/>no commit pump, no drain, no shutdown"]
-        DUR["no DURABLE store.StateStore<br/>only internal/example/memstore, DurabilityNone"]
-        BIN["no package main and no cmd directory<br/>there is no binary"]
-        IMPL["no Encoder, Framer, Compressor, Buffer or Transform<br/>implementation exists anywhere in the module"]
+        RUN["multi-worker coordination<br/>store.Coordinator has no implementation;<br/>the engine is labelled single-worker"]
+        DUR["no Buffer or Transform implementation<br/>exists anywhere in the module"]
+        BIN["no frontend and no control API<br/>the read model is declared, nothing serves it"]
+        IMPL["engine/remote: the out-of-process<br/>connector seam is a fixed shape, not code"]
     end
 
     BLD -->|"returns a *Pipeline holding only sources, sinks<br/>and a ledger that is never given a lane"| RUN
@@ -146,7 +146,7 @@ has both because the ack is a *method over bytes* and the resolver is *core-owne
 sequenceDiagram
     autonumber
     participant K as Sink
-    participant E as engine commit pump — NOT BUILT
+    participant E as engine commit pump — internal/engine/run.go
     participant L as ledger.Ledger
     participant S as store.StateStore
     participant Src as Source
@@ -219,7 +219,8 @@ degradation.
 
 Fifty-seven diagrams, every one drawn from the `.go` files rather than from the prose around it.
 Dotted edges and "NOT BUILT" boxes are load-bearing: they mark the parts of this document that
-describe an engine which does not run yet.
+describe behaviour the module does not have. The single-source-to-single-sink path is no longer among
+them — it runs, and `cmd/canal/main_test.go` kills it three times to prove the position survives.
 
 | Section | Diagrams |
 |---|---|
@@ -291,7 +292,7 @@ flowchart TB
   end
 
   subgraph INTERNAL["internal/ — engine machinery, no exported API"]
-    ENG["internal/engine<br/>Build, Pipeline<br/>Pipeline.Run not implemented"]
+    ENG["internal/engine<br/>Build, Pipeline, Run<br/>single worker, no transforms or buffers"]
     LED["internal/ledger<br/>Tracker, Ticket, Ledger"]
   end
 
@@ -365,18 +366,20 @@ github.com/BernardoCSACarreira/canal
 │   │                    as data, the thing a config store holds and the engine builds from
 │   │                    imports: connector, fault, record, registry, schema, telemetry
 │   ├── store/           ConfigStore, StateStore, Coordinator, StatusStore, Space, Key, LaneRow, Lease —
-│   │                    the standalone ↔ coordinated deployment seam. Interfaces only; the sole
-│   │                    implementation in the repo is the in-memory internal/example/memstore.
+│   │                    the standalone ↔ coordinated deployment seam.
 │   │                    imports: connector, record, spec, telemetry
+│   │   └── wal/         the durable StateStore: CRC32C-framed append log, fsync before Set returns,
+│   │                    per-key CAS and epoch fencing, torn tail truncated. DurabilityNode.
+│   │                    imports: connector, fault, record, store
 │   └── connectortest/   Base, and inert embeddable stubs for the three runtimes, LaneCtl and StateHandle,
 │                        so adding a runtime method does not break every connector's tests
 │                        imports: config, connector, fault, record, schema
 └── internal/            not importable from any other module (Go's internal rule)
     ├── ledger/          Tracker[P], Ticket, Ledger, Disposition, Outcome, LaneStats, Leak, the leak reaper
     │                    imports: connector, fault, record
-    ├── engine/          Build, Deps, Pipeline, Checkpoint, Header, LaneState.
-    │                    Pipeline.Run is a stub returning "not implemented yet" — no record has moved
-    │                    through the engine, and there is no durable StateStore.
+    ├── engine/          Build, Deps, Pipeline, Run, codec resolution, Checkpoint, Header, LaneState.
+    │                    Run drives read, admit, write, settle, flush and commit for one worker.
+    │                    Checkpoint and Header are declared; nothing constructs one yet.
     │                    imports: internal/ledger, and every pkg/ package except connectortest
     ├── example/         linefile (a source), stdoutsink (a sink), memstore (an in-memory store.StateStore)
     └── stress/          eight deliberately hostile connectors kept as a regression suite:
@@ -384,11 +387,11 @@ github.com/BernardoCSACarreira/canal
                          parallel-snapshot, push-source, schema-drift, txn-sink
 ```
 
-That is the whole module. There is no `cmd/`, no `api/`, no `ui/`, and no `codecs/`, `buffers/`,
-`transforms/` or `connectors/` directory: no binary exists, the HTTP surface and the built-in stage
-libraries are unwritten, and `store/` has no bbolt or Postgres implementation. Everything above compiles,
-`go vet` is clean and nine test packages pass, but the deliverable so far is the interface set, not a
-running program.
+Plus `cmd/canal`: `run` and `check`, and nothing else — the composition root holds wiring, never
+policy. There is no `api/`, no `ui/`, and no `buffers/`, `transforms/` or `connectors/` directory: the
+HTTP surface and those two stage libraries are unwritten, and `store/` has no bbolt or Postgres
+implementation for the coordinated shape. Everything above compiles, `go vet` is clean, and eighteen
+test packages pass including a `kill -9` test that runs the real binary.
 
 ### The one statement that matters
 
@@ -1615,7 +1618,7 @@ flowchart TD
     OI -->|"IndeterminateDeadLetter"| DLQ
     OI -->|"IndeterminateStall"| STALL
 
-    subgraph NB["engine response — NOT BUILT: internal/engine.Pipeline.Run returns 'not implemented yet'"]
+    subgraph NB["engine response — NOT BUILT: Run classifies and reports faults, but retries none of them"]
         RETRY["retry with backoff<br/>Counted() true — spends an attempt"]
         TH["wait fault.RetryAfterOf(err)<br/>Counted() false — spends NO attempt"]
         DLQ["dead-letter this record<br/>pipeline stays healthy"]
@@ -1633,8 +1636,9 @@ flowchart TD
 A connector states only the `Class`, a fact; every branch to the right of it is behaviour the engine
 *computes* from `(class, capabilities, policy)` — the classes are defined in `pkg/fault/class.go` and
 the dispositions in `pkg/fault/retry.go`. Everything inside the boxed region is documented intent
-only: `internal/engine/build.go:321` `Pipeline.Run` is a one-line error return, so no fault has ever
-been routed by this tree.
+only. `Pipeline.Run` classifies faults and fails the pipeline on one; it does not retry, dead-letter
+or stall, and no caller of `RetryPolicy.Next` exists anywhere in the module. Routing a fault by this
+tree is the next thing the engine owes.
 
 ```go
 // Package fault defines canal's closed error-classification set, the per-record
@@ -1967,8 +1971,8 @@ stateDiagram-v2
       delay = fault.RetryAfterOf(err) when the chain
       carries a hint, otherwise RetryPolicy.Next(attempt),
       which is full-jitter uniform in [0, exponential].
-      NOT BUILT: this loop is engine behaviour and
-      internal/engine.Pipeline.Run is a one-line stub.
+      NOT BUILT: Run fails the pipeline on a fault rather
+      than retrying it. No caller of RetryPolicy.Next exists.
     end note
 ```
 
@@ -2081,10 +2085,10 @@ stateDiagram-v2
     end note
 
     note left of Planned
-      NOT BUILT. store.Coordinator has no implementation and
-      internal/engine.Pipeline.Run is a one-line error return.
-      The types on this diagram are real Go. Nothing has ever
-      driven a lane through them.
+      PARTLY BUILT. Announce, Assigned, Finish and the cursor
+      are driven by internal/engine/run.go today. Leasing,
+      revocation and planning are not: store.Coordinator has
+      no implementation, so Revoked is truthfully always false.
     end note
 
     note left of Revoked
@@ -2094,7 +2098,7 @@ stateDiagram-v2
     end note
 ```
 
-A lane's whole life, from a durable announcement to either a kept `Finished` row or a `Forget`: the states are `LaneAssignment` field combinations defined in `pkg/connector/lane.go`, the transitions are the methods in `pkg/connector/lanectl.go`, and the lease and epoch are `store.Lease` in `pkg/store/coordinator.go`. Read the two `NOT BUILT` notes literally — every type here compiles, but `store.Coordinator` has no implementation, nothing anywhere assigns `FinishedAt`, and `internal/engine.Pipeline.Run` is a one-line error return, so no lane has ever taken a single one of these transitions.
+A lane's whole life, from a durable announcement to either a kept `Finished` row or a `Forget`: the states are `LaneAssignment` field combinations defined in `pkg/connector/lane.go`, the transitions are the methods in `pkg/connector/lanectl.go`, and the lease and epoch are `store.Lease` in `pkg/store/coordinator.go`. Read the `PARTLY BUILT` note literally. The announce-to-finish path runs today: `internal/engine/runtime.go` writes the durable lane row, `Finish` sets `FinishedAt`, and the cursor advances through `flushOnce`. Everything involving a LEASE does not: `store.Coordinator` has no implementation, so no lane has ever been claimed, revoked, planned or reassigned, and `Revoked` returns false because it is truthfully always false with one worker.
 
 ```go
 // Package connector defines every interface a connector author implements and
@@ -2551,10 +2555,10 @@ func (p *Persister) Restore(lane record.LaneID) (record.Blob, bool)
 sequenceDiagram
     autonumber
     participant B as engine.Build
-    participant RG as source read goroutine — NOT BUILT
+    participant RG as source read goroutine — internal/engine/run.go
     participant S as Source
     participant RT as SourceRuntime
-    participant CG as source control goroutine — NOT BUILT
+    participant CG as source control goroutine — the shared commit pump
 
     B->>S: registry.SourceDef.New(ctx, *config.Config)
     Note over B,S: no I/O here. Config is already parsed, defaulted and validated
@@ -3047,7 +3051,7 @@ type StateAdopter interface {
 sequenceDiagram
     autonumber
     participant B as engine.Build
-    participant E as sink node loop — NOT BUILT
+    participant E as sink node loop — internal/engine/run.go
     participant K as Sink
     participant RT as SinkRuntime
 
@@ -3070,7 +3074,7 @@ sequenceDiagram
     end
     Note over E,K: a Flusher sink is settled on Flush, NOT on Write's return
     E->>K: Close(ctx) — exactly once, always, even after a failed Open
-    Note over B,RT: TODAY only New and Close have callers, both in internal/engine/build.go. No record has been written.
+    Note over B,RT: New and Close are called by Build; Open and Write by Run. The optional tiers below Flusher have no caller yet.
 ```
 
 Three frozen methods and the three answers `Write` may give, from `pkg/connector/sink.go` — the
@@ -3315,7 +3319,7 @@ func AllWritten(n int) WriteResult // convenience for the happy path
 ```mermaid
 sequenceDiagram
     autonumber
-    participant E as checkpoint pump — NOT BUILT
+    participant E as checkpoint pump — NOT BUILT: the flush loop writes lane cursors, not Checkpoints
     participant K as Sink — Committer plus WriterState
     participant ST as store.StateStore
 
@@ -3909,11 +3913,11 @@ flowchart LR
     ADP -.->|"AdoptsState"| RECOV
 
     SUBMIT["submit time and the control API<br/>reached today through registry.ResolvedSource"]
-    RUN["the running read path<br/>NOT BUILT — Pipeline.Run is a stub"]
-    RECOV["restart and connector migration<br/>NOT BUILT — no durable store exists"]
+    RUN["the running read path<br/>Pipeline.Run — reads, admits and commits"]
+    RECOV["restart and connector migration<br/>restart is real over pkg/store/wal;<br/>connector migration is not"]
 ```
 
-Each edge label is the `SourceCaps` field that must also be set — the interface alone does nothing. The dotted edges lead to behaviour that does not exist yet: `internal/engine.Pipeline.Run` is a one-line error return, so no resolved source handle is ever called. Interfaces in `pkg/connector/source_optional.go` and `shared_optional.go`, flags in `pkg/connector/caps.go`, the "unlocks" wording in `pkg/registry/add.go`.
+Each edge label is the `SourceCaps` field that must also be set — the interface alone does nothing. `Source`, `LaneCtl` and `Commit` are driven by `internal/engine/run.go` today; the dotted edges above them lead to optional tiers the single-worker engine never reaches — nothing calls `Nack`, `AdoptsState`, `ReadLanes` or a `Prober`. Interfaces in `pkg/connector/source_optional.go` and `shared_optional.go`, flags in `pkg/connector/caps.go`, the "unlocks" wording in `pkg/registry/add.go`.
 
 Data crosses a process boundary; a type assertion does not. A flag with no methods behind it is
 worthless. So both exist, and registration cross-checks them.
@@ -4700,7 +4704,7 @@ flowchart TB
     DG --> WV["applyWaivers over spec.Downgrades<br/>DEFECTIVE — do not rely on this edge"]
     WV --> Q{"any SeverityError left?"}
     Q -->|"yes"| NO["Build refuses at submit time"]
-    Q -->|"no"| YES["Pipeline is built — but Pipeline.Run is a stub, so nothing moves"]
+    Q -->|"no"| YES["Pipeline is built, and Run moves records through it"]
 ```
 
 Negotiation is a pure function of the resolved capability set and it runs today, in `internal/engine/negotiate.go`; the `applyWaivers` node is marked defective because it downgrades every capability and guarantee error on a match of node, signer and reason alone, never reading `Downgrade.Requested`, `Effective` or `Missing`, so one signature disables the data-loss refusals as well as the tier refusal it was written for.
@@ -5234,7 +5238,7 @@ sequenceDiagram
     participant St as store.StateStore
     participant Up as the source's own upstream
 
-    Note over Eng: NOT BUILT — engine.Pipeline.Run is a one-line error return.<br/>Every Eng step below is the specified protocol, not running code.
+    Note over Eng: internal/engine/run.go implements every Eng step below.<br/>The epoch on the phase-three Ack has only one worker to fence.
 
     Eng->>Src: Read(ctx, b)
     Eng->>Led: Admit(ctx, b)
@@ -5262,7 +5266,7 @@ sequenceDiagram
     Note over Src,Up: DEFECTS, NOT DESIGN — the shipped code around this protocol has three known fatal defects<br/>(applyWaivers disabling the phase-two guard, a Ledger.send/Close race, group-id reuse at<br/>ledger.go:304). Read docs/decisions/_rule-compliance.md before trusting this as implemented.
 ```
 
-Three phases in one fixed order: the sink's write is durable, THEN canal's own record is flushed through `store.StateStore.Set`, and only THEN is the source told it may advance — with the acknowledgement carrying the lane's lease epoch and suppressed entirely for a revoked lane. Specified in `docs/decisions/0006-three-phase-commit.md` and `internal/ledger/ledger.go` (`Flushable`, `Committed`, `Acks`); the engine side is `internal/engine/build.go`, whose `Pipeline.Run` is still a one-line error return.
+Three phases in one fixed order: the sink's write is durable, THEN canal's own record is flushed through `store.StateStore.Set`, and only THEN is the source told it may advance — with the acknowledgement carrying the lane's lease epoch and suppressed entirely for a revoked lane. Specified in `docs/decisions/0006-three-phase-commit.md` and `internal/ledger/ledger.go` (`Flushable`, `Committed`, `Acks`); the engine side is `internal/engine/run.go`, where `flushOnce` writes the cursors before calling `Committed` and `commitPump` delivers phase three from the acknowledgements that follow. Reversing those two lines is the violation the ordering exists to prevent, and the comment above them says so.
 
 This is the most important section in the document. Read it as normative sequence.
 
@@ -6461,7 +6465,7 @@ sequenceDiagram
     UI->>EB: tier 3 - Build ctx, registry, spec, deps
     EB->>EB: validateGraph, per-node Spec.Validate, ResolveSource, ResolveSink, negotiate
     EB-->>UI: Pipeline, telemetry.Negotiated, Diagnostics
-    Note over EB: Pipeline.Run is a one-line error return.<br/>Everything above this note is real, compiling, running code.
+    Note over EB: Run is tier four: it executes what Build negotiated.<br/>Everything on this diagram is real, compiling, running code.
 ```
 
 The three tiers are separated by what each is allowed to do: tier one is pure and therefore runs in the
@@ -7247,7 +7251,7 @@ after. The abandoned attempt had no authentication, no authorization and no tena
 
 ```mermaid
 flowchart TD
-  READ["Source.Read(ctx, dst)"] --> ENG["engine node loop<br/>Pipeline.Run is a one-line error return: NOT BUILT"]
+  READ["Source.Read(ctx, dst)"] --> ENG["engine node loop<br/>internal/engine/run.go readLoop"]
   ENG --> ADMIT["ledger.Ledger.Admit(ctx, b)"]
   ADMIT --> CHK{"lane registered, not revoked,<br/>and every record stamped for b.Lane?"}
   CHK -- "no" --> F1["fault.Contract(OpBuffer, ...) or fault.ErrFenced"]
@@ -7340,7 +7344,7 @@ sequenceDiagram
   participant P as HTTP peer
   participant PS as push source (internal/stress/push-source)
   participant LC as connector.LaneCtl (core-implemented, injected)
-  participant EN as engine node loop (NOT BUILT)
+  participant EN as engine node loop (internal/engine/run.go)
   participant LG as ledger.Ledger
 
   P->>PS: POST, holding an open request
@@ -7708,7 +7712,7 @@ sequenceDiagram
     participant LG as ledger.Ledger
     participant ST as store.StateStore
 
-    Note over S,ST: NOT BUILT. Every arrow below is a declared Go method.<br/>No implementation computes GatedOn from StartAfter, nothing<br/>anywhere assigns FinishedAt, and Pipeline.Run is a stub.
+    Note over S,ST: PARTLY BUILT. Announce, the durable lane row and Finish run today.<br/>No implementation computes GatedOn from StartAfter, so the handoff<br/>this diagram shows has never been driven end to end.
     Note over S: low = the upstream log position,<br/>captured BEFORE any scan lane exists
     S->>LC: Announce LaneSpec Name tail, Group tail,<br/>StartAfter scan, Spec = low, Unbounded
     LC->>ST: lane row written durably
@@ -7819,7 +7823,7 @@ flowchart LR
     R3 --> Y
     R4 --> Y
     Y --> Z["Six independent rows, so a cluster may claim each on a<br/>DIFFERENT worker. Lost work is at most one lane Budget<br/>of in-flight records, which are re-read, never skipped."]
-    Z -.-> NB["NOT BUILT. The lane row and its cursor are declared types<br/>only. The sole StateStore is internal/example/memstore,<br/>which is in-memory, so nothing here survives a real kill -9."]
+    Z -.-> NB["PARTLY BUILT. The lane row and its cursor are written to<br/>pkg/store/wal and survive a real kill -9 — cmd/canal proves it.<br/>Claiming one lane per worker is not built: no Coordinator exists."]
 ```
 
 Why a crash at 40% neither rescans nor loses: finished chunks are excluded from `Assigned` by `Finished`, the gated tail is excluded by `GatedOn`, and the six survivors each carry their own `Cursor` next to their own write-once `Spec` — the two differently-lifetimed halves that `pkg/connector/lane.go:174-211` keeps as separate fields, which is exactly what lets the resume re-parallelise onto more workers than it started with. The `Assigned` filter shown here is implemented only in the test double `pkg/connectortest/runtime.go:278-292`; there is no durable store behind it.
@@ -8545,7 +8549,7 @@ sequenceDiagram
     participant C as control goroutine
     participant S as your Source
 
-    Note over B,S: Everything below the Open line is NOT BUILT.<br/>internal.engine.Pipeline.Run returns an error and moves no record.
+    Note over B,S: Read, Commit and Close below run today.<br/>Heartbeat and the assignment refresh have no caller.
 
     B->>S: New with a parsed config, and NO I/O here
     B->>S: Open with a runtime. The ctx dies when Open returns, so keep rt.Context
@@ -8565,12 +8569,12 @@ sequenceDiagram
     B->>S: Close exactly once, always, with a fresh grace-period ctx
 ```
 
-**This ordering is a contract, not an observation of a running system.**
-`internal/engine.Pipeline.Run` is currently `return fmt.Errorf("engine: Pipeline.Run is not
-implemented yet; the interface set is the deliverable of this stage")` (`internal/engine/build.go:321`).
-No record has moved through the engine. Write against the contract — it is what the interfaces in
-`pkg/connector/source.go:15-98` specify and what the ledger in `internal/ledger` was built to
-enforce — but do not read this diagram as a description of behaviour anyone has watched happen.
+**Most of this ordering is now observed rather than only specified.** `Open`, `Read`, `Commit` and
+`Close` are called in exactly this order by `internal/engine/run.go`, and the concurrency claim —
+`Commit` running while `Read` is blocked — is what the separate commit pump exists to make true.
+Write against the contract regardless: `Heartbeat`, `Backlog`, `Nack` and the assignment refresh have
+no caller yet, so the parts of this diagram that involve them are still specification. The
+interfaces are in `pkg/connector/source.go:15-98` and the enforcement is in `internal/ledger`.
 
 The two consequences that catch every first-time author:
 
@@ -8926,11 +8930,13 @@ Delivered and verifiable today:
 
 Designed and specified, but **not built** — do not plan around them landing on a date:
 
-- durable resumable progress. The only `store.StateStore` implementation in the tree is in-memory.
-- backpressure, retry with classified faults, the dead-letter route, the metric set, position
-  rendering and scan progress. All of these are engine behaviour and
-  `internal/engine.Pipeline.Run` returns an error.
-- an out-of-process deployment. There is no `engine/remote` package and no `cmd/` main package.
+- retry with classified faults, the dead-letter route, the metric set, position rendering and scan
+  progress. `Pipeline.Run` classifies a fault and fails on it; nothing retries, dead-letters or
+  stalls, and `noopMetrics` refuses every registration rather than returning a dangling handle.
+- an out-of-process deployment. There is no `engine/remote` package.
+
+Durable resumable progress is no longer on this list: `pkg/store/wal` is a real `store.StateStore`
+and `cmd/canal/main_test.go` kills the binary three times to prove a position survives.
 
 ---
 

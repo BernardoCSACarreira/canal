@@ -367,7 +367,18 @@ func (s *StateStore) append(frame []byte) (int64, error) {
 }
 
 // Capabilities reports what this store can honestly promise.
-func (s *StateStore) Capabilities() store.StoreCaps {
+func (s *StateStore) Capabilities() store.StoreCaps { return Caps() }
+
+// Caps is what every WAL store promises, as a value that needs no open store.
+//
+// It is a package-level constant rather than only a method because negotiation is a pure function
+// of config, and a tool that reports the contract a WAL-backed deployment WILL get must not have to
+// open — and therefore exclusively lock — the state directory of a pipeline that may be running.
+// Asking "what would this spec negotiate" should never be able to disturb a running pipeline.
+//
+// TestCapabilitiesNeedNoOpenStore pins this to the method, so the two cannot drift into reporting
+// different tiers for the same store.
+func Caps() store.StoreCaps {
 	return store.StoreCaps{
 		// One frame is one atomic unit, so a batch spanning cursors, schema epoch, pending
 		// committables and dedupe additions cannot be torn between them.

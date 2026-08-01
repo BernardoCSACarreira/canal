@@ -51,6 +51,16 @@ var declared = map[string][]string{
 	"internal/ledger": {"pkg/connector", "pkg/fault", "pkg/record"},
 	"internal/engine": {"internal/ledger", "pkg/config", "pkg/connector", "pkg/fault",
 		"pkg/record", "pkg/registry", "pkg/schema", "pkg/spec", "pkg/store", "pkg/telemetry"},
+
+	// cmd/ — the composition root, and the ONLY package allowed to import both internal/engine and
+	// a concrete deployment assembly. It is where the standalone shape is chosen; the enterprise
+	// shape is a different main with different stores and the same engine.
+	//
+	// The blank imports of the example connectors and pkg/codec are what make this build's
+	// catalogue, and they are why this row is longer than any other. Nothing imports cmd.
+	"cmd/canal": {"internal/engine", "internal/example/linefile", "internal/example/stdoutsink",
+		"pkg/codec", "pkg/config", "pkg/registry", "pkg/spec", "pkg/store", "pkg/store/wal",
+		"pkg/telemetry", "pkg/fault"},
 }
 
 // connectorPrefixes are the trees that stand in for third-party code: the worked examples and the
@@ -136,7 +146,7 @@ func repoRoot(t *testing.T) string {
 func allPackageDirs(t *testing.T, root string) []string {
 	t.Helper()
 	var dirs []string
-	for _, top := range []string{"pkg", "internal"} {
+	for _, top := range []string{"pkg", "internal", "cmd"} {
 		err := filepath.WalkDir(filepath.Join(root, top), func(path string, d os.DirEntry, err error) error {
 			if err != nil || !d.IsDir() {
 				return err

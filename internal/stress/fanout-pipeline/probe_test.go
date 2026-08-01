@@ -16,6 +16,8 @@ import (
 	"github.com/BernardoCSACarreira/canal/pkg/registry"
 	"github.com/BernardoCSACarreira/canal/pkg/spec"
 	"github.com/BernardoCSACarreira/canal/pkg/store"
+
+	"github.com/BernardoCSACarreira/canal/pkg/codec"
 )
 
 func deps() engine.Deps { return engine.Deps{State: memstore.New()} }
@@ -132,6 +134,13 @@ func TestRegistrationIsClean(t *testing.T) {
 // TestFanOutIsRefused is F1: the commissioned fan-out cannot be configured, because
 // StreamConfig.Write is one destination mode for the whole pipeline and negotiate checks it against
 // every sink.
+// A byte sink needs an encoder, and Build refuses one that has none registered. Reg is this
+// harness's own registry, so the shipped codecs have to be added to it explicitly — the same choice
+// a deployment makes when it links pkg/codec. It happens here rather than in connector.go because
+// the connector import boundary the arch test enforces does not include pkg/codec, and a codec is
+// not something a connector should be able to reach.
+func init() { codec.Register(Reg) }
+
 func TestFanOutIsRefused(t *testing.T) {
 	// Drift is pinned to ignore so that F12 (below) does not contaminate this observation.
 	//

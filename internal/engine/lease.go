@@ -79,10 +79,12 @@ func (lt *leaseTable) epochFor(id record.LaneID) uint64 {
 	if l, ok := lt.held[id]; ok {
 		return l.Epoch
 	}
-	// A LANE THIS WORKER DOES NOT HOLD GETS THE HIGHEST EPOCH IT EVER HELD PLUS NOTHING — zero, which
-	// store.Versioned reads as "use the batch's". It is reachable only in the window between losing a
-	// lease and the read loop noticing, and a write in that window is one the store should refuse
-	// anyway: whoever took the lane holds a higher epoch, and zero loses to it.
+	// A LANE THIS WORKER DOES NOT HOLD REPORTS ZERO, which store.Assignment uses for "unclaimed".
+	//
+	// This is a REPORTING value and nothing else: Assigned and Table are the only callers, and no
+	// durable write is fenced with it — runtime.go still batches at singleWorkerEpoch and says so.
+	// An earlier version of this comment reasoned about how a zero would fare against the state
+	// store's epoch check, which described a path that does not exist.
 	return 0
 }
 
@@ -235,16 +237,34 @@ func (r *runner) joinCluster(ctx context.Context) {
 	if err != nil {
 		r.deps.Log.Warn("could not join the worker set; this worker still reads what it can claim",
 			"worker", r.deps.Worker, "error", err)
-	} else {
-		r.membership = m
 	}
 
-	l, err := r.leases.coord.Campaign(ctx)
-	if err != nil {
-		r.deps.Log.Warn("could not campaign for the planner role", "error", err)
-		return
+	l, cerr := r.leases.coord.Campaign(ctx)
+	if cerr != nil {
+		r.deps.Log.Warn("could not campaign for the planner role", "error", cerr)
 	}
-	r.leadership = l
+
+	// PUBLISHED UNDER THE LOCK, because Status reads them and Status runs on whatever goroutine asked.
+	// This is the same race newRunner exists to prevent: the runner is published before run() starts,
+	// so anything run() assigns afterwards is assigned while a concurrent Status can be reading it.
+	// Join and Campaign do I/O, so they cannot move into newRunner — the lock is the answer instead.
+	r.mu.Lock()
+	r.membership, r.leadership = m, l
+	r.mu.Unlock()
+}
+
+// cluster returns this worker's membership and planner claim, or nils.
+func (r *runner) cluster() (store.Membership, store.Leadership) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.membership, r.leadership
+}
+
+// isLeader reports what this process believes about the planner role, which is advisory by
+// construction and true for a standalone run that is the only planner there is.
+func (r *runner) isLeader() bool {
+	_, l := r.cluster()
+	return l == nil || l.IsLeader()
 }
 
 // leaveCluster releases every lease and withdraws, in that order.
@@ -257,13 +277,14 @@ func (r *runner) leaveCluster(ctx context.Context) {
 		return
 	}
 	r.leases.releaseAll(ctx, r.deps.Log)
-	if r.leadership != nil {
-		if err := r.leadership.Resign(ctx); err != nil {
+	m, l := r.cluster()
+	if l != nil {
+		if err := l.Resign(ctx); err != nil {
 			r.deps.Log.Warn("resigning the planner role", "error", err)
 		}
 	}
-	if r.membership != nil {
-		if err := r.membership.Leave(ctx); err != nil {
+	if m != nil {
+		if err := m.Leave(ctx); err != nil {
 			r.deps.Log.Warn("leaving the worker set", "error", err)
 		}
 	}
@@ -310,7 +331,7 @@ func (r *runner) planAndClaim(ctx context.Context, node record.NodeID, lc *laneC
 		return
 	}
 	rows := lc.laneRows()
-	if r.leadership != nil && r.leadership.IsLeader() {
+	if r.isLeader() {
 		if err := r.leases.coord.Plan(ctx, r.p.spec.Tenant, r.p.spec.ID, r.leases.gen, rows); err != nil {
 			if ctx.Err() == nil {
 				r.deps.Log.Warn("planning lanes", "node", node, "error", err)

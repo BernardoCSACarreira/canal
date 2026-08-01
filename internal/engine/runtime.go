@@ -195,6 +195,22 @@ func (l *laneCtl) Announce(ctx context.Context, s connector.LaneSpec) (record.La
 // One write rather than N: a source announcing 900 streams should not pay 900 fsyncs, and a partial
 // announcement is a lane table that disagrees with itself.
 func (l *laneCtl) AnnounceMany(ctx context.Context, specs []connector.LaneSpec) ([]record.LaneID, error) {
+	ids, err := l.announceMany(ctx, specs)
+	if err != nil || l.afterAnnounce == nil {
+		return ids, err
+	}
+
+	// PLANNED AND CLAIMED OUTSIDE writeMu, which is the point of this wrapper existing at all.
+	// afterAnnounce talks to the coordinator, and writeMu serialises DURABLE WRITES to the lane
+	// table — so calling it inside meant a slow control plane blocked the flush loop persisting
+	// cursors. lease.go opens by saying every failure there is inert on the data path; holding the
+	// durability lock across a coordinator round trip is exactly how that stops being true.
+	l.afterAnnounce(ctx)
+	return ids, nil
+}
+
+// announceMany does the durable half, under writeMu.
+func (l *laneCtl) announceMany(ctx context.Context, specs []connector.LaneSpec) ([]record.LaneID, error) {
 	if len(specs) == 0 {
 		return nil, nil
 	}
@@ -265,9 +281,6 @@ func (l *laneCtl) AnnounceMany(ctx context.Context, specs []connector.LaneSpec) 
 	}
 
 	l.notify()
-	if l.afterAnnounce != nil {
-		l.afterAnnounce(ctx)
-	}
 	return ids, nil
 }
 

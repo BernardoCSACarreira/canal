@@ -203,12 +203,8 @@ func (r *runner) fillStatus(s *telemetry.PipelineStatus, now time.Time, q teleme
 	// have granted one. Leader is what this process believes, which is advisory by construction —
 	// store.Leadership says so — and true by default for a standalone run that is the only planner
 	// there is.
-	leader := true
-	if r.leadership != nil {
-		leader = r.leadership.IsLeader()
-	}
 	s.Workers = []telemetry.WorkerStatus{{
-		ID: string(r.deps.Worker), Since: r.started, Leader: leader,
+		ID: string(r.deps.Worker), Since: r.started, Leader: r.isLeader(),
 		Lanes: len(lanes), LastHeard: now, LeaseExpires: r.leases.soonestExpiry(),
 	}}
 	s.Throughput = r.throughput(now, facts)

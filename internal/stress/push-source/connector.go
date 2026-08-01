@@ -300,7 +300,11 @@ func (s *Source) initMetrics(rt connector.SourceRuntime) error {
 	if s.cShed, err = m.Counter("shed_total", "reason"); err != nil {
 		return err
 	}
-	if s.cSettled, err = m.Counter("acked_total", "verdict"); err != nil {
+	// "outcome", not "verdict". The label vocabulary is CLOSED (telemetry.Labels) and the core
+	// refuses a name outside it — which nothing discovered while rt.Metrics() was a noop that
+	// accepted every call and dropped it. The first run of this connector through a real engine
+	// failed at Open with the vocabulary printed in the error, which is the refusal working.
+	if s.cSettled, err = m.Counter("acked_total", "outcome"); err != nil {
 		return err
 	}
 	if s.cOrphan, err = m.Counter("orphaned_total"); err != nil {

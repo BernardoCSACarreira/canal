@@ -27,6 +27,7 @@ import (
 	// The binary can only run what is linked into it. These blank imports ARE the connector
 	// catalogue of this build: a spec naming anything else is refused at build time with a
 	// diagnostic that lists what is available, which is the honest failure for a static registry.
+	_ "github.com/BernardoCSACarreira/canal/internal/example/filesink"
 	_ "github.com/BernardoCSACarreira/canal/internal/example/linefile"
 	_ "github.com/BernardoCSACarreira/canal/internal/example/stdoutsink"
 	_ "github.com/BernardoCSACarreira/canal/pkg/codec"
@@ -203,6 +204,14 @@ func cmdCheck(args []string) int {
 	}
 	_ = p.Close(context.Background())
 	printNegotiated(neg)
+
+	// A CONTRACT THIS BUILD CANNOT EXECUTE EXITS NON-ZERO, even though Build only warned about it.
+	// `canal check` is the question "is this deployable", usually asked by CI, and answering yes to
+	// a spec that `canal run` will refuse would make the check worse than useless.
+	if err := engine.Executable(neg); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return exitRefused
+	}
 	return exitOK
 }
 

@@ -6998,10 +6998,11 @@ flowchart TB
 
 The four interfaces are defined in `pkg/store/config_store.go`, `state_store.go`, `coordinator.go` and
 `status_store.go`, and they reach the engine as the first four fields of `engine.Deps`
-(`internal/engine/build.go:25`) — that struct is the whole seam. Everything drawn dashed is design and
-not code: the module contains no implementation of `ConfigStore`, `Coordinator` or `StatusStore`, the
-only `StateStore` is `internal/example/memstore` (which declares `connector.DurabilityNone`), and there
-is no `main` package, so neither `canal run` nor `canal serve` exists yet as a command.
+(`internal/engine/build.go:25`) — that struct is the whole seam. Three of the four are still design and
+not code: the module contains no implementation of `ConfigStore`, `Coordinator` or `StatusStore`. The
+`StateStore` is real — `pkg/store/wal` declares `connector.DurabilityNode` and fsyncs before `Set`
+returns, alongside the in-memory `internal/example/memstore` that labels itself as scaffolding — and
+`cmd/canal` runs a pipeline from a spec file. There is no `canal serve`: the control API is unwritten.
 
 **Four interfaces. If a fifth appears, the abstraction is wrong.** This is the only thing that differs
 between a laptop and a cluster.
@@ -7832,7 +7833,7 @@ flowchart LR
     Z -.-> NB["PARTLY BUILT. The lane row and its cursor are written to<br/>pkg/store/wal and survive a real kill -9 — cmd/canal proves it.<br/>Claiming one lane per worker is not built: no Coordinator exists."]
 ```
 
-Why a crash at 40% neither rescans nor loses: finished chunks are excluded from `Assigned` by `Finished`, the gated tail is excluded by `GatedOn`, and the six survivors each carry their own `Cursor` next to their own write-once `Spec` — the two differently-lifetimed halves that `pkg/connector/lane.go:174-211` keeps as separate fields, which is exactly what lets the resume re-parallelise onto more workers than it started with. The `Assigned` filter shown here is implemented only in the test double `pkg/connectortest/runtime.go:278-292`; there is no durable store behind it.
+Why a crash at 40% neither rescans nor loses: finished chunks are excluded from `Assigned` by `Finished`, the gated tail is excluded by `GatedOn`, and the six survivors each carry their own `Cursor` next to their own write-once `Spec` — the two differently-lifetimed halves that `pkg/connector/lane.go:174-211` keeps as separate fields, which is exactly what lets the resume re-parallelise onto more workers than it started with. The `Assigned` filter is implemented in `internal/engine/runtime.go` over `pkg/store/wal`, so the lane rows and their cursors genuinely survive a crash — `cmd/canal/main_test.go` kills the binary three times to prove it. What is still missing is the part this diagram is really about: no `store.Coordinator` exists, so the six survivors cannot be claimed by six different workers.
 
 8. `Open` → `Assigned` returns **six** assignments: `scan/2` at `key > 'acme-991'`, `scan/3` at
    `key > 'zeta-2'`, and `scan/4..7` at their range starts. Lanes 0 and 1 are absent because they finished.
@@ -8942,6 +8943,11 @@ Designed and specified, but **not built** — do not plan around them landing on
 - eleven of the twenty-six metric names. `internal/metrics` exports fifteen; the rest measure things
   that do not exist yet — buffer depth, dedupe, lane revocation, restart phases, node utilization.
   They are declared and unemitted, which under omit-don't-zero means simply absent from a scrape.
+- Flusher, Committer, TokenSink and WriterState. All four are resolved by the registry and reported
+  by the negotiation; none has a caller. That gap USED TO BE SILENT — a capable source plus a
+  Committer sink negotiated exactly_once against an engine that settles on Write — and is now
+  guarded by `engine.Executable`, which warns at Build, refuses at Run before anything is opened,
+  and exits non-zero from `canal check`.
 - an out-of-process deployment. There is no `engine/remote` package.
 
 Retry with classified faults, the dead-letter route and the metric surface are no longer on this

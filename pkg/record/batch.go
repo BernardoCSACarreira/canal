@@ -108,7 +108,6 @@ type Batch struct {
 	alloc *Allocator
 	group GroupID
 	cap   int
-	bytes int64
 }
 
 // NewBatch returns a batch bound to an allocator, with a hard capacity of capHint
@@ -309,7 +308,6 @@ func (b *Batch) Reset() {
 	b.Records = b.Records[:0]
 	b.Position = Position{}
 	b.EndOfLane = false
-	b.bytes = 0
 	if b.alloc != nil {
 		b.group = b.alloc.NextGroup()
 	}

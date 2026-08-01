@@ -161,6 +161,12 @@ func allPackageDirs(t *testing.T, root string) []string {
 			if err != nil || !d.IsDir() {
 				return err
 			}
+			// testdata is not a package, by the toolchain's own rule: go build ignores it entirely.
+			// This walk did not, so the first fixture directory anybody added — one for the
+			// write-only field detector in inert_test.go — was reported as an undeclared package.
+			if d.Name() == "testdata" {
+				return filepath.SkipDir
+			}
 			ents, err := os.ReadDir(path)
 			if err != nil {
 				return err

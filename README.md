@@ -445,6 +445,14 @@ passed the gate and pinned its upstream's retention anyway.
 [`internal/engine/control.go`](internal/engine/control.go) is that goroutine; `Backlog`, `Idle` and
 `EventTimeLag` in the read model come from it.
 
+**`record.MarkFailed` is implemented, and the guard was widened to the class it belonged to.** A
+source could mark one of its own records broken and the record was delivered anyway — the worst
+available outcome, and the default one. The widened check looks for unexported fields a package
+writes and never reads; it found three more, including a count of records acknowledged to the source
+that the ledger computed and discarded while the read model reported the sink's settled count under
+the name `recordsCommitted`. Those two numbers differ by exactly the window the three-phase commit
+exists to manage.
+
 **Nothing on `spec.Spec` is inert any more, and there is a test that keeps it that way.**
 [`internal/arch/inert_test.go`](internal/arch/inert_test.go) walks `Deps` and `spec.Spec` for fields
 nothing reads, and the stage-standard config fields the registry puts on every node's form. A field

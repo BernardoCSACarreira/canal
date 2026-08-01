@@ -9063,6 +9063,15 @@ and `cmd/canal/main_test.go` kills the binary three times to prove a position su
 Each node runs one goroutine with one `select`. The edges are bounded channels of `*record.Batch` with
 capacity 2. There is no shared mutable state between nodes; a batch is handed over, never shared.
 
+**`record.MarkFailed` does something now.** Its doc has always said "attaches a fault and lets the
+record continue; the engine's configured routing decides whether that means a Failed edge, a drop,
+or a pipeline stop" — those three being `fault.Terminal`'s three values — and the engine read the
+mark nowhere, so a source could declare a record broken and the record was delivered to the
+destination as though nothing had been said. `internal/engine/marked.go` routes it, before admission
+so it never takes a settlement reference, and the operator's terminal disposition is what decides
+which of the three it means. That is what lets mark-and-route need no vocabulary of its own, which
+is the property the method's comment claims for it.
+
 **`clock` is read now, and it was the last inert field on `spec.Spec`.** A source could stamp a record
 a year in the future and every window, retention rule and event-time lag computed from it was wrong
 with nothing to say so. The check runs at the SOURCE EDGE, before admission, because that is where a

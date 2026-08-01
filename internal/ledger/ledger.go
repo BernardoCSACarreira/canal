@@ -108,7 +108,14 @@ type laneState struct {
 	blockedSince time.Time
 	blocked      bool
 
-	recordsRead      uint64
+	recordsRead uint64
+	// recordsCommitted counts records whose position reached the SOURCE as a durable
+	// acknowledgement — phase three, not phase two.
+	//
+	// It is emphatically not the tracker's settled count, which is records a SINK accepted. The two
+	// diverge by exactly the phase-two-to-phase-three lag, which is the window the whole commit
+	// design exists to manage, and the read model reported the settled number under the name
+	// "committed" because this one was computed and discarded.
 	recordsCommitted uint64
 	// shed counts records dropped at ADMISSION under a non-blocking when_full.
 	//
@@ -731,6 +738,7 @@ func (l *Ledger) Stats(lane record.LaneID) LaneStats {
 	}
 	tracker := st.tracker
 	out.RecordsRead = st.recordsRead
+	out.RecordsCommitted = st.recordsCommitted
 	shed := st.shed
 	out.AbandonedTotal = shed
 	l.mu.Unlock()
@@ -763,11 +771,16 @@ type LaneStats struct {
 	// RecordsRead is everything the source produced for this lane, INCLUDING records shed at
 	// admission. It was called Admitted, which stopped being true the moment a shed could count: a
 	// shed record is read and deliberately not admitted.
-	RecordsRead    uint64
-	Settled        uint64
-	AbandonedTotal uint64
-	InFlight       uint64
-	PendingGroups  int
+	RecordsRead uint64
+
+	// RecordsCommitted is phase three: records whose position reached the source as a durable
+	// acknowledgement. Settled, just below, is phase two — records a sink accepted. Reporting the
+	// second under the first's name overstates how far the SOURCE has been told it may advance.
+	RecordsCommitted uint64
+	Settled          uint64
+	AbandonedTotal   uint64
+	InFlight         uint64
+	PendingGroups    int
 
 	OldestPendingAge      time.Duration
 	OldestPendingPosition record.Position

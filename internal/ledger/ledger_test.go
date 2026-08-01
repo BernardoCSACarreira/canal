@@ -320,3 +320,52 @@ func batchAt(t *testing.T, lane record.LaneID, pos record.Position, n int) *reco
 	b.Position = pos
 	return b
 }
+
+// SETTLED IS PHASE TWO AND COMMITTED IS PHASE THREE, and reporting one under the other's name
+// overstates how far the source has been told it may advance.
+//
+// The two diverge by exactly the window the three-phase design exists to manage: a record is settled
+// the moment a sink accepts it, and committed only once canal's own write of its position is durable
+// AND the acknowledgement has been produced. LaneStats reported the tracker's settled count as
+// RecordsCommitted while the ledger computed the real number and discarded it — found by the
+// write-only field check in internal/arch.
+func TestSettledAndCommittedAreDifferentNumbers(t *testing.T) {
+	l := New(Config{Tenant: "acme", Pipeline: "p", DefaultBudget: 16, GroupTTL: time.Minute})
+	defer l.Close()
+	if err := l.Lane("lane-1", connector.OrderingPrefix, 16, connector.WhenFullBlock); err != nil {
+		t.Fatalf("Lane: %v", err)
+	}
+
+	pos := record.Position{Order: []byte{1}, Token: record.Blob{Version: 1, Bytes: []byte{1}}, Safe: true}
+	b := batchAt(t, "lane-1", pos, 4)
+	if err := l.Admit(context.Background(), b); err != nil {
+		t.Fatalf("Admit: %v", err)
+	}
+
+	// PHASE TWO. The sink has accepted every record and nothing is durable yet.
+	outs := make([]Outcome, 0, 4)
+	for _, r := range b.Records {
+		outs = append(outs, Outcome{Record: r.Origin().ID, Node: "out", Disposition: Delivered})
+	}
+	l.Settle(outs)
+
+	st := l.Stats("lane-1")
+	if st.Settled != 4 {
+		t.Fatalf("%d settled after every record landed, want 4", st.Settled)
+	}
+	if st.RecordsCommitted != 0 {
+		t.Errorf("%d records reported committed before any position was made durable; the source has "+
+			"been told nothing at all yet", st.RecordsCommitted)
+	}
+
+	// PHASE THREE. Only now has the position been flushed and the source may be told.
+	l.Committed(map[record.LaneID]record.Position{"lane-1": pos})
+
+	st = l.Stats("lane-1")
+	if st.RecordsCommitted != 4 {
+		t.Errorf("%d records committed after the position was made durable, want 4", st.RecordsCommitted)
+	}
+	if st.Settled != 4 {
+		t.Errorf("settled changed to %d during phase three; it is a phase-two count", st.Settled)
+	}
+}

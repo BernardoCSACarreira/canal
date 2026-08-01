@@ -24,7 +24,11 @@ type node struct {
 	// no-op rather than a corruption of the prefix.
 	done bool
 
-	prev, next *node
+	// SINGLY LINKED, deliberately. This was a doubly-linked list whose back pointer was assigned in
+	// three places and followed in none: the only traversal is advanceLocked walking the contiguous
+	// resolved prefix forward from the head, and retirement is always head-first. The pointer cost a
+	// write per admission and bought nothing.
+	next *node
 }
 
 // Ticket identifies one tracked node.
@@ -206,7 +210,6 @@ func (t *Tracker[P]) appendLocked(n *node) *node {
 	if t.tail == nil {
 		t.head, t.tail = n, n
 	} else {
-		n.prev = t.tail
 		t.tail.next = n
 		t.tail = n
 	}
@@ -273,12 +276,10 @@ func (t *Tracker[P]) advanceLocked() (P, bool) {
 		moved = true
 
 		t.head = n.next
-		if t.head != nil {
-			t.head.prev = nil
-		} else {
+		if t.head == nil {
 			t.tail = nil
 		}
-		n.done, n.next, n.prev = true, nil, nil
+		n.done, n.next = true, nil
 
 		t.pending -= n.weight
 		t.nodes--

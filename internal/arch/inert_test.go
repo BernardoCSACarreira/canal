@@ -315,3 +315,137 @@ func TestTheInertMatcherWorksInBothDirections(t *testing.T) {
 			"the base-expression filter is not filtering")
 	}
 }
+
+// unreadWriteOnly are the unexported fields a package assigns and never reads, and why.
+//
+// Same defect as an inert exported field, one level down and harder to see: nothing outside the
+// package can even observe the field, so the only symptom is work being done for no reason — or, in
+// the case that motivated this check, a number being computed correctly and thrown away while a
+// consumer reported a different one under its name.
+var unreadWriteOnly = map[string]string{}
+
+// TestNoFieldIsWrittenAndNeverRead finds state a package maintains for nobody.
+//
+// It found three on its first run: record.Batch.bytes, declared and zeroed and never once
+// incremented; the tracker's doubly-linked back pointer, assigned three times and followed never;
+// and the ledger's recordsCommitted, which counted records acknowledged to the SOURCE and was
+// discarded while the read model reported the sink's settled count under the name "committed".
+//
+// The check is per package and by name, so it cannot see a field read through an interface or in
+// another package — which is fine, because an unexported field has neither.
+func TestNoFieldIsWrittenAndNeverRead(t *testing.T) {
+	root := repoRoot(t)
+	for _, pkg := range []string{
+		"pkg/record", "pkg/connector", "pkg/config", "pkg/spec", "pkg/store", "pkg/telemetry",
+		"pkg/fault", "pkg/registry", "pkg/schema",
+		"internal/ledger", "internal/engine", "internal/metrics",
+	} {
+		for _, field := range writeOnlyFields(t, filepath.Join(root, filepath.FromSlash(pkg))) {
+			key := pkg + "." + field
+			if _, allowed := unreadWriteOnly[key]; allowed {
+				continue
+			}
+			t.Errorf("%s is assigned and never read.\n"+
+				"  Either something should be reading it, or the writes are work done for nobody.\n"+
+				"  Add it to unreadWriteOnly in inert_test.go with the reason if it is deliberate.", key)
+		}
+	}
+}
+
+// writeOnlyFields returns the unexported struct fields a package writes and never reads.
+func writeOnlyFields(t *testing.T, dir string) []string {
+	t.Helper()
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("reading %s: %v", dir, err)
+	}
+	declared := map[string]bool{}
+	reads, writes := map[string]int{}, map[string]int{}
+
+	for _, e := range ents {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(token.NewFileSet(), filepath.Join(dir, e.Name()), nil, 0)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", e.Name(), err)
+		}
+
+		// Assignment targets are collected by POSITION first, so the second pass can tell a write
+		// from a read of the same selector text. Without that, every write counts as a read and the
+		// check reports nothing at all — which is exactly what the first version of it did.
+		target := map[token.Pos]bool{}
+		ast.Inspect(f, func(n ast.Node) bool {
+			switch s := n.(type) {
+			case *ast.AssignStmt:
+				for _, l := range s.Lhs {
+					if sel, ok := l.(*ast.SelectorExpr); ok {
+						target[sel.Pos()] = true
+						writes[sel.Sel.Name]++
+					}
+				}
+			case *ast.IncDecStmt:
+				if sel, ok := s.X.(*ast.SelectorExpr); ok {
+					target[sel.Pos()] = true
+					writes[sel.Sel.Name]++
+				}
+			}
+			return true
+		})
+		ast.Inspect(f, func(n ast.Node) bool {
+			switch s := n.(type) {
+			case *ast.StructType:
+				for _, fld := range s.Fields.List {
+					for _, nm := range fld.Names {
+						if !nm.IsExported() {
+							declared[nm.Name] = true
+						}
+					}
+				}
+			case *ast.SelectorExpr:
+				if !target[s.Pos()] {
+					reads[s.Sel.Name]++
+				}
+			}
+			return true
+		})
+	}
+
+	var out []string
+	for name := range declared {
+		// A COMPOUND ASSIGNMENT IS A READ TOO. x.n += 1 parses as an AssignStmt with x.n on the left,
+		// so it counts only as a write here — which is right for this question: a counter that is
+		// only ever added to and never consulted is precisely the thing being looked for.
+		if writes[name] > 0 && reads[name] == 0 {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// THE DETECTOR NEEDS ITS OWN FIXTURE, in both directions.
+//
+// writeOnlyFields reports nothing on a clean tree, and so does a broken version of it. The first
+// draft of it was exactly that: it counted an assignment target as a read of itself, so every write
+// looked like a read and it found nothing at all — on a tree that had three. A check whose passing
+// state is indistinguishable from its broken state is not a check.
+func TestTheWriteOnlyDetectorWorksInBothDirections(t *testing.T) {
+	got := writeOnlyFields(t, filepath.Join(repoRoot(t), "internal/arch/testdata/writeonly"))
+	found := map[string]bool{}
+	for _, f := range got {
+		found[f] = true
+	}
+
+	if !found["dropped"] {
+		t.Error("the fixture's write-only field was not found; every clean result from this check is " +
+			"now meaningless")
+	}
+	if !found["compound"] {
+		t.Error("a field that is only ever added to was not found: x += n is a write, and a counter " +
+			"nothing consults is the case that motivated this check")
+	}
+	if found["kept"] {
+		t.Error("a field that is written and read was reported as write-only")
+	}
+}

@@ -13,6 +13,7 @@ import (
 	"github.com/BernardoCSACarreira/canal/pkg/record"
 	"github.com/BernardoCSACarreira/canal/pkg/registry"
 	"github.com/BernardoCSACarreira/canal/pkg/spec"
+	"github.com/BernardoCSACarreira/canal/pkg/telemetry"
 )
 
 // SCOPE (design rule R10, labelled rather than implied).
@@ -63,6 +64,83 @@ type runner struct {
 
 	mu       sync.Mutex
 	firstErr error
+
+	// lastCheckpoint is when each lane's durable cursor last advanced, and started is the fallback
+	// for a lane that has not advanced at all. Together they are what makes canal_checkpoint_age
+	// seconds ALWAYS available: a pipeline that has never checkpointed reports its age since start
+	// and climbing, rather than reporting nothing and looking healthy to an absent() alert.
+	lastCheckpoint map[record.LaneID]time.Time
+	started        time.Time
+	lastPersist    time.Time
+}
+
+// markCheckpointed records that these lanes' cursors are now durable.
+func (r *runner) markCheckpointed(lanes map[record.LaneID]record.Position) {
+	now := time.Now()
+	r.mu.Lock()
+	for id := range lanes {
+		r.lastCheckpoint[id] = now
+	}
+	r.lastPersist = now
+	r.mu.Unlock()
+}
+
+// refreshGauges republishes every point-in-time series.
+//
+// It runs on the flush ticker rather than on events, because an age is only useful if it climbs
+// WITHOUT anything happening. A checkpoint age updated only when a checkpoint is written is frozen
+// at its last good value exactly when the pipeline stalls, which is the one moment it matters.
+func (r *runner) refreshGauges() {
+	o := r.p.obs
+	if o == nil {
+		return
+	}
+	now := time.Now()
+
+	r.mu.Lock()
+	persist := r.lastPersist
+	r.mu.Unlock()
+	o.staleness.Set(now.Sub(persist).Seconds(), o.pipeline)
+
+	for _, lc := range r.lanes {
+		lc.mu.Lock()
+		ids := make([]record.LaneID, 0, len(lc.lanes))
+		done := make(map[record.LaneID]bool, len(lc.lanes))
+		for id, rec := range lc.lanes {
+			ids = append(ids, id)
+			done[id] = rec.Finished
+		}
+		lc.mu.Unlock()
+
+		for _, id := range ids {
+			// A FINISHED LANE IS NOT A STALLED ONE. Its cursor is final and durable, so an age that
+			// keeps climbing would page somebody about a bounded pipeline that completed exactly as
+			// intended. Forgetting the series is what omit-don't-zero means for a quantity that has
+			// stopped existing rather than one that was never measured.
+			if done[id] {
+				o.checkpointAge.Forget(o.pipeline, laneLabel(id))
+				o.inFlight.Forget(o.pipeline, laneLabel(id))
+				o.inFlightMax.Forget(o.pipeline, laneLabel(id))
+				o.replay.Forget(o.pipeline, laneLabel(id))
+				continue
+			}
+			r.mu.Lock()
+			at, ok := r.lastCheckpoint[id]
+			if !ok {
+				// Never checkpointed. Age from the start of the run, which is the honest answer and
+				// the one that alarms.
+				at = r.started
+				r.lastCheckpoint[id] = at
+			}
+			r.mu.Unlock()
+			o.checkpointAge.Set(now.Sub(at).Seconds(), o.pipeline, laneLabel(id))
+
+			st := r.p.ledger.Stats(id)
+			o.inFlight.Set(float64(st.InFlight), o.pipeline, laneLabel(id))
+			o.inFlightMax.Set(float64(st.InFlightBudget), o.pipeline, laneLabel(id))
+			o.replay.Set(float64(st.ReplayRecords), o.pipeline, laneLabel(id))
+		}
+	}
 }
 
 func (r *runner) fail(err error) {
@@ -91,6 +169,9 @@ func (r *runner) run(ctx context.Context) error {
 
 	r.lanes = map[record.NodeID]*laneCtl{}
 	r.srcRT = map[record.NodeID]*sourceRuntime{}
+	r.lastCheckpoint = map[record.LaneID]time.Time{}
+	r.started = time.Now()
+	r.lastPersist = r.started
 	r.mainSinks, r.failedSinks = partitionSinks(r.p.spec, r.p.sinks)
 
 	// Sinks open before sources. A source that produces before its sink can accept is a batch with
@@ -117,9 +198,11 @@ func (r *runner) run(ctx context.Context) error {
 	}()
 
 	flushStop := make(chan struct{})
+	flushDone := make(chan struct{})
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		defer close(flushDone)
 		r.flushLoop(ctx, flushStop)
 	}()
 
@@ -156,7 +239,24 @@ func (r *runner) run(ctx context.Context) error {
 	// One final flush, so anything that settled during the drain is durable before we stop.
 	r.flushOnce(context.WithoutCancel(ctx))
 
+	// And one final gauge refresh, so the last scrape describes the state the pipeline actually
+	// stopped in. Without it a run shorter than the flush interval published no gauges at all, and
+	// a completed lane kept reporting the in-flight count it had a tick before it drained.
+	r.refreshGauges()
+
+	// CLOSING flushStop ONLY ASKS THE LOOP TO STOP; waiting for flushDone is what makes it true.
+	//
+	// Without the wait, a ticker firing at this instant leaves the flush loop inside flushOnce while
+	// the main goroutine closes the ledger underneath it. Ledger.send then finds the ledger closed
+	// and DROPS the acknowledgement — silently, and by design, because dropping is the safe
+	// direction for the data. But the ack is phase three: dropping it means the source is never told
+	// it may advance, so a source that prunes its upstream on commit never releases the tail of a
+	// clean shutdown, every time the race is lost.
+	//
+	// It surfaced as canal_records_committed_total intermittently missing from a scrape, which is
+	// exactly the sort of thing that stays invisible until something measures it.
 	close(flushStop)
+	<-flushDone
 	_ = r.p.ledger.Close() // closing the ack channel is what ends the pump
 	<-pumpDone
 	wg.Wait()
@@ -167,6 +267,9 @@ func (r *runner) run(ctx context.Context) error {
 		// guessing.
 		r.deps.Log.Warn("drain did not settle every group; records in these may replay on restart",
 			"pipeline", r.p.spec.ID, "groups", len(leaks))
+		for _, lk := range leaks {
+			r.p.obs.leaks.Add(1, r.p.obs.pipeline, string(lk.Node))
+		}
 	}
 	if drainErr != nil {
 		r.fail(fmt.Errorf("engine: drain: %w", drainErr))
@@ -209,7 +312,7 @@ func (r *runner) openSources(ctx context.Context) error {
 		// Every call into a connector goes through the sandbox, so a panic is a classified fault and
 		// a hang is abandoned rather than wedging the host.
 		src := r.p.sources[id]
-		if _, err := sandbox(ctx, src.Name, rt,
+		if _, err := sandbox(ctx, r.p.obs, id, src.Name, rt,
 			func(c context.Context, rt *sourceRuntime) (struct{}, error) {
 				return struct{}{}, src.Source.Open(c, rt)
 			}); err != nil {
@@ -226,13 +329,13 @@ func (r *runner) openSinks(ctx context.Context) error {
 		rt := &sinkRuntime{baseRuntime: baseRuntime{
 			ctx: ctx, deps: r.deps,
 			tenant: r.p.spec.Tenant, pipeline: r.p.spec.ID, node: id,
-			streams: configuredStreams(r.p.spec),
+			streams: configuredStreams(r.p.spec), component: sk.Name,
 		}}
 		opening := connector.Opening{
 			Guarantee: r.p.negotiated.Guarantee,
 			Streams:   configuredStreams(r.p.spec),
 		}
-		if _, err := sandbox(ctx, sk.Name, opening,
+		if _, err := sandbox(ctx, r.p.obs, id, sk.Name, opening,
 			func(c context.Context, o connector.Opening) (struct{}, error) {
 				return struct{}{}, sk.Sink.Open(c, rt, o)
 			}); err != nil {
@@ -246,7 +349,7 @@ func (r *runner) openSinks(ctx context.Context) error {
 		if cc == nil {
 			continue
 		}
-		if _, err := sandbox(ctx, sk.Name, rt,
+		if _, err := sandbox(ctx, r.p.obs, id, sk.Name, rt,
 			func(c context.Context, rt *sinkRuntime) (struct{}, error) {
 				return struct{}{}, cc.open(c, rt)
 			}); err != nil {
@@ -308,7 +411,7 @@ func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 		}
 
 		batch := record.NewBatch(alloc, maxReadBatch)
-		_, err := sandbox(ctx, src.Name, batch,
+		_, err := sandbox(ctx, r.p.obs, id, src.Name, batch,
 			func(c context.Context, b *record.Batch) (struct{}, error) {
 				return struct{}{}, src.Source.Read(c, b)
 			})
@@ -332,6 +435,7 @@ func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 			if readAttempt.started.IsZero() {
 				readAttempt.started = time.Now()
 			}
+			r.p.obs.fault(id, err)
 			rt := route(err, false, r.p.spec.Retry, &readAttempt, time.Now())
 			if rt.disp != dispRetry {
 				r.fail(fmt.Errorf("engine: source %s read (%s after %d attempts): %w",
@@ -341,12 +445,15 @@ func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 			r.deps.Log.Warn("retrying a read",
 				"node", id, "wait", rt.delay, "attempt", readAttempt.count,
 				"class", fault.ClassOf(err), "error", err)
+			r.p.obs.waited(id, fault.ClassOf(err), rt.delay)
 			if serr := sleep(ctx, rt.delay); serr != nil {
 				return
 			}
 			continue
 		}
 		readAttempt = attempt{}
+
+		r.p.obs.recordsRead.Add(float64(batch.Len()), r.p.obs.pipeline, laneLabel(lane.ID), src.Name)
 
 		if err := r.p.ledger.Admit(ctx, batch); err != nil {
 			if ctx.Err() != nil {
@@ -533,6 +640,9 @@ func (r *runner) flushLoop(ctx context.Context, stop <-chan struct{}) {
 			return
 		case <-t.C:
 			r.flushOnce(context.WithoutCancel(ctx))
+			// Unconditionally, even when nothing was flushable: a stalled pipeline produces no
+			// flushes, and that is precisely when its checkpoint age has to keep climbing.
+			r.refreshGauges()
 		}
 	}
 }
@@ -556,10 +666,13 @@ func (r *runner) flushOnce(ctx context.Context) {
 		if len(mine) == 0 {
 			continue
 		}
+		start := time.Now()
 		if err := lc.commit(ctx, mine); err != nil {
 			r.fail(fmt.Errorf("engine: persisting lane cursors for %s: %w", node, err))
 			return
 		}
+		r.p.obs.commitLatency.ObserveSince(start, r.p.obs.pipeline, telemetry.CommitPhasePersist)
+		r.markCheckpointed(mine)
 		// ONLY NOW may the ledger emit acknowledgements for these positions. Calling Committed
 		// before the write returned would tell a source to advance past data canal has no durable
 		// record of, which is design rule R4's original violation.
@@ -570,11 +683,12 @@ func (r *runner) flushOnce(ctx context.Context) {
 // commitPump is phase three: it hands durable acknowledgements to sources.
 func (r *runner) commitPump(ctx context.Context) {
 	for ack := range r.p.ledger.Acks() {
-		src, ok := r.sourceFor(ack.Lane)
+		src, srcNode, ok := r.sourceFor(ack.Lane)
 		if !ok {
 			continue
 		}
-		if _, err := sandbox(ctx, src.Name, ack,
+		start := time.Now()
+		if _, err := sandbox(ctx, r.p.obs, srcNode, src.Name, ack,
 			func(c context.Context, a connector.Ack) (struct{}, error) {
 				return struct{}{}, src.Source.Commit(c, a)
 			}); err != nil {
@@ -582,7 +696,10 @@ func (r *runner) commitPump(ctx context.Context) {
 			// and the next acknowledgement carries it again. Logged rather than fatal.
 			r.deps.Log.Warn("source refused an acknowledgement; its upstream position was not advanced",
 				"lane", ack.Lane, "error", err)
+			continue
 		}
+		r.p.obs.commitLatency.ObserveSince(start, r.p.obs.pipeline, telemetry.CommitPhaseUpstrm)
+		r.p.obs.recordsCommitted.Add(float64(ack.Records), r.p.obs.pipeline, laneLabel(ack.Lane))
 	}
 }
 
@@ -596,16 +713,16 @@ func (r *runner) specFields() specRefFields {
 }
 
 // sourceFor finds the source node that owns a lane.
-func (r *runner) sourceFor(lane record.LaneID) (*registry.ResolvedSource, bool) {
+func (r *runner) sourceFor(lane record.LaneID) (*registry.ResolvedSource, record.NodeID, bool) {
 	for id, lc := range r.lanes {
 		lc.mu.Lock()
 		_, ok := lc.lanes[lane]
 		lc.mu.Unlock()
 		if ok {
-			return r.p.sources[id], true
+			return r.p.sources[id], id, true
 		}
 	}
-	return nil, false
+	return nil, "", false
 }
 
 // configuredStreams projects the spec's stream table into the connector-facing view.

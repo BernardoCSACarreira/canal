@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/BernardoCSACarreira/canal/internal/engine"
+	"github.com/BernardoCSACarreira/canal/internal/metrics"
 	"github.com/BernardoCSACarreira/canal/pkg/config"
 	"github.com/BernardoCSACarreira/canal/pkg/fault"
 	"github.com/BernardoCSACarreira/canal/pkg/registry"
@@ -36,10 +37,11 @@ type opts struct {
 	spec  string
 	state string
 
-	worker string
-	flush  time.Duration
-	grace  time.Duration
-	logLvl string
+	worker  string
+	flush   time.Duration
+	grace   time.Duration
+	logLvl  string
+	metrics string
 }
 
 func (o *opts) bind(fs *flag.FlagSet, withState bool) {
@@ -51,6 +53,8 @@ func (o *opts) bind(fs *flag.FlagSet, withState bool) {
 			"how often lane cursors are made durable; also the upper bound on how much replays after a crash")
 		fs.DurationVar(&o.grace, "grace", 30*time.Second,
 			"how long shutdown is given to drain in-flight records before it is reported as a drain timeout")
+		fs.StringVar(&o.metrics, "metrics", "",
+			"address to serve Prometheus metrics on, e.g. :9090; empty disables the listener")
 	}
 	fs.StringVar(&o.logLvl, "log", "info", "log level: debug, info, warn or error")
 }
@@ -97,11 +101,26 @@ func cmdRun(args []string) int {
 		}
 	}
 
+	// The registry is created whether or not anything serves it. Accumulating series costs almost
+	// nothing, and a pipeline that was started without --metrics and then needs them would otherwise
+	// have to be restarted to get any history at all.
+	reg := metrics.New()
+	if o.metrics != "" {
+		stopServing, err := serveMetrics(o.metrics, reg, log)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "canal run: serving metrics on %s: %v\n", o.metrics, err)
+			closeStore()
+			return exitUsage
+		}
+		defer stopServing()
+	}
+
 	deps := engine.Deps{
 		State:         st,
 		Worker:        store.WorkerID(o.worker),
 		Log:           log,
 		Version:       buildVersion(),
+		Metrics:       reg,
 		FlushInterval: o.flush,
 		GracePeriod:   o.grace,
 	}

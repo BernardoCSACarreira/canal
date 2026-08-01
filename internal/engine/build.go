@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/BernardoCSACarreira/canal/internal/ledger"
+	"github.com/BernardoCSACarreira/canal/internal/metrics"
 	"github.com/BernardoCSACarreira/canal/pkg/config"
 	"github.com/BernardoCSACarreira/canal/pkg/connector"
 	"github.com/BernardoCSACarreira/canal/pkg/record"
@@ -32,6 +33,10 @@ type Deps struct {
 
 	Worker store.WorkerID
 	Log    *slog.Logger
+
+	// Metrics is where this process accumulates its series. A nil registry instruments nothing and
+	// is safe on every path — see obs — which is what lets a test build a pipeline without one.
+	Metrics *metrics.Registry
 
 	// Version is this canal build's version, recorded in every checkpoint header so an operator can see
 	// what wrote the state they are looking at.
@@ -91,6 +96,9 @@ type Pipeline struct {
 	codecs map[record.NodeID]*codecChain
 
 	ledger *ledger.Ledger
+
+	// obs is this pipeline's instrument set, registered once at build.
+	obs *obs
 
 	// negotiated is kept so the read model can serve what the operator GOT rather than what they asked
 	// for, for the pipeline's whole life.
@@ -290,9 +298,22 @@ func Build(ctx context.Context, r *registry.Registry, s spec.Spec, d Deps) (*Pip
 		neg.ReplayBudget = budget
 	}
 
+	ob, err := newObs(deps.Metrics, s.ID)
+	if err != nil {
+		// Every name and label in newObs is a constant from telemetry's closed sets, so a failure
+		// here means one of those sets was edited without this engine. That is a build-time mistake
+		// and refusing is the only way it gets noticed.
+		diags = append(diags, config.Diagnostic{
+			Severity: config.SeverityError, Code: config.CodeCustom,
+			Message: "the engine could not register its own metrics: " + err.Error(),
+		})
+		return fail()
+	}
+
 	p := &Pipeline{
 		spec:    s,
 		deps:    deps,
+		obs:     ob,
 		sources: res.sources,
 		sinks:   res.sinks,
 		codecs:  res.codecs,

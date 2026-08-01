@@ -8936,12 +8936,18 @@ Delivered and verifiable today:
 
 Designed and specified, but **not built** — do not plan around them landing on a date:
 
-- retry with classified faults, the dead-letter route, the metric set, position rendering and scan
-  progress. Retry, dead-letter, drop, stop and stall all run now — what is missing is the
-  MEASUREMENT: `noopMetrics` refuses every registration rather than returning a dangling handle, so
-  `canal_faults_total` and `canal_records_abandoned_total` have nowhere to go and every routing
-  decision is visible only in the log.
+- position rendering, scan progress, and the read model behind them. `telemetry.PipelineStatus` is a
+  declared shape nothing constructs, so `canal_condition` is the one metric in the closed set with
+  no producer.
+- eleven of the twenty-six metric names. `internal/metrics` exports fifteen; the rest measure things
+  that do not exist yet — buffer depth, dedupe, lane revocation, restart phases, node utilization.
+  They are declared and unemitted, which under omit-don't-zero means simply absent from a scrape.
 - an out-of-process deployment. There is no `engine/remote` package.
+
+Retry with classified faults, the dead-letter route and the metric surface are no longer on this
+list. Retry, dead-letter, drop, stop and stall run in `internal/engine/retry.go` and `write.go`, and
+`internal/metrics` accumulates and exposes the series behind them; `canal run --metrics :9090`
+serves them.
 
 Durable resumable progress is no longer on this list: `pkg/store/wal` is a real `store.StateStore`
 and `cmd/canal/main_test.go` kills the binary three times to prove a position survives.

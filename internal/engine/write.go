@@ -66,6 +66,9 @@ func (r *runner) writeSet(ctx context.Context, id record.NodeID, records []*reco
 			if !bad {
 				continue
 			}
+			// Counted BEFORE routing: route normalises Unclassified to PermanentInternal, and the
+			// counter that must stay zero for a compliant connector only works on the raw class.
+			r.p.obs.fault(id, ferr)
 			rt := route(ferr, sk.Caps.Idempotent, policy, att(rec), time.Now())
 
 			switch rt.disp {
@@ -110,6 +113,7 @@ func (r *runner) writeSet(ctx context.Context, id record.NodeID, records []*reco
 		}
 		r.deps.Log.Warn("retrying records a sink did not accept",
 			"node", id, "records", len(retry), "wait", wait, "attempt", att(retry[0]).count)
+		r.p.obs.waited(id, fault.ClassOf(failed[retry[0].Origin().ID]), wait)
 		if err := sleep(ctx, wait); err != nil {
 			return err
 		}
@@ -139,7 +143,7 @@ func (r *runner) writeOnce(ctx context.Context, id record.NodeID, sk *registry.R
 
 	failed := map[record.RecordID]error{}
 	for _, rq := range reqs {
-		res, werr := sandbox(ctx, sk.Name, rq.req,
+		res, werr := sandbox(ctx, r.p.obs, id, sk.Name, rq.req,
 			func(c context.Context, q *connector.Request) (connector.WriteResult, error) {
 				return sk.Sink.Write(c, q)
 			})
@@ -181,6 +185,10 @@ func (r *runner) writeOnce(ctx context.Context, id record.NodeID, sk *registry.R
 		}
 		if len(landed) > 0 {
 			r.p.ledger.Settle(outcomesFor(id, landed, res))
+			r.p.obs.recordsWritten.Add(float64(len(landed)), r.p.obs.pipeline, string(id), sk.Name)
+		}
+		if n := len(res.Duplicates); n > 0 {
+			r.p.obs.recordsDuplicate.Add(float64(n), r.p.obs.pipeline, string(id))
 		}
 	}
 	return failed, nil
@@ -204,6 +212,7 @@ func (r *runner) abandon(id record.NodeID, rec *record.Record, ferr error, reaso
 		Disposition: ledger.Abandoned,
 		Fault:       asFault(ferr),
 	}})
+	r.p.obs.recordsAbandoned.Add(1, r.p.obs.pipeline, laneLabel(rec.Origin().Lane), reason)
 }
 
 // deadLetter writes one record to every sink whose inbound edge carries failed records.
@@ -226,7 +235,7 @@ func (r *runner) deadLetter(ctx context.Context, rec *record.Record, cause error
 			return fmt.Errorf("engine: encoding record %v for dead-letter sink %s: %w", rec.Origin().ID, id, err)
 		}
 		for _, rq := range reqs {
-			if _, err := sandbox(ctx, sk.Name, rq.req,
+			if _, err := sandbox(ctx, r.p.obs, id, sk.Name, rq.req,
 				func(c context.Context, q *connector.Request) (connector.WriteResult, error) {
 					return sk.Sink.Write(c, q)
 				}); err != nil {

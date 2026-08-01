@@ -8942,6 +8942,11 @@ Designed and specified, but **not built** — do not plan around them landing on
 - eleven of the twenty-six metric names. `internal/metrics` exports fifteen; the rest measure things
   that do not exist yet — buffer depth, dedupe, lane revocation, restart phases, node utilization.
   They are declared and unemitted, which under omit-don't-zero means simply absent from a scrape.
+- Flusher, Committer, TokenSink and WriterState. All four are resolved by the registry and reported
+  by the negotiation; none has a caller. That gap USED TO BE SILENT — a capable source plus a
+  Committer sink negotiated exactly_once against an engine that settles on Write — and is now
+  guarded by `engine.Executable`, which warns at Build, refuses at Run before anything is opened,
+  and exits non-zero from `canal check`.
 - an out-of-process deployment. There is no `engine/remote` package.
 
 Retry with classified faults, the dead-letter route and the metric surface are no longer on this

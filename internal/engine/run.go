@@ -43,6 +43,11 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		return fault.Contract(fault.OpOpen,
 			fmt.Errorf("engine: a pipeline needs at least one source and one sink"))
 	}
+	// Refused BEFORE anything is opened, so a pipeline whose contract this build cannot keep never
+	// touches a source, a sink or a byte of state. Build has already warned about it.
+	if err := Executable(p.negotiated); err != nil {
+		return fault.Contract(fault.OpOpen, err)
+	}
 	r := &runner{p: p, deps: p.deps}
 	return r.run(ctx)
 }
@@ -303,7 +308,7 @@ func (r *runner) openSources(ctx context.Context) error {
 			baseRuntime: baseRuntime{
 				ctx: ctx, deps: r.deps,
 				tenant: r.p.spec.Tenant, pipeline: r.p.spec.ID, node: id,
-				streams: configuredStreams(r.p.spec),
+				streams: configuredStreams(r.p.spec), component: r.p.sources[id].Name,
 			},
 			lanes: lc,
 			state: &stateHandle{deps: r.deps, tenant: r.p.spec.Tenant, pipeline: r.p.spec.ID, node: id},

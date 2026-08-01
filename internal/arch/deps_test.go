@@ -63,7 +63,7 @@ var declared = map[string][]string{
 	//
 	// The blank imports of the example connectors and pkg/codec are what make this build's
 	// catalogue, and they are why this row is longer than any other. Nothing imports cmd.
-	"cmd/canal": {"internal/engine", "internal/example/linefile", "internal/example/stdoutsink",
+	"cmd/canal": {"internal/engine", "internal/example/filesink", "internal/example/linefile", "internal/example/stdoutsink",
 		"internal/metrics", "pkg/codec", "pkg/config", "pkg/registry", "pkg/spec", "pkg/store",
 		"pkg/store/wal", "pkg/telemetry", "pkg/fault"},
 }

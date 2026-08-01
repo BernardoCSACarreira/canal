@@ -19,16 +19,17 @@ go run ./cmd/canal check --spec your-pipeline.json
 | | |
 |---|---|
 | `pkg/` — the connector-author surface | **real, compiling, documented.** 89 files, 14,074 lines. |
-| `internal/engine`, `internal/ledger`, `internal/metrics` | **real for one shape.** 5,506 lines. `Build` resolves, validates and negotiates; `Run` reads, admits, writes, settles, flushes and commits, routes a fault to retry, dead-letter, drop, stop or stall, and measures all of it. Single worker, no transforms, no buffers. |
+| `internal/engine`, `internal/ledger`, `internal/metrics` | **real for one shape.** 5,569 lines. `Build` resolves, validates and negotiates; `Run` reads, admits, writes, settles, flushes and commits, routes a fault to retry, dead-letter, drop, stop or stall, and measures all of it. Single worker, no transforms, no buffers. |
 | `cmd/canal` | **real.** `run` and `check`, 483 lines of wiring and no policy. |
 | Durable state store | **real.** [`pkg/store/wal`](pkg/store/wal) is a hand-rolled write-ahead log: CRC32C framing, fsync before return, a torn tail truncated rather than refused, and a flock the kernel drops when the holder dies. |
 | Codecs | **three.** `raw` and `json` encoders, a `newline` framer. json+newline is ndjson; raw+newline is a log tail. |
+| Connectors | **two sources, two sinks.** `line_file` and `stdout` were written alongside the core; [`file`](internal/example/filesink) appends and fsyncs before returning, and [`http_push`](internal/stress/push-source) — one of the deliberately hostile stress connectors — now runs end to end unmodified. |
 | `internal/stress` — eight hostile connectors | **real.** 15,670 lines, kept as an interface-shape regression suite; the audit found five of the eight genuinely catch drift today. |
 | Fault routing | **real.** A connector states a `Class`, a fact; the engine computes the behaviour from (class, capabilities, policy). Throttling never spends a retry attempt, an indeterminate write against a non-idempotent sink fails loud rather than guessing, and a dead letter is delivered before the record is abandoned. |
 | Metrics | **real for fifteen of twenty-six names.** [`internal/metrics`](internal/metrics) accumulates and renders Prometheus text; `canal run --metrics :9090` serves it. An unmeasurable quantity is OMITTED rather than reported as zero, which is what makes `canal_checkpoint_age_seconds` usable as the primary alert. |
 | Buffers, transforms, multi-worker, a frontend, an API | **do not exist.** The interfaces do, and the negotiation refuses a pipeline that asks for one. |
 
-`go build ./...`, `go vet ./...`, `gofmt -l .` and `go test -race ./...` are clean: 142 test functions
+`go build ./...`, `go vet ./...`, `gofmt -l .` and `go test -race ./...` are clean: 145 test functions
 across 20 packages, 41 of them under `pkg/`. [CI](.github/workflows/ci.yml) runs all of that on Linux
 and macOS, cross-compiles for five targets, and verifies the module still has zero third-party
 dependencies.
@@ -40,6 +41,25 @@ restart seam, not anywhere in the output. Duplicates are permitted and counted, 
 negotiated tier is at-least-once and pretending otherwise would be the lie the whole design exists
 to avoid. Both of that test's assertions were confirmed against deliberately injected defects; the
 one class of defect it provably does **not** catch is named in its doc comment.
+
+**The claim the architecture rests on is now tested.** The opening paragraph of this file — adding a
+source or a sink means implementing an interface and registering it, with no core changes — had
+never been checked: there was one real source and one real sink, written alongside the core by the
+same hand. [`internal/engine/thirdparty_test.go`](internal/engine/thirdparty_test.go) runs
+`internal/stress/push-source` — an HTTP ingress written to be deliberately hostile — through the
+real engine into a real file, with forty concurrent POSTs each answered `204` only after their
+record was fsynced. It exercises a discrete-ordered lane, an unbounded lane, a blocking `Read` and
+connector-owned metrics, none of which had ever run. The core needed no change; the connector needed
+one word, because it asked for a metric label outside the closed vocabulary and the registry refused
+it by name.
+
+That exercise also surfaced the worst defect found so far, described on
+[`engine.Executable`](internal/engine/build.go): negotiation is a pure function of COMPONENT
+capabilities and never asked whether the engine could drive the answer, so a capable source plus a
+`Committer` sink negotiated **exactly-once** against an engine that has never called `Committer`.
+Such a pipeline would have settled on `Write`, advanced the cursor, and left the sink holding staged
+data nothing would commit. `Run` now refuses before opening anything and `canal check` exits
+non-zero.
 
 The project's own compliance audit
 ([`docs/decisions/_rule-compliance.md`](docs/decisions/_rule-compliance.md)) ran 19 adversarial
@@ -214,7 +234,7 @@ internal/               engine machinery and connectors; unreachable from outsid
   engine/               Build, negotiation, the graph, codec resolution, checkpoint plumbing,
                         and Run: read, admit, write, settle, flush, commit
   ledger/               Tracker[P], Ledger, Disposition, LaneStats, the leak reaper
-  example/              linefile source, stdoutsink sink, memstore StateStore (scaffolding)
+  example/              linefile and filesink and stdoutsink, memstore StateStore (scaffolding)
   stress/               eight deliberately hostile connectors, kept as a regression suite
 
 docs/

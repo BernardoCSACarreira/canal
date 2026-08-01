@@ -282,6 +282,13 @@ func Build(ctx context.Context, r *registry.Registry, s spec.Spec, d Deps) (*Pip
 		return fail()
 	}
 
+	// A CONTRACT THIS BUILD CANNOT EXECUTE IS A WARNING HERE AND A REFUSAL AT RUN. See [Executable]
+	// for the rule and for why it is not an error at this point.
+	if err := Executable(neg); err != nil {
+		diags = diags.Warnf(config.CodeGuarantee, nil, err.Error(),
+			"the pipeline will be refused when it is run; use a sink that is durable on Write, or lower the requested guarantee")
+	}
+
 	// The wire format each sink will produce is disclosed alongside the guarantee, because it is a
 	// thing the operator GOT rather than asked for: an unnamed encoder defaults to json, which
 	// base64-encodes a byte payload. Sorted, because iterating a map here is how DurabilityEdge
@@ -326,6 +333,57 @@ func Build(ctx context.Context, r *registry.Registry, s spec.Spec, d Deps) (*Pip
 		negotiated: neg,
 	}
 	return p, neg, diags
+}
+
+// Executable reports whether THIS BUILD can honour a negotiated contract.
+//
+// WHY THIS EXISTS. Negotiation is a pure function of COMPONENT capabilities: it works out what the
+// source, the sink and the store can promise between them, and it never asks whether the engine can
+// drive the answer. That gap is not theoretical. A source declaring StableKeys and durable
+// retention, paired with a sink implementing Committer, negotiates exactly_once with
+// ack_point=commit — and nothing in internal/engine has ever called Committer. Such a pipeline would
+// settle every record on Write returning cleanly, advance the source past it, and leave the sink
+// holding staged data that is never committed: data loss, under a promise of exactly-once, which is
+// the one failure the whole negotiation exists to prevent.
+//
+// WHY IT IS NOT A BUILD ERROR. Build answers "is this pipeline coherent"; this answers "can the
+// binary in front of you run it". They are different questions with different lifetimes — the second
+// changes as the engine grows, the first does not — and conflating them would make Build unusable as
+// the negotiation entry point that internal/stress uses it as. So Build WARNS, [Pipeline.Run]
+// refuses before opening anything, and `canal check` exits non-zero. Nothing can move a record under
+// a contract this build cannot keep.
+//
+// SCOPE (R10). This engine settles on exactly one thing: Sink.Write returning cleanly, which is ack
+// point "write". Flusher, Committer and TokenSink are resolved by the registry, reported by the
+// negotiation, and called by nothing. As each is implemented its ack point comes off this list and
+// the pipelines that were refused start running.
+func Executable(n telemetry.Negotiated) error {
+	for _, id := range slices.Sorted(maps.Keys(n.Nodes)) {
+		c := n.Nodes[id]
+		if c.AckPoint == "write" {
+			continue
+		}
+		return fmt.Errorf(
+			"engine: sink %s earns its acknowledgement at %q and the negotiated guarantee is %s, "+
+				"but this build settles only on Write returning cleanly and never calls %s",
+			id, c.AckPoint, c.Guarantee, ifaceFor(c.AckPoint))
+	}
+	return nil
+}
+
+// ifaceFor names the Go interface behind an ack point, so a refusal is a task list rather than a
+// category. It is the same discipline as config.Diagnostic.Iface.
+func ifaceFor(ackPoint string) string {
+	switch ackPoint {
+	case "flush":
+		return "connector.Flusher"
+	case "commit":
+		return "connector.Committer"
+	case "token":
+		return "connector.TokenSink"
+	default:
+		return "that interface"
+	}
 }
 
 // closer pairs a node id with the Close it owes, so a failed build closes exactly what it constructed and

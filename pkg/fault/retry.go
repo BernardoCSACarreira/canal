@@ -176,15 +176,36 @@ func (p RetryPolicy) Next(attempt int) (time.Duration, bool) {
 		return 0, false
 	}
 	m := p.Backoff.Multiplier
-	if m < 1 {
+	if !(m >= 1) { // also catches NaN, which no comparison against 1 would
 		m = 1
 	}
 	exp := float64(p.Backoff.Initial) * math.Pow(m, float64(attempt-1))
-	if max := float64(p.Backoff.Max); max > 0 && exp > max {
-		exp = max
+
+	// THE CEILING IS ALWAYS APPLIED, including when the policy names none.
+	//
+	// Validate guarantees Max >= Initial > 0 for any policy that retries, so a configured pipeline
+	// never reaches the second branch. But this is a public method on a public type and an
+	// unvalidated value is reachable — and without a ceiling the exponential grows without bound:
+	// at attempt 20 with a multiplier of 10 it passes 1e28, and converting a float64 that large to
+	// int64 is IMPLEMENTATION-DEFINED. arm64 saturates to MaxInt64 and yields a 218-year delay;
+	// x86 returns the integer indefinite value, which is NEGATIVE, and rand.Int64N panics on it.
+	// A retry helper that panics on one architecture and sleeps for two centuries on another is not
+	// a difference worth preserving.
+	ceiling := float64(p.Backoff.Max)
+	if p.Backoff.Max <= 0 {
+		ceiling = float64(unboundedCeiling)
+	}
+	if !(exp <= ceiling) { // also catches NaN and +Inf
+		exp = ceiling
 	}
 	if exp <= 0 {
 		return 0, true
 	}
 	return time.Duration(rand.Int64N(int64(exp)) + 1), true
 }
+
+// unboundedCeiling bounds the backoff of a policy that never went through Validate.
+//
+// It is arithmetic safety rather than a policy choice: a validated policy always has its own Max
+// and never sees this value.
+const unboundedCeiling = time.Hour

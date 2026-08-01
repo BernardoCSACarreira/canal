@@ -6518,13 +6518,13 @@ type Negotiated struct {
 	// the disclosed answer depended on Go's map iteration order: 200 identical Builds of
 	// one graph produced four durability_edge values and two ack_point values. Deriving
 	// them from a NAMED branch makes them deterministic.
-	DurabilityEdge string `json:"durability_edge"`
+	DurabilityEdge string `json:"durabilityEdge"`
 	// AckPoint is which sink interface earns the ack: "write" or "flush" or
 	// "commit" or "token".
-	AckPoint string `json:"ack_point"`
+	AckPoint string `json:"ackPoint"`
 	// ReplayBudget is the configured in-flight bound, labelled as the configured
 	// worst case rather than as a measurement.
-	ReplayBudget int `json:"replay_budget"`
+	ReplayBudget int `json:"replayBudget"`
 	// Defaults labels every value the core supplied rather than the operator (R10).
 	Defaults []DefaultNote `json:"defaults"`
 	// Downgrades lists operator-acknowledged waivers in force.
@@ -6534,14 +6534,14 @@ type Negotiated struct {
 // NodeContract is one branch's negotiated answer.
 type NodeContract struct {
 	Guarantee      spec.Guarantee `json:"guarantee"`
-	AckPoint       string         `json:"ack_point"`
-	DurabilityEdge string         `json:"durability_edge"`
+	AckPoint       string         `json:"ackPoint"`
+	DurabilityEdge string         `json:"durabilityEdge"`
 
 	// BestEffort is true when every inbound edge of this node is spec.Edge.BestEffort, so
 	// the branch bears no progress and cannot lower the pipeline's guarantee. Disclosed,
 	// because "this branch may silently drop BY DESIGN" is exactly the fact an operator
 	// must be able to see.
-	BestEffort bool `json:"best_effort,omitempty"`
+	BestEffort bool `json:"bestEffort,omitempty"`
 }
 
 type DefaultNote struct {
@@ -6562,8 +6562,8 @@ type Downgrade struct {
 	Effective      string    `json:"effective"`
 	Missing        []string  `json:"missing"` // capability names
 	Node           record.NodeID `json:"node"`
-	AcknowledgedBy string    `json:"acknowledged_by"`
-	AcknowledgedAt time.Time `json:"acknowledged_at"`
+	AcknowledgedBy string    `json:"acknowledgedBy"`
+	AcknowledgedAt time.Time `json:"acknowledgedAt"`
 	Reason         string    `json:"reason"`
 }
 ```
@@ -6658,8 +6658,45 @@ classDiagram
 `PipelineStatus` is one value type with everything inlined — there are no references to fetch and no
 second document; defined in `pkg/telemetry/readmodel.go`, with `Negotiated` in `negotiated.go` and
 `Condition` in `status.go`. Note `LaneCount` and `LanesTruncated`, which the code block below this
-diagram omits, and note that nothing in the module constructs a `PipelineStatus` yet: its only declared
-producers are `store.StatusStore.Report` and `.Aggregate`, which have no implementation.
+diagram omits.
+
+`engine.Pipeline.Status` constructs it (`internal/engine/status.go`), from live runner state, at any
+point in a pipeline's life including before `Run` and after it returns. `cmd/canal run --metrics`
+serves it at `GET /status` alongside `/metrics`. The two are one observation in two serialisations:
+`refreshGauges` and the document are built from the same pass over the lanes, so a scrape and a status
+read cannot disagree about the pipeline at a given moment.
+
+The declared producers `store.StatusStore.Report` and `.Aggregate` still have no implementation, which
+is what a second worker would need; a single worker reports on itself and sets `Complete: true` because
+it has heard from every worker there is.
+
+**What the engine cannot fill, and why** — the omissions are load-bearing, because the document's rule
+is that every unknown is a nil pointer and never a zero:
+
+| Absent | Because |
+| --- | --- |
+| `PipelineStatus.Config` | The redacted tree needs each component's declared `config.Spec`, and `Build` does not keep the redaction it computes. It is the one field that can carry a secret, so absent is the safe direction |
+| `LaneStatus.Progress` | `record.Fraction` needs a lane's scalar bounds, and a lane declares only its current `Scalar` |
+| `NodeStatus.Utilization`, `.BlockedForSeconds` | Not measured anywhere in the engine |
+| `Buffers` | There is no buffer node type |
+| `WorkerStatus.LeaseExpires` | There are no leases until `store.Coordinator` exists |
+
+`LaneStatus.Position` and `.Resolved` are **present**: `record.Position.Label` is connector-authored
+and rendered verbatim, which is how the UI shows a meaningful position for an arbitrary connector with
+no connector-specific code. A connector that supplies neither leaves both nil, which renders as unknown
+rather than as a position of zero.
+
+`Backlog`, `Idle`, `IdleSince` and `EventTimeLag` come from the source's **control goroutine** (§23.1,
+`internal/engine/control.go`). `Idle` is set only when a heartbeat was ACCEPTED, which is what keeps it
+meaning "the source reports this lane quiet" rather than "the core cannot see anything happening" — a
+stuck lane is also quiet, and only one of the two is healthy. `EventTimeLag` prefers the source's own
+answer from `Backlog` and falls back to differencing the committed position's `At`.
+
+`Generation` and `ObservedGeneration` are both the running spec's `Revision`, because in a standalone
+run the spec canal loaded *is* the stored spec and there is no second copy to diverge from. The
+comparison behind `CondSpecApplied` is real and tested with divergent revisions
+(`engine.specApplied`); it starts reporting something the day a control plane can hold a revision this
+process has not applied.
 
 ```go
 // Package telemetry owns metric naming, the closed label vocabulary, and the single
@@ -6722,7 +6759,17 @@ type Condition struct {
 }
 ```
 
-**The honesty invariant, and it is asserted by a test.** `CondSourceReady: True` **must never be able to
+**The honesty invariant, and it is asserted by a test** —
+`TestConnectedNeverImpliesProgressing` in `internal/engine/status_test.go`, which drives a real
+pipeline into exactly the state described rather than constructing the document by hand.
+`CondSourceReady: True` **must never be able to imply** `CondProgressing: True`. A fixture in which the
+source and sink are connected and the durable cursor has not moved for an hour must render as
+unhealthy. A metrics UI that cannot distinguish *the endpoint answered* from *your data arrived* is
+actively misleading, and this separation is the machine-readable form of that rule.
+
+The engine keeps it structurally rather than by care: readiness is computed from whether `Open`
+returned and progressing from `runner.lastCheckpoint` — the times canal's own durable cursor moved —
+with no input in common, so no amount of connection health can raise `Progressing`.
 
 ```mermaid
 flowchart LR
@@ -6770,11 +6817,6 @@ renders per-lane and per-stream progress; `LaneStatus.Label` and `LaneStatus.Str
 connector-authored strings and are rendered verbatim (`pkg/telemetry/readmodel.go`). Two honest gaps:
 the renderer does not exist, and `LanesTruncated` announces a cut list that no API can page through —
 `store.StatusStore.Aggregate` takes no cursor, offset or limit.
-
-imply** `CondProgressing: True`. A fixture in which the source and sink are connected and the durable
-cursor has not moved for an hour must render as unhealthy. A metrics UI that cannot distinguish *the
-endpoint answered* from *your data arrived* is actively misleading, and this separation is the
-machine-readable form of that rule.
 
 The legacy operator vocabulary `healthy → degraded → paused → terminal` maps onto this without a second
 enum (R9): `healthy` = `PhaseRunning` with no `Degraded: True`; `degraded` = `PhaseRunning` with
@@ -8579,9 +8621,11 @@ sequenceDiagram
 **Most of this ordering is now observed rather than only specified.** `Open`, `Read`, `Commit` and
 `Close` are called in exactly this order by `internal/engine/run.go`, and the concurrency claim —
 `Commit` running while `Read` is blocked — is what the separate commit pump exists to make true.
-Write against the contract regardless: `Heartbeat`, `Backlog`, `Nack` and the assignment refresh have
-no caller yet, so the parts of this diagram that involve them are still specification. The
-interfaces are in `pkg/connector/source.go:15-98` and the enforcement is in `internal/ledger`.
+`Heartbeat`, `Backlog` and `Nack` are called by the source's control goroutine
+(`internal/engine/control.go`). The **assignment refresh** is the one part of this diagram still
+specification: assignments come from `store.Coordinator`, which has no implementation, so the set of
+lanes a worker holds cannot change after `Open` and there is nothing to refresh. The interfaces are in
+`pkg/connector/source.go:15-98` and the enforcement is in `internal/ledger`.
 
 The two consequences that catch every first-time author:
 
@@ -8937,12 +8981,25 @@ Delivered and verifiable today:
 
 Designed and specified, but **not built** — do not plan around them landing on a date:
 
-- position rendering, scan progress, and the read model behind them. `telemetry.PipelineStatus` is a
-  declared shape nothing constructs, so `canal_condition` is the one metric in the closed set with
-  no producer.
-- eleven of the twenty-six metric names. `internal/metrics` exports fifteen; the rest measure things
-  that do not exist yet — buffer depth, dedupe, lane revocation, restart phases, node utilization.
+- the generic renderer. Nothing consumes the read model yet; `GET /status` serves the document and
+  there is no UI on the other end of it.
+- the **assignment refresh**, the fourth thing a source's control goroutine is specified to do. It
+  needs `store.Coordinator`, so in this runtime a worker's lane set cannot change after `Open`.
+
+  Position rendering, scan progress and the read model itself have come off this list.
+  `engine.Pipeline.Status` constructs a `telemetry.PipelineStatus`, `cmd/canal` serves it at
+  `GET /status`, cursor labels are rendered from `record.Position.Label`, and scan progress is
+  computed from lane weights for any source with no connector code. What the document still cannot
+  answer is tabulated in §16 rather than guessed at.
+- seven of the twenty-six metric names. `internal/metrics` exports nineteen; the seven that remain
+  measure things that do not exist yet — `canal_buffer_depth_records`, `canal_buffer_refused_total`,
+  `canal_records_deduped_total`, `canal_lane_revoked_unsettled_records`,
+  `canal_restore_phase_seconds`, `canal_node_utilization_ratio` and `canal_node_blocked_seconds_total`.
   They are declared and unemitted, which under omit-don't-zero means simply absent from a scrape.
+
+  `canal_condition`, `canal_reconcile_delta_records` and `canal_oldest_pending_age_seconds` have come
+  off this list with the read model, because the conditions are metrics as well as document fields —
+  which is what turns "my config change silently did not apply" into an alert rather than a mystery.
 - TokenSink, the strongest tier, where the destination stores canal's token transactionally with
   the data. It is resolved by the registry, reported by the negotiation and called by nothing, so
   `engine.Executable` still refuses it: warns at Build, refuses at Run before anything is opened,
@@ -8960,7 +9017,14 @@ Designed and specified, but **not built** — do not plan around them landing on
 Retry with classified faults, the dead-letter route and the metric surface are no longer on this
 list. Retry, dead-letter, drop, stop and stall run in `internal/engine/retry.go` and `write.go`, and
 `internal/metrics` accumulates and exposes the series behind them; `canal run --metrics :9090`
-serves them.
+serves them, and the same listener serves the read model at `/status`.
+
+The status route is the API sketch above reduced to what exists: one document, no versioned prefix,
+no `/watch`, no `/offsets`, no `/tap`, no `/readyz`. It is deliberately **not** ETagged even though
+`Version` is documented as one — the document carries live ages, so a conditional GET could never
+match, and a 304 that did match would serve a stale checkpoint age for the field an operator is
+watching. `Version` travels as `X-Canal-Status-Version`, where it is honest about being a cursor
+rather than a cache key.
 
 Durable resumable progress is no longer on this list: `pkg/store/wal` is a real `store.StateStore`
 and `cmd/canal/main_test.go` kills the binary three times to prove a position survives.
@@ -8977,6 +9041,20 @@ capacity 2. There is no shared mutable state between nodes; a batch is handed ov
 A **source node** runs two goroutines and only two: the **read goroutine** (`Open`, `Read`, `Close`) and
 the **control goroutine** (`Commit`, `Heartbeat`, `Backlog`, `Nack`, and `Assigned` refreshes). The
 contract states that exactly, once, on `Source.Read`. Every other node kind runs one goroutine.
+
+Both exist. `internal/engine/control.go` is the control goroutine and `Deps.ControlInterval` is its
+cadence, which is also the idleness threshold — one number, because a lane that produced nothing since
+the last tick is quiet and the heartbeat carries the real elapsed duration rather than the interval. It
+is deliberately **not** derived from `FlushInterval`: that one bounds how much data replays after a
+crash, this one bounds how long an upstream pins its own retention with nothing to acknowledge.
+
+`Commit` runs in the shared commit pump rather than per source, because nothing in it is per-source.
+Backlog polling is round-robined under a per-tick cap: `Backlog` may be an expensive remote query and a
+pipeline may hold tens of thousands of lanes, so `Backlog.AsOf` is what makes the resulting staleness
+visible rather than a lie. `Nack` is event-driven, so the write path queues it — under a cap, dropping
+oldest and saying so — and the control goroutine drains it, including once more on the way out: a
+record abandoned in the final moments has already been committed past, and if the upstream is never
+told then nothing will ever tell it.
 
 ### 23.2 Every plugin call is sandboxed
 

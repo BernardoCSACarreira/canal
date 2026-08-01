@@ -55,7 +55,7 @@ func (o *opts) bind(fs *flag.FlagSet, withState bool) {
 		fs.DurationVar(&o.grace, "grace", 30*time.Second,
 			"how long shutdown is given to drain in-flight records before it is reported as a drain timeout")
 		fs.StringVar(&o.metrics, "metrics", "",
-			"address to serve Prometheus metrics on, e.g. :9090; empty disables the listener")
+			"address to serve /metrics and /status on, e.g. :9090; empty disables the listener")
 	}
 	fs.StringVar(&o.logLvl, "log", "info", "log level: debug, info, warn or error")
 }
@@ -106,8 +106,11 @@ func cmdRun(args []string) int {
 	// nothing, and a pipeline that was started without --metrics and then needs them would otherwise
 	// have to be restarted to get any history at all.
 	reg := metrics.New()
+	// The status source is created empty and filled after Build, because the listener binds first: a
+	// port conflict is worth reporting before every connector in the graph has been constructed.
+	src := &statusSource{}
 	if o.metrics != "" {
-		stopServing, err := serveMetrics(o.metrics, reg, log)
+		stopServing, err := serveObservability(o.metrics, reg, src, log)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "canal run: serving metrics on %s: %v\n", o.metrics, err)
 			closeStore()
@@ -138,6 +141,9 @@ func cmdRun(args []string) int {
 		return exitRefused
 	}
 	printNegotiated(neg)
+	// Published before Run, so /status answers PhasePending for a pipeline that is built and not yet
+	// started rather than 503 — those are different states and only one of them is a problem.
+	src.set(p)
 
 	runErr := p.Run(ctx)
 

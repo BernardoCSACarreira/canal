@@ -309,7 +309,7 @@ func (r *runner) flushOne(ctx context.Context, id record.NodeID, sk *registry.Re
 
 	if len(durable) > 0 {
 		r.p.ledger.Settle(outcomesFor(id, durable, connector.WriteResult{Duplicates: res.Duplicates}))
-		r.p.obs.recordsWritten.Add(float64(len(durable)), r.p.obs.pipeline, string(id), sk.Name)
+		r.p.obs.wrote(id, sk.Name, len(durable))
 	}
 	if len(res.Failed) > 0 {
 		// A flush that names failures is reporting records the sink could not make durable. They
@@ -349,7 +349,7 @@ func (r *runner) settleOrHold(id record.NodeID, sk *registry.ResolvedSink,
 		return
 	}
 	r.p.ledger.Settle(outcomesFor(id, landed, res))
-	r.p.obs.recordsWritten.Add(float64(len(landed)), r.p.obs.pipeline, string(id), sk.Name)
+	r.p.obs.wrote(id, sk.Name, len(landed))
 }
 
 // verify at compile time that the ledger outcome vocabulary this file relies on has not moved.

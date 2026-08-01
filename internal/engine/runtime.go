@@ -650,15 +650,35 @@ func (b *baseRuntime) Log() *slog.Logger {
 	return b.deps.Log.With("tenant", b.tenant, "pipeline", b.pipeline, "node", b.node)
 }
 
-// Note records a connector-raised event.
+// Note records a connector-raised event, for the log and for the read model's RecentEvents.
 //
-// Events go to the log today. The read model's RecentEvents ring is where they belong, and that
-// arrives with the status document.
+// THE RING IS BOUNDED, and it has to be. This was an unbounded append fed by third-party code with
+// no rate limit of any kind: a source noting one event per record grew it for the life of the
+// process. Dropping the oldest is the right direction — a status document shows the LAST few events,
+// and an operator reading it wants what just happened, not what happened an hour ago.
 func (b *baseRuntime) Note(e connector.Event) {
+	if e.At.IsZero() {
+		// Stamped by the host when the connector did not. An event with no time sorts to the front of
+		// the document and reads as the oldest thing that happened, which is the opposite of true.
+		e.At = time.Now()
+	}
 	b.mu.Lock()
 	b.events = append(b.events, e)
+	if n := len(b.events); n > maxRetainedEvents {
+		b.events = append(b.events[:0], b.events[n-maxRetainedEvents:]...)
+	}
 	b.mu.Unlock()
 	b.Log().Info("connector event", "kind", e.Kind, "severity", e.Severity, "message", e.Message)
+}
+
+// maxRetainedEvents is how many events one component keeps for the read model.
+const maxRetainedEvents = 64
+
+// recent copies what this component has noted, for the status document.
+func (b *baseRuntime) recent() []connector.Event {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]connector.Event(nil), b.events...)
 }
 
 type sourceRuntime struct {

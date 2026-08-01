@@ -214,7 +214,7 @@ func negotiate(s *spec.Spec, res resolved, sc store.StoreCaps, d config.Diagnost
 			Guarantee: requested.Min(branch),
 			// AckPoint and DurabilityEdge are PER NODE. Assigning two single-valued strings inside a
 			// map-range loop made the disclosed answer depend on Go's map iteration order: 200 identical
-			// Builds produced four durability_edge values and two ack_point values for one graph.
+			// Builds produced four DurabilityEdge values and two AckPoint values for one graph.
 			AckPoint:       sk.AckPoint(),
 			DurabilityEdge: "sink:" + string(id),
 			BestEffort:     nodeIsBestEffort(s, id),

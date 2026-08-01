@@ -48,8 +48,61 @@ func (p *Pipeline) Run(ctx context.Context) error {
 	if err := Executable(p.negotiated); err != nil {
 		return fault.Contract(fault.OpOpen, err)
 	}
-	r := &runner{p: p, deps: p.deps}
+	r := newRunner(p)
+	// Published BEFORE run so that a status read during a slow open sees "starting" rather than
+	// "pending" — the two are different answers, and opening a source against an unreachable upstream
+	// is exactly when somebody is watching.
+	//
+	// WHICH IS WHY newRunner EXISTS. Publishing a runner whose fields the run goroutine was still
+	// assigning was a data race against every concurrent Status: the topology maps, the lane
+	// activity and the start time were all written after the store. A published runner is fully
+	// formed; what happens afterwards is only ever INSERTION into maps that have their own lock.
+	p.active.Store(r)
 	return r.run(ctx)
+}
+
+// newRunner builds a runner that is safe to read from another goroutine the instant it exists.
+func newRunner(p *Pipeline) *runner {
+	now := time.Now()
+	r := &runner{
+		p:    p,
+		deps: p.deps,
+
+		lanes:  map[record.NodeID]*laneCtl{},
+		srcRT:  map[record.NodeID]*sourceRuntime{},
+		sinkRT: map[record.NodeID]*sinkRuntime{},
+
+		lastCheckpoint: map[record.LaneID]time.Time{},
+		started:        now,
+		lastPersist:    now,
+
+		activity:     newLaneActivity(),
+		checkpointer: newCheckpointer(),
+		awaiting:     newAwaitingCommit(),
+	}
+	r.status.phase = telemetry.PhaseStarting
+	r.mainSinks, r.failedSinks = partitionSinks(p.spec, p.sinks)
+
+	// THE TRIGGER MUST FIRE BEFORE ADMISSION BLOCKS, which is why it is half the budget and not the
+	// whole of it.
+	//
+	// With a Flusher every un-durable record counts against the lane budget, so a trigger equal to
+	// the budget is unreachable: the read loop fills the budget, Admit blocks, and the flush that
+	// would release it never happens because the batch that would have triggered it is stuck in
+	// admission. Measured at 3,450 records/s — the budget divided by the tick interval — where half
+	// the budget gives 92,000/s on the same input.
+	//
+	// Half leaves room for at least one more read batch, which is all the margin the invariant
+	// needs. FlushRecords caps it lower when an operator wants a tighter durability window.
+	trigger := p.deps.FlushRecords
+	if half := p.spec.LaneBudget / 2; half > 0 && half < trigger {
+		trigger = half
+	}
+	if trigger <= 0 {
+		trigger = 1
+	}
+	r.deferred = newDeferred(trigger)
+	return r
 }
 
 // runner holds one execution of a pipeline.
@@ -58,9 +111,22 @@ type runner struct {
 	deps Deps
 
 	// lanes and srcRT are kept so shutdown can reach the lane table for the final commit, and so the
-	// commit pump can find the source that owns an acknowledged lane.
-	lanes map[record.NodeID]*laneCtl
-	srcRT map[record.NodeID]*sourceRuntime
+	// commit pump can find the source that owns an acknowledged lane. sinkRT is kept so the read model
+	// can collect the events a sink reported through connector.Runtime.Note.
+	//
+	// nodesMu GUARDS ONLY THE MAPS, never the I/O that produces what goes in them. A component is
+	// constructed and opened outside the lock and inserted under it, so a status read during a slow
+	// open is not blocked by that open — it simply sees the nodes that are up so far, with the rest
+	// reporting Connected false, which is the honest answer and a more useful one than waiting.
+	nodesMu sync.RWMutex
+	lanes   map[record.NodeID]*laneCtl
+	srcRT   map[record.NodeID]*sourceRuntime
+	sinkRT  map[record.NodeID]*sinkRuntime
+
+	// status is the read model's own state: the phase, the previous condition set and the rate
+	// samples. See status.go. activity is the control loop's, see control.go.
+	status   statusState
+	activity *laneActivity
 
 	// mainSinks and failedSinks are the sink nodes split by what their inbound edges carry, computed
 	// once at start because it is a property of the spec and cannot change during a run.
@@ -79,6 +145,11 @@ type runner struct {
 
 	mu       sync.Mutex
 	firstErr error
+
+	// firstErrAt is when the fault that ended the run was recorded. The read model needs it and
+	// fault.Fault carries no timestamp of its own — deliberately, since a fault crosses a wire and a
+	// clock does not travel well, so the moment it was OBSERVED is the host's to record.
+	firstErrAt time.Time
 
 	// lastCheckpoint is when each lane's durable cursor last advanced, and started is the fallback
 	// for a lane that has not advanced at all. Together they are what makes canal_checkpoint_age
@@ -105,6 +176,11 @@ func (r *runner) markCheckpointed(lanes map[record.LaneID]record.Position) {
 // It runs on the flush ticker rather than on events, because an age is only useful if it climbs
 // WITHOUT anything happening. A checkpoint age updated only when a checkpoint is written is frozen
 // at its last good value exactly when the pipeline stalls, which is the one moment it matters.
+//
+// EVERY SERIES HERE IS PROJECTED FROM THE SAME PASS THE STATUS DOCUMENT IS BUILT FROM. The scrape
+// and the document are two serialisations of one observation, so they cannot disagree about the
+// state of the pipeline at a given moment — which is the whole reason [runner.laneStatuses] returns
+// its facts rather than each consumer walking the lanes itself.
 func (r *runner) refreshGauges() {
 	o := r.p.obs
 	if o == nil {
@@ -117,45 +193,42 @@ func (r *runner) refreshGauges() {
 	r.mu.Unlock()
 	o.staleness.Set(now.Sub(persist).Seconds(), o.pipeline)
 
-	for _, lc := range r.lanes {
-		lc.mu.Lock()
-		ids := make([]record.LaneID, 0, len(lc.lanes))
-		done := make(map[record.LaneID]bool, len(lc.lanes))
-		for id, rec := range lc.lanes {
-			ids = append(ids, id)
-			done[id] = rec.Finished
+	lanes, facts := r.laneStatuses(now)
+	for i := range lanes {
+		ls := &lanes[i]
+		lbl := laneLabel(ls.ID)
+
+		// A FINISHED LANE IS NOT A STALLED ONE. Its cursor is final and durable, so an age that keeps
+		// climbing would page somebody about a bounded pipeline that completed exactly as intended.
+		// Forgetting the series is what omit-don't-zero means for a quantity that has stopped
+		// existing rather than one that was never measured.
+		if ls.Finished {
+			o.checkpointAge.Forget(o.pipeline, lbl)
+			o.inFlight.Forget(o.pipeline, lbl)
+			o.inFlightMax.Forget(o.pipeline, lbl)
+			o.replay.Forget(o.pipeline, lbl)
+			o.oldestPending.Forget(o.pipeline, lbl)
+			continue
 		}
-		lc.mu.Unlock()
+		if ls.CheckpointAge != nil {
+			o.checkpointAge.Set(*ls.CheckpointAge, o.pipeline, lbl)
+		}
+		o.inFlight.Set(float64(ls.InFlight), o.pipeline, lbl)
+		o.inFlightMax.Set(float64(ls.InFlightBudget), o.pipeline, lbl)
+		o.replay.Set(float64(ls.ReplayRecords), o.pipeline, lbl)
 
-		for _, id := range ids {
-			// A FINISHED LANE IS NOT A STALLED ONE. Its cursor is final and durable, so an age that
-			// keeps climbing would page somebody about a bounded pipeline that completed exactly as
-			// intended. Forgetting the series is what omit-don't-zero means for a quantity that has
-			// stopped existing rather than one that was never measured.
-			if done[id] {
-				o.checkpointAge.Forget(o.pipeline, laneLabel(id))
-				o.inFlight.Forget(o.pipeline, laneLabel(id))
-				o.inFlightMax.Forget(o.pipeline, laneLabel(id))
-				o.replay.Forget(o.pipeline, laneLabel(id))
-				continue
-			}
-			r.mu.Lock()
-			at, ok := r.lastCheckpoint[id]
-			if !ok {
-				// Never checkpointed. Age from the start of the run, which is the honest answer and
-				// the one that alarms.
-				at = r.started
-				r.lastCheckpoint[id] = at
-			}
-			r.mu.Unlock()
-			o.checkpointAge.Set(now.Sub(at).Seconds(), o.pipeline, laneLabel(id))
-
-			st := r.p.ledger.Stats(id)
-			o.inFlight.Set(float64(st.InFlight), o.pipeline, laneLabel(id))
-			o.inFlightMax.Set(float64(st.InFlightBudget), o.pipeline, laneLabel(id))
-			o.replay.Set(float64(st.ReplayRecords), o.pipeline, laneLabel(id))
+		// OMIT, DO NOT ZERO. A lane with nothing pending has no oldest pending record, and an age of
+		// zero would read as "the oldest one arrived just now" — the opposite of the truth, and the
+		// reading that makes a `> 60` alert quietly stop firing.
+		if ls.OldestPendingAge != nil {
+			o.oldestPending.Set(*ls.OldestPendingAge, o.pipeline, lbl)
+		} else {
+			o.oldestPending.Forget(o.pipeline, lbl)
 		}
 	}
+
+	o.reconcile.Set(float64(int64(facts.admitted)-int64(facts.settled)), o.pipeline)
+	r.publishConditions(r.conditions(now, facts))
 }
 
 func (r *runner) fail(err error) {
@@ -164,9 +237,16 @@ func (r *runner) fail(err error) {
 	}
 	r.mu.Lock()
 	if r.firstErr == nil {
-		r.firstErr = err
+		r.firstErr, r.firstErrAt = err, time.Now()
 	}
 	r.mu.Unlock()
+}
+
+// setPhase moves the pipeline's coarse state, which is the read model's headline.
+func (r *runner) setPhase(p telemetry.Phase) {
+	r.status.mu.Lock()
+	r.status.phase = p
+	r.status.mu.Unlock()
 }
 
 // firstError reports the fault that ended the run, if one has.
@@ -182,49 +262,34 @@ func (r *runner) run(ctx context.Context) error {
 	runCtx, stopReading := context.WithCancel(ctx)
 	defer stopReading()
 
-	r.lanes = map[record.NodeID]*laneCtl{}
-	r.srcRT = map[record.NodeID]*sourceRuntime{}
-	r.lastCheckpoint = map[record.LaneID]time.Time{}
-	r.started = time.Now()
-	r.lastPersist = r.started
-	r.mainSinks, r.failedSinks = partitionSinks(r.p.spec, r.p.sinks)
-	// THE TRIGGER MUST FIRE BEFORE ADMISSION BLOCKS, which is why it is half the budget and not the
-	// whole of it.
-	//
-	// With a Flusher every un-durable record counts against the lane budget, so a trigger equal to
-	// the budget is unreachable: the read loop fills the budget, Admit blocks, and the flush that
-	// would release it never happens because the batch that would have triggered it is stuck in
-	// admission. Measured at 3,450 records/s — the budget divided by the tick interval — where half
-	// the budget gives 92,000/s on the same input.
-	//
-	// Half leaves room for at least one more read batch, which is all the margin the invariant
-	// needs. FlushRecords caps it lower when an operator wants a tighter durability window.
-	trigger := r.deps.FlushRecords
-	if half := r.p.spec.LaneBudget / 2; half > 0 && half < trigger {
-		trigger = half
-	}
-	if trigger <= 0 {
-		trigger = 1
-	}
-	r.deferred = newDeferred(trigger)
-	r.checkpointer = newCheckpointer()
-	r.awaiting = newAwaitingCommit()
-
 	// Sinks open before sources. A source that produces before its sink can accept is a batch with
 	// nowhere to go, held against the lane budget for nothing.
 	if err := r.openSinks(runCtx); err != nil {
+		r.fail(err)
+		r.setPhase(telemetry.PhaseFailed)
 		return err
 	}
+	r.status.mu.Lock()
+	r.status.sinkReady = true
+	r.status.mu.Unlock()
 	// RECOVERY BEFORE ANY RECORD MOVES. A previous run may have left staged artifacts the
 	// destination has and this process does not know about; resolving them after starting to read
 	// would let a new checkpoint advance a cursor past records nobody published. It runs after the
 	// sinks are open because only an open sink can answer for its own committables.
 	if err := r.recoverCheckpoint(runCtx); err != nil {
+		r.fail(err)
+		r.setPhase(telemetry.PhaseFailed)
 		return err
 	}
 	if err := r.openSources(runCtx); err != nil {
+		r.fail(err)
+		r.setPhase(telemetry.PhaseFailed)
 		return err
 	}
+	r.status.mu.Lock()
+	r.status.sourceReady = true
+	r.status.mu.Unlock()
+	r.setPhase(telemetry.PhaseRunning)
 
 	var wg sync.WaitGroup
 
@@ -249,6 +314,18 @@ func (r *runner) run(ctx context.Context) error {
 		r.flushLoop(ctx, flushStop)
 	}()
 
+	// THE SECOND GOROUTINE PER SOURCE. It takes ctx rather than runCtx so heartbeats keep an
+	// upstream's retention moving while the pipeline drains, and it is stopped by a channel so every
+	// call into a connector has returned before Run does — and therefore before the host calls Close.
+	controlStop := make(chan struct{})
+	for id := range r.p.sources {
+		wg.Add(1)
+		go func(id record.NodeID) {
+			defer wg.Done()
+			r.controlLoop(ctx, id, controlStop)
+		}(id)
+	}
+
 	readers := &sync.WaitGroup{}
 	for id := range r.p.sources {
 		readers.Add(1)
@@ -259,6 +336,15 @@ func (r *runner) run(ctx context.Context) error {
 	}
 	readers.Wait()
 	stopReading()
+
+	// DRAINING IS ITS OWN PHASE, and the two fields that describe it are only meaningful here. An
+	// operator watching a stop wants to know when it started and when canal will give up, and
+	// "drained" and "drain timed out" are distinct events because the second means records replay.
+	r.status.mu.Lock()
+	r.status.phase = telemetry.PhaseDraining
+	r.status.stoppingSince = time.Now()
+	r.status.drainDeadline = r.status.stoppingSince.Add(r.deps.GracePeriod)
+	r.status.mu.Unlock()
 
 	// Drain: settlement continues while the ledger empties. A graceful stop must not discard a
 	// commit that is one millisecond from safe.
@@ -315,6 +401,10 @@ func (r *runner) run(ctx context.Context) error {
 	//
 	// It surfaced as canal_records_committed_total intermittently missing from a scrape, which is
 	// exactly the sort of thing that stays invisible until something measures it.
+	// The control loops stop here too, and their last act is to deliver any nack the write path
+	// queued in the final moments — a record already settled and already committed past, which
+	// nothing else will ever tell the upstream about.
+	close(controlStop)
 	close(flushStop)
 	<-flushDone
 	_ = r.p.ledger.Close() // closing the ack channel is what ends the pump
@@ -336,6 +426,22 @@ func (r *runner) run(ctx context.Context) error {
 	if drainErr != nil {
 		r.fail(fmt.Errorf("engine: drain: %w", drainErr))
 	}
+
+	// THE TERMINAL PHASE, and the distinction between the last two is the whole reason PhaseCompleted
+	// exists: without it a finished batch job looks identical to a stalled stream. A run that ended
+	// because its input ended is COMPLETED; one that ended because somebody cancelled it is STOPPED
+	// and may well be restarted. A fault outranks both.
+	switch {
+	case r.firstError() != nil:
+		r.setPhase(telemetry.PhaseFailed)
+	case ctx.Err() != nil:
+		r.setPhase(telemetry.PhaseStopped)
+	default:
+		r.setPhase(telemetry.PhaseCompleted)
+	}
+	// One last condition refresh, so the final scrape describes the state the pipeline stopped in
+	// rather than the one it was in a tick earlier.
+	r.refreshGauges()
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -359,7 +465,7 @@ func (r *runner) openSources(ctx context.Context) error {
 		if err := lc.load(ctx); err != nil {
 			return err
 		}
-		r.lanes[id] = lc
+		r.setLaneCtl(id, lc)
 
 		rt := &sourceRuntime{
 			baseRuntime: baseRuntime{
@@ -380,7 +486,7 @@ func (r *runner) openSources(ctx context.Context) error {
 			}); err != nil {
 			return fmt.Errorf("engine: opening source %s: %w", id, err)
 		}
-		r.srcRT[id] = rt
+		r.setSourceRT(id, rt)
 	}
 	return nil
 }
@@ -393,6 +499,7 @@ func (r *runner) openSinks(ctx context.Context) error {
 			tenant: r.p.spec.Tenant, pipeline: r.p.spec.ID, node: id,
 			streams: configuredStreams(r.p.spec), component: sk.Name,
 		}}
+		r.setSinkRT(id, rt)
 		opening := connector.Opening{
 			Guarantee: r.p.negotiated.Guarantee,
 			Streams:   configuredStreams(r.p.spec),
@@ -432,7 +539,7 @@ const maxReadBatch = 512
 // that second goroutine, shared across sources here because nothing in it is per-source.
 func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 	src := r.p.sources[id]
-	rt := r.srcRT[id]
+	rt := r.sourceRT(id)
 
 	// Delivery does NOT inherit the read context.
 	//
@@ -516,6 +623,13 @@ func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 		readAttempt = attempt{}
 
 		r.p.obs.recordsRead.Add(float64(batch.Len()), r.p.obs.pipeline, laneLabel(lane.ID), src.Name)
+		if batch.Len() > 0 {
+			// A lane that produced records is not quiet, which ends any idleness the control loop had
+			// reported. A ZERO-RECORD POSITIONED BATCH deliberately does not count: it advances the
+			// cursor without producing, so the lane genuinely has nothing to say and a heartbeat is
+			// exactly what should keep holding its slot.
+			r.activity.saw(lane.ID, time.Now())
+		}
 
 		if err := r.p.ledger.Admit(ctx, batch); err != nil {
 			if ctx.Err() != nil {
@@ -784,7 +898,7 @@ func (r *runner) flushOnce(ctx context.Context, reason connector.FlushReason) {
 // representation so much as two readers: the lane rows are what a warm start reads to answer
 // Assigned, and the envelope is what makes a committable and the span it covers one atomic record.
 func (r *runner) fillLaneStates(cp *Checkpoint, positions map[record.LaneID]record.Position) {
-	for _, lc := range r.lanes {
+	for _, lc := range r.laneCtls() {
 		lc.mu.Lock()
 		for id, rec := range lc.lanes {
 			cursor := rec.Cursor
@@ -842,7 +956,7 @@ func (r *runner) specFields() specRefFields {
 
 // sourceFor finds the source node that owns a lane.
 func (r *runner) sourceFor(lane record.LaneID) (*registry.ResolvedSource, record.NodeID, bool) {
-	for id, lc := range r.lanes {
+	for id, lc := range r.laneCtls() {
 		lc.mu.Lock()
 		_, ok := lc.lanes[lane]
 		lc.mu.Unlock()

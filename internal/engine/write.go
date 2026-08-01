@@ -51,6 +51,16 @@ func (r *runner) writeSet(ctx context.Context, id record.NodeID, records []*reco
 	for len(pending) > 0 {
 		failed, err := r.writeOnce(ctx, id, sk, cc, pending, lane, at)
 		if err != nil {
+			// A FAULT THE ENGINE RAISED ABOUT THIS SINK IS STILL A FAULT AT THIS NODE. Only the faults
+			// a sink RETURNED were counted, so a broken contract — a WriteResult that accounts for
+			// fewer records than the request carried, a non-Flusher deferring — went uncounted, which
+			// made the single clearest case of "this is the connector's bug" the one case
+			// canal_faults_total could not attribute. Found by asserting the node rollup in the read
+			// model against a sink that under-reports.
+			//
+			// Every other fatal path in the engine already counts at the point it gives up:
+			// flushOne, signalFlush and the commit protocol all do. This was the outlier.
+			r.p.obs.fault(id, err)
 			return err
 		}
 		if len(failed) == 0 {
@@ -89,10 +99,10 @@ func (r *runner) writeSet(ctx context.Context, id record.NodeID, records []*reco
 				if err := r.deadLetter(ctx, rec, ferr); err != nil {
 					return err
 				}
-				r.abandon(id, rec, ferr, rt.reason)
+				r.abandon(id, rec, ferr, rt.reason, at, att(rec).count)
 
 			case dispDrop:
-				r.abandon(id, rec, ferr, rt.reason)
+				r.abandon(id, rec, ferr, rt.reason, at, att(rec).count)
 
 			case dispStall:
 				// SCOPE (R10). The specified behaviour is to block THIS LANE and leave the rest of
@@ -145,6 +155,10 @@ func (r *runner) writeOnce(ctx context.Context, id record.NodeID, sk *registry.R
 
 	failed := map[record.RecordID]error{}
 	for _, rq := range reqs {
+		// Counted BEFORE the call, because "handed to the sink" is what the read model's RecordsIn
+		// means for a sink node. Counting after a successful return would make it a second, worse
+		// copy of RecordsOut, and the gap between the two is exactly what a stuck sink looks like.
+		r.p.obs.handed(id, len(rq.records))
 		res, werr := sandbox(ctx, r.p.obs, id, sk.Name, rq.req,
 			func(c context.Context, q *connector.Request) (connector.WriteResult, error) {
 				return sk.Sink.Write(c, q)
@@ -200,11 +214,20 @@ func (r *runner) writeOnce(ctx context.Context, id record.NodeID, sk *registry.R
 // what stops a poison record livelocking the lane. It is logged at error level with the class and
 // the reason, because a record leaving the pipeline without reaching its destination is the single
 // most consequential thing this engine can do quietly.
-func (r *runner) abandon(id record.NodeID, rec *record.Record, ferr error, reason string) {
+func (r *runner) abandon(id record.NodeID, rec *record.Record, ferr error, reason string,
+	at record.Position, attempts int,
+) {
 	class := fault.ClassOf(ferr)
 	r.deps.Log.Error("a record will not be delivered",
 		"node", id, "record", rec.Origin().ID, "lane", rec.Origin().Lane,
 		"class", class, "blame", class.Blames(), "reason", reason, "error", ferr)
+
+	// THE SOURCE IS TOLD, if it asked to be. A terminal disposition is the one thing a source can
+	// never infer: the cursor advances past the record exactly as if it had been delivered, so
+	// without a nack a parked-message source parks nothing and an upstream that tracks failures
+	// records a success. Queued rather than called here, because this runs on the write path and
+	// Nack belongs to the source's control goroutine.
+	r.nack(rec, at, ferr, reason, attempts)
 
 	r.p.ledger.Settle([]ledger.Outcome{{
 		Record:      rec.Origin().ID,

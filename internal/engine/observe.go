@@ -6,6 +6,7 @@ import (
 	"github.com/BernardoCSACarreira/canal/internal/metrics"
 	"github.com/BernardoCSACarreira/canal/pkg/fault"
 	"github.com/BernardoCSACarreira/canal/pkg/record"
+	"github.com/BernardoCSACarreira/canal/pkg/spec"
 	"github.com/BernardoCSACarreira/canal/pkg/telemetry"
 )
 
@@ -38,8 +39,49 @@ type obs struct {
 	inFlightMax   *metrics.Gauge
 	replay        *metrics.Gauge
 	staleness     *metrics.Gauge
+	oldestPending *metrics.Gauge
+	reconcile     *metrics.Gauge
+	conditions    *metrics.Gauge
 
 	commitLatency *metrics.Histogram
+
+	// tally is the read model's per-node accounting, allocated once from the spec graph so the map is
+	// read-only for the whole run and the counters are plain atomics.
+	//
+	// It exists BECAUSE the instruments above cannot be read back, and because the label sets do not
+	// line up with the document's: canal_records_read_total is labelled by lane, and summing a counter
+	// family over a label is something a scrape does, not something a process can ask its own
+	// registry for.
+	tally map[record.NodeID]*nodeTally
+}
+
+// tallyFor returns a node's accounting, or nil for a node that is not in the graph.
+func (o *obs) tallyFor(id record.NodeID) *nodeTally {
+	if o == nil {
+		return nil
+	}
+	return o.tally[id]
+}
+
+// wrote records records a sink made durable: the metric and the node's own total.
+func (o *obs) wrote(node record.NodeID, connector string, n int) {
+	if o == nil || n <= 0 {
+		return
+	}
+	o.recordsWritten.Add(float64(n), o.pipeline, string(node), connector)
+	if t := o.tally[node]; t != nil {
+		t.out.Add(uint64(n))
+	}
+}
+
+// handed records records given to a sink's Write, whether or not they are durable yet.
+func (o *obs) handed(node record.NodeID, n int) {
+	if o == nil || n <= 0 {
+		return
+	}
+	if t := o.tally[node]; t != nil {
+		t.in.Add(uint64(n))
+	}
 }
 
 // newObs registers the engine's own metrics.
@@ -48,8 +90,11 @@ type obs struct {
 // telemetry.MetricNames and every label from telemetry.Labels, so a failure means one of those two
 // closed sets has been edited without this file, which is a build-time mistake and not a runtime
 // condition to tolerate.
-func newObs(r *metrics.Registry, pipeline record.PipelineID) (*obs, error) {
-	o := &obs{pipeline: string(pipeline)}
+func newObs(r *metrics.Registry, s spec.Spec) (*obs, error) {
+	o := &obs{pipeline: string(s.ID), tally: map[record.NodeID]*nodeTally{}}
+	for _, n := range s.Graph {
+		o.tally[n.ID] = &nodeTally{}
+	}
 	if r == nil {
 		return o, nil
 	}
@@ -91,6 +136,9 @@ func newObs(r *metrics.Registry, pipeline record.PipelineID) (*obs, error) {
 	o.inFlightMax = gauge(telemetry.MInFlightBudget, P, L)
 	o.replay = gauge(telemetry.MReplayRecords, P, L)
 	o.staleness = gauge(telemetry.MStateStaleness, P)
+	o.oldestPending = gauge(telemetry.MOldestPending, P, L)
+	o.reconcile = gauge(telemetry.MReconcileDelta, P)
+	o.conditions = gauge(telemetry.MConditions, P, telemetry.LabelCondition, telemetry.LabelStatus)
 
 	if err == nil {
 		o.commitLatency, err = r.Histogram(telemetry.MCommitLatency, nil, P, telemetry.LabelPhase)
@@ -124,6 +172,9 @@ func (o *obs) fault(node record.NodeID, err error) {
 		op = f.Op
 	}
 	o.faults.Add(1, o.pipeline, string(node), op.String(), class.String(), class.Blames().String())
+	if t := o.tally[node]; t != nil {
+		t.faults.Add(1)
+	}
 }
 
 // waited records time spent backing off.
@@ -136,6 +187,9 @@ func (o *obs) waited(node record.NodeID, class fault.Class, d time.Duration) {
 		return
 	}
 	o.backoff.Add(d.Seconds(), o.pipeline, string(node), class.String())
+	if t := o.tally[node]; t != nil {
+		t.backoffNanos.Add(uint64(d))
+	}
 }
 
 // abandonedCall records a plugin call the host gave up on.

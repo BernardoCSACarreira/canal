@@ -41,14 +41,31 @@ type Key struct {
 // implementation is free to store the tenant and space as columns, and must not rely on this format.
 func (k Key) String() string {
 	var b strings.Builder
-	b.WriteString(string(k.Tenant))
+	b.WriteString(escapeKeyPart(string(k.Tenant)))
 	b.WriteByte('/')
-	b.WriteString(string(k.Space))
+	b.WriteString(escapeKeyPart(string(k.Space)))
 	for _, p := range k.Parts {
 		b.WriteByte('/')
-		b.WriteString(p)
+		b.WriteString(escapeKeyPart(p))
 	}
 	return b.String()
+}
+
+// escapeKeyPart makes the separator unambiguous, the same way record.DeriveLaneID does.
+//
+// WITHOUT IT TWO DIFFERENT KEYS RENDER ALIKE. Pipeline "a" with node "b/c" and pipeline "a/b" with
+// node "c" both produced "acme/connector/a/b/c/lane", and this string is the identity a store
+// indexes by — the WAL keys its in-memory map on it and store.Batch keys its writes on it — so one
+// pipeline's connector state silently overwrote another's inside the same tenant. Node and pipeline
+// ids are operator-chosen, so a slash in one is all it takes.
+//
+// It is safe to change: the WAL persists the Key STRUCT, with each part length-prefixed, and never
+// this rendering. Nothing on disk moves.
+func escapeKeyPart(s string) string {
+	if !strings.ContainsAny(s, "%/") {
+		return s
+	}
+	return strings.NewReplacer("%", "%25", "/", "%2F").Replace(s)
 }
 
 // Prefix reports whether k is within p: same tenant, same space, and every part of p leading k's.

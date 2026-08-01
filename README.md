@@ -31,10 +31,10 @@ go run ./cmd/canal check --spec your-pipeline.json
 | Metrics | **real for fifteen of twenty-six names.** [`internal/metrics`](internal/metrics) accumulates and renders Prometheus text; `canal run --metrics :9090` serves it. An unmeasurable quantity is OMITTED rather than reported as zero, which is what makes `canal_checkpoint_age_seconds` usable as the primary alert. |
 | Buffers, transforms, multi-worker, a frontend, an API | **do not exist.** The interfaces do, and the negotiation refuses a pipeline that asks for one. |
 
-`go build ./...`, `go vet ./...`, `gofmt -l .` and `go test -race ./...` are clean: 193 test functions
-across 23 packages, 82 of them under `pkg/`. Four published packages still have none —
-`pkg/spec`, `pkg/schema`, `pkg/store` and `pkg/connectortest` — which is tracked rather than glossed:
-the first three tests written against this surface found a panic that only fires on amd64. [CI](.github/workflows/ci.yml) runs all of that on Linux
+`go build ./...`, `go vet ./...`, `gofmt -l .` and `go test -race ./...` are clean: 222 test
+functions across 27 packages, 111 of them under `pkg/`. **Every published package now has tests.**
+Writing them found two defects nothing else would have: a retry helper that panics on amd64, and a
+key encoding under which two pipelines in one tenant could overwrite each other's state. [CI](.github/workflows/ci.yml) runs all of that on Linux
 and macOS, cross-compiles for five targets, and verifies the module still has zero third-party
 dependencies.
 

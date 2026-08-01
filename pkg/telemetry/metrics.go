@@ -65,7 +65,11 @@ const (
 	// boundary behave like a subprocess boundary.
 	MAbandonedPluginCalls = "canal_abandoned_plugin_calls_total" // {pipeline,node}
 
-	// MReconcileDelta is records in minus records out per checkpoint.
+	// MReconcileDelta is records in minus records out per checkpoint, where OUT is settled PLUS
+	// abandoned. An abandoned record left by an accounted route — a dead letter, a drop, a lane shed
+	// — and counting it as missing makes this permanently non-zero the first time any of those fires,
+	// which destroys the one thing it is for: a QUIESCENT pipeline whose records went somewhere
+	// nobody accounted for.
 	MReconcileDelta = "canal_reconcile_delta_records" // {pipeline}
 
 	// MConditions exports every condition as a bounded series, so a silently unapplied config change
@@ -121,7 +125,7 @@ var MetricHelp = map[string]string{
 	MUnclassified: "Faults a connector returned with no class. MUST stay zero.",
 
 	MAbandonedPluginCalls: "Plugin calls the host gave up on. Each leaks one goroutine.",
-	MReconcileDelta:       "Records in minus records out for one checkpoint.",
+	MReconcileDelta:       "Records read minus records settled and abandoned: what is unaccounted for.",
 	MConditions:           "Every pipeline condition as a bounded series.",
 }
 

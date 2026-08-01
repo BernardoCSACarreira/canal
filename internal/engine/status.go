@@ -408,12 +408,12 @@ func (r *runner) laneStatuses(now time.Time) ([]telemetry.LaneStatus, laneFacts)
 			st := r.p.ledger.Stats(id)
 
 			f.total++
-			f.admitted += st.Admitted
+			f.admitted += st.RecordsRead
 			f.settled += st.Settled
 			f.abandoned += st.AbandonedTotal
 			f.inFlight += st.InFlight
 			agg := f.perNode[node]
-			f.perNode[node] = [2]uint64{agg[0] + st.Admitted, agg[1] + st.Settled}
+			f.perNode[node] = [2]uint64{agg[0] + st.RecordsRead, agg[1] + st.Settled}
 
 			ls := telemetry.LaneStatus{
 				ID:     id,
@@ -424,7 +424,7 @@ func (r *runner) laneStatuses(now time.Time) ([]telemetry.LaneStatus, laneFacts)
 				Label:  rec.Spec.Label,
 				Worker: string(r.deps.Worker),
 
-				RecordsRead:      st.Admitted,
+				RecordsRead:      st.RecordsRead,
 				RecordsCommitted: st.Settled,
 				RecordsAbandoned: st.AbandonedTotal,
 				InFlight:         st.InFlight,
@@ -634,10 +634,15 @@ func (r *runner) throughput(now time.Time, f laneFacts) telemetry.Throughput {
 	}
 
 	t := telemetry.Throughput{RecordsPerSecondIn: r.status.rateIn, RecordsPerSecondOut: r.status.rateOut}
-	// RECORDS IN MINUS RECORDS OUT, which must be exactly what is still in flight. A pipeline that is
-	// quiescent and still reports a non-zero delta has lost records somewhere between the two counts,
-	// and that is the only cheap way to notice a sink that silently drops.
-	delta := int64(f.admitted) - int64(f.settled)
+	// RECORDS IN MINUS RECORDS OUT, where OUT is settled PLUS abandoned.
+	//
+	// Subtracting only the settled ones was wrong before shedding existed and obviously wrong after
+	// it: an abandoned record leaves the pipeline by an accounted route — a dead letter, a drop, a
+	// lane shed — and counting it as missing meant the delta went permanently non-zero the first time
+	// any of those fired. That is precisely the signal being destroyed, because a delta that is always
+	// non-zero cannot report the thing it exists for: a QUIESCENT pipeline whose records went
+	// somewhere nobody accounted for.
+	delta := int64(f.admitted) - int64(f.settled) - int64(f.abandoned)
 	t.ReconcileDelta = &delta
 	return t
 }

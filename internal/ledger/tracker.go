@@ -125,6 +125,35 @@ func (t *Tracker[P]) Track(ctx context.Context, payload P, weight uint64, refs u
 	}
 }
 
+// TryTrack is Track without the wait: it admits if there is room right now and reports (zero, false)
+// if there is not.
+//
+// IT EXISTS SO THAT "BLOCK" IS A CHOICE RATHER THAN THE ONLY BEHAVIOUR. connector.WhenFull offers
+// block, drop_newest, reject and overflow; blocking is the default and the only one that never loses
+// data, but a source feeding a queue that must not stall needs the others, and until this existed the
+// engine had no way to ask "is there room" without committing to waiting for it.
+//
+// Same admission rule as Track, including the one that matters: a payload heavier than the whole
+// budget is admitted when the tracker is otherwise empty, because refusing it forever is a deadlock
+// rather than backpressure.
+func (t *Tracker[P]) TryTrack(payload P, weight uint64, refs uint32) (Ticket, bool) {
+	if weight == 0 {
+		weight = 1
+	}
+	if refs == 0 {
+		refs = 1
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return Ticket{}, false
+	}
+	if t.nodes == 0 || t.pending+weight <= t.budget {
+		return Ticket{n: t.appendLocked(&node{payload: payload, weight: weight, refs: refs, at: time.Now()})}, true
+	}
+	return Ticket{}, false
+}
+
 // TrackResolved admits a payload that discharges NO references and is complete the moment it arrives:
 // a lane position carried by a batch with zero records.
 //

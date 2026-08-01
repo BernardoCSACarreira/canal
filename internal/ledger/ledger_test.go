@@ -7,6 +7,7 @@ package ledger
 
 import (
 	"context"
+	"errors"
 	"runtime"
 	"strings"
 	"sync"
@@ -50,7 +51,7 @@ func newBatch(lane record.LaneID, n int) *record.Batch {
 // test fails with "send on closed channel".
 func TestSendDuringCloseDoesNotPanic(t *testing.T) {
 	l := newLedger(t)
-	if err := l.Lane("lane-1", connector.OrderingPrefix, 1000); err != nil {
+	if err := l.Lane("lane-1", connector.OrderingPrefix, 1000, connector.WhenFullBlock); err != nil {
 		t.Fatalf("Lane: %v", err)
 	}
 
@@ -133,7 +134,7 @@ func TestGroupIDReuseIsRefused(t *testing.T) {
 		}
 	}()
 
-	if err := l.Lane("lane-1", connector.OrderingPrefix, 1000); err != nil {
+	if err := l.Lane("lane-1", connector.OrderingPrefix, 1000, connector.WhenFullBlock); err != nil {
 		t.Fatalf("Lane: %v", err)
 	}
 
@@ -164,8 +165,8 @@ func TestGroupIDReuseIsRefused(t *testing.T) {
 	if st.PendingGroups != 1 {
 		t.Errorf("pending groups = %d, want 1: the refused Admit leaked or dropped a ticket", st.PendingGroups)
 	}
-	if st.Admitted != uint64(first.Len()) {
-		t.Errorf("admitted = %d, want %d: the refused batch was counted as admitted", st.Admitted, first.Len())
+	if st.RecordsRead != uint64(first.Len()) {
+		t.Errorf("admitted = %d, want %d: the refused batch was counted as admitted", st.RecordsRead, first.Len())
 	}
 }
 
@@ -224,7 +225,7 @@ func TestDiscreteLaneIsBounded(t *testing.T) {
 	}()
 
 	const budget = 8
-	if err := l.Lane("d", connector.OrderingDiscrete, budget); err != nil {
+	if err := l.Lane("d", connector.OrderingDiscrete, budget, connector.WhenFullBlock); err != nil {
 		t.Fatalf("Lane: %v", err)
 	}
 
@@ -251,4 +252,71 @@ func TestDiscreteLaneIsBounded(t *testing.T) {
 		t.Error("admitted nothing at all; the budget is not backpressure, it is a wall")
 	}
 	t.Logf("admitted %d against budget %d before blocking", admitted, budget)
+}
+
+// A SHED ADVANCES THE POSITION PAST WHAT IT DROPPED, and that is the property that makes shedding
+// different from a noisier kind of backpressure.
+//
+// If the prefix did not move, the source would re-read exactly the records the operator configured
+// the pipeline to drop, the lane would still be full, and the shed would repeat forever — a
+// permanently stuck cursor dressed up as a load-shedding policy. TrackResolved is how a position
+// enters the ordered prefix carrying no references, so it still takes its place BEHIND anything
+// outstanding rather than committing past unsettled records.
+func TestAShedAdvancesThePositionPastTheDroppedRecords(t *testing.T) {
+	l := New(Config{Tenant: "acme", Pipeline: "p", DefaultBudget: 2, GroupTTL: time.Minute})
+	defer l.Close()
+	if err := l.Lane("lane-1", connector.OrderingPrefix, 2, connector.WhenFullReject); err != nil {
+		t.Fatalf("Lane: %v", err)
+	}
+
+	at := func(n byte) record.Position {
+		return record.Position{Order: []byte{n}, Token: record.Blob{Version: 1, Bytes: []byte{n}}, Safe: true}
+	}
+
+	// Fill the budget.
+	first := batchAt(t, "lane-1", at(1), 2)
+	if err := l.Admit(context.Background(), first); err != nil {
+		t.Fatalf("admitting the first batch: %v", err)
+	}
+
+	// The next batch has nowhere to go and the policy sheds it.
+	shed := batchAt(t, "lane-1", at(2), 2)
+	err := l.Admit(context.Background(), shed)
+	if !errors.Is(err, ErrShed) {
+		t.Fatalf("admitting into a full lane under reject returned %v, want ErrShed", err)
+	}
+	if got := l.Stats("lane-1").AbandonedTotal; got != 2 {
+		t.Errorf("%d records counted as abandoned, want the 2 that were shed", got)
+	}
+
+	// Settling the first batch must now resolve the prefix ALL THE WAY PAST the shed position,
+	// because nothing is outstanding in front of it any more.
+	outs := make([]Outcome, 0, 2)
+	for _, r := range first.Records {
+		outs = append(outs, Outcome{Record: r.Origin().ID, Node: "out", Disposition: Delivered})
+	}
+	l.Settle(outs)
+
+	st := l.Stats("lane-1")
+	if !st.ResolvedOK {
+		t.Fatal("nothing resolved after the only outstanding batch settled")
+	}
+	if len(st.Resolved.Order) == 0 || st.Resolved.Order[0] != 2 {
+		t.Errorf("the resolved prefix is at %v, want the shed batch's position 2: a shed that does "+
+			"not advance makes the source re-read exactly what it was told to drop", st.Resolved.Order)
+	}
+}
+
+// batchAt builds a positioned batch of n records for a lane.
+func batchAt(t *testing.T, lane record.LaneID, pos record.Position, n int) *record.Batch {
+	t.Helper()
+	a := record.NewAllocator("acme", "p", "in", lane, "s", 1, 1)
+	b := record.NewBatch(a, n)
+	for i := 0; i < n; i++ {
+		if b.Add() == nil {
+			t.Fatalf("Add returned nil at %d", i)
+		}
+	}
+	b.Position = pos
+	return b
 }

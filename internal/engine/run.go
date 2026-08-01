@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/BernardoCSACarreira/canal/internal/ledger"
+	"github.com/BernardoCSACarreira/canal/pkg/config"
 	"github.com/BernardoCSACarreira/canal/pkg/connector"
 	"github.com/BernardoCSACarreira/canal/pkg/fault"
 	"github.com/BernardoCSACarreira/canal/pkg/record"
@@ -227,7 +228,7 @@ func (r *runner) refreshGauges() {
 		}
 	}
 
-	o.reconcile.Set(float64(int64(facts.admitted)-int64(facts.settled)), o.pipeline)
+	o.reconcile.Set(float64(int64(facts.admitted)-int64(facts.settled)-int64(facts.abandoned)), o.pipeline)
 	r.publishConditions(r.conditions(now, facts))
 }
 
@@ -451,9 +452,10 @@ func (r *runner) run(ctx context.Context) error {
 // openSources constructs a runtime per source and opens it.
 func (r *runner) openSources(ctx context.Context) error {
 	for id := range r.p.sources {
+		whenFull := r.whenFullFor(id)
 		lc := newLaneCtl(r.deps, r.specFields(), id,
 			func(lane record.LaneID, ord connector.Ordering, budget int) error {
-				return r.p.ledger.Lane(lane, ord, budget)
+				return r.p.ledger.Lane(lane, ord, budget, whenFull)
 			},
 			func(lane record.LaneID) connector.Admission {
 				st := r.p.ledger.Stats(lane)
@@ -472,6 +474,7 @@ func (r *runner) openSources(ctx context.Context) error {
 				ctx: ctx, deps: r.deps,
 				tenant: r.p.spec.Tenant, pipeline: r.p.spec.ID, node: id,
 				streams: configuredStreams(r.p.spec), component: r.p.sources[id].Name,
+				cfg: r.p.configs[id],
 			},
 			lanes: lc,
 			state: &stateHandle{deps: r.deps, tenant: r.p.spec.Tenant, pipeline: r.p.spec.ID, node: id},
@@ -498,6 +501,7 @@ func (r *runner) openSinks(ctx context.Context) error {
 			ctx: ctx, deps: r.deps,
 			tenant: r.p.spec.Tenant, pipeline: r.p.spec.ID, node: id,
 			streams: configuredStreams(r.p.spec), component: sk.Name,
+			cfg: r.p.configs[id],
 		}}
 		r.setSinkRT(id, rt)
 		opening := connector.Opening{
@@ -568,6 +572,10 @@ func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 	lane := assigned[0]
 	alloc := record.NewAllocator(r.p.spec.Tenant, r.p.spec.ID, id, lane.ID, lane.Spec.Stream, 1, 1)
 
+	// Resolved once. It cannot change during a run, and the shed path logs it on a line that can fire
+	// twenty thousand times a second.
+	policy := r.whenFullFor(id)
+
 	// readAttempt is RESET after every successful read. Carrying it across successes would make
 	// MaxAttempts a lifetime budget rather than a per-failure one, so a source that hiccuped four
 	// times over a week would stop on the fourth — a week apart, and correctly reported as
@@ -632,8 +640,33 @@ func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 		}
 
 		if err := r.p.ledger.Admit(ctx, batch); err != nil {
+			// A SHED IS NOT A FAILURE, it is the policy working. The lane was at its budget and the
+			// operator configured something other than block, so the batch does not enter the
+			// pipeline, its position advances past it and the source is told on the next
+			// acknowledgement. Reading continues — stopping here would turn a load-shedding policy
+			// into a slightly noisier version of stopping.
+			//
+			// LOUDLY, though. This is the one configured path in the engine that loses data on
+			// purpose, and every record it drops is counted under buffer_full and named in a log
+			// line at ERROR. An operator who chose it should see exactly what it cost.
+			//
+			// COUNTED BEFORE THE CANCELLATION CHECK, deliberately. The ledger has already dropped
+			// these records and advanced past them, so returning first because shutdown happened to
+			// win the race would leave the engine's count short of the ledger's — the one number an
+			// operator has for a configured loss, quietly undercounting at every shutdown.
+			shed := errors.Is(err, ledger.ErrShed)
+			if shed {
+				r.deps.Log.Error("records were dropped because the lane is full and its policy sheds",
+					"node", id, "lane", lane.ID, "records", batch.Len(),
+					"when_full", policy, "budget", r.p.spec.LaneBudget)
+				r.p.obs.recordsAbandoned.Add(float64(batch.Len()), r.p.obs.pipeline,
+					laneLabel(lane.ID), telemetry.ReasonBufferFull)
+			}
 			if ctx.Err() != nil {
 				return
+			}
+			if shed {
+				continue
 			}
 			r.fail(fmt.Errorf("engine: admitting a batch from %s: %w", id, err))
 			return
@@ -978,4 +1011,33 @@ func configuredStreams(s spec.Spec) []connector.ConfiguredStream {
 		})
 	}
 	return out
+}
+
+// whenFullFor resolves a source node's admission policy.
+//
+// SPECIFIC BEATS GENERAL, the same precedence spec.StreamFor uses: the node's own stage-standard
+// when_full wins over the pipeline-wide one. spec.Spec says Retry and WhenFull are node-overridable
+// and the registry offers when_full on EVERY node's config form, so an operator setting it there had
+// every reason to expect it to mean something — and until this existed, neither the node field nor
+// the pipeline field was read anywhere at all.
+//
+// Only a SOURCE's policy is consulted, because admission happens at the source edge and nowhere
+// else. A sink's when_full will start mattering when a buffer node can sit in front of it.
+func (r *runner) whenFullFor(id record.NodeID) connector.WhenFull {
+	cfg := r.p.configs[id]
+	if cfg == nil || !cfg.Has(config.FieldWhenFull) {
+		return r.p.spec.WhenFull
+	}
+	raw, err := config.Get[string](cfg, config.FieldWhenFull)
+	if err != nil {
+		return r.p.spec.WhenFull
+	}
+	w, ok := connector.ParseWhenFull(raw)
+	if !ok {
+		// Unreachable through a validated config — the field is an enum and Validate refuses anything
+		// else — so falling back rather than failing is the conservative reading of a state that
+		// should not exist.
+		return r.p.spec.WhenFull
+	}
+	return w
 }

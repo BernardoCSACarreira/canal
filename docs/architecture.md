@@ -9063,6 +9063,25 @@ and `cmd/canal/main_test.go` kills the binary three times to prove a position su
 Each node runs one goroutine with one `select`. The edges are bounded channels of `*record.Batch` with
 capacity 2. There is no shared mutable state between nodes; a batch is handed over, never shared.
 
+**`when_full` is read now, in both places it can be set.** `spec.Spec.WhenFull` is pipeline-wide and
+`pkg/registry` adds `when_full` to every node's stage-standard form, so it reaches the generated JSON
+Schema and the submit screen — and neither was read anywhere, so whatever an operator chose,
+admission blocked. `ledger.Admit` is the one place the choice is made, which is where the
+backpressure claim already lived. A source node's own value wins over the pipeline's, the same
+specific-beats-general precedence `spec.StreamFor` uses.
+
+`block` is the default and the only policy that never loses data. `drop_newest` and `reject` **shed**:
+the batch does not enter the pipeline, **its position advances anyway**, and the records are counted
+under `canal_records_abandoned_total{reason="buffer_full"}`, logged at ERROR and reported to the
+source through `Ack.Abandoned` so a destructive-commit source can refuse to advance. The position
+advancing is the point rather than an oversight — without it the source re-reads exactly what the
+operator configured the pipeline to drop, the lane is still full, and the shed repeats forever.
+Shedding is at BATCH granularity, because admission is; the two shed policies coincide at the source
+edge today and diverge once a buffer node can decide which end of a queue to drop. `overflow` is
+**refused at Build**, pipeline-wide and per node: it means "spill to the next buffer in the graph",
+no buffer node type exists, and treating it as a shed would drop data an operator asked to have moved
+somewhere else.
+
 A **source node** runs two goroutines and only two: the **read goroutine** (`Open`, `Read`, `Close`) and
 the **control goroutine** (`Commit`, `Heartbeat`, `Backlog`, `Nack`, and `Assigned` refreshes). The
 contract states that exactly, once, on `Source.Read`. Every other node kind runs one goroutine.

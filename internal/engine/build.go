@@ -111,6 +111,15 @@ type Pipeline struct {
 	// structured sink maps to nil.
 	codecs map[record.NodeID]*codecChain
 
+	// configs is each node's VALIDATED config, kept so the runtime can hand it back through
+	// connector.Runtime.Config and so the engine can read the stage-standard fields.
+	//
+	// Build validated it, defaulted it and handed it to New, and then dropped it — which left
+	// baseRuntime.cfg nil for every connector in existence, so Runtime.Config returned (nil, nil) to
+	// anyone who asked. It also left the per-node when_full offered on every config form with no
+	// possible reader.
+	configs map[record.NodeID]*config.Config
+
 	ledger *ledger.Ledger
 
 	// obs is this pipeline's instrument set, registered once at build.
@@ -175,6 +184,7 @@ func Build(ctx context.Context, r *registry.Registry, s spec.Spec, d Deps) (*Pip
 		sinks:   map[record.NodeID]*registry.ResolvedSink{},
 		buffers: map[record.NodeID]connector.BufferCaps{},
 		codecs:  map[record.NodeID]*codecChain{},
+		configs: map[record.NodeID]*config.Config{},
 	}
 	var built []closer
 
@@ -209,6 +219,7 @@ func Build(ctx context.Context, r *registry.Registry, s spec.Spec, d Deps) (*Pip
 				continue
 			}
 			res.sources[n.ID] = rs
+			res.configs[n.ID] = cfg
 
 		case registry.KindSink:
 			e, ok := r.Sink(n.Name)
@@ -233,6 +244,7 @@ func Build(ctx context.Context, r *registry.Registry, s spec.Spec, d Deps) (*Pip
 				continue
 			}
 			res.sinks[n.ID] = rk
+			res.configs[n.ID] = cfg
 
 			// A codec node attached to a structured sink would be a double encoding, so the field is not
 			// even offered. Its presence in the config therefore means the operator edited around the
@@ -360,6 +372,7 @@ func Build(ctx context.Context, r *registry.Registry, s spec.Spec, d Deps) (*Pip
 		sources: res.sources,
 		sinks:   res.sinks,
 		codecs:  res.codecs,
+		configs: res.configs,
 		ledger: ledger.New(ledger.Config{
 			Tenant:        s.Tenant,
 			Pipeline:      s.ID,

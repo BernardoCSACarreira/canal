@@ -96,7 +96,7 @@ func TestB2_RetargetingABatchIsRefusedLoudly(t *testing.T) {
 	// rather than corrupting 33350 of 33500 records' provenance.
 	l := ledger.New(ledger.Config{Tenant: "default", Pipeline: "p", DefaultBudget: 64})
 	defer l.Close()
-	if err := l.Lane(otherLane, connector.OrderingPrefix, 64); err != nil {
+	if err := l.Lane(otherLane, connector.OrderingPrefix, 64, connector.WhenFullBlock); err != nil {
 		t.Fatalf("Lane: %v", err)
 	}
 	err := l.Admit(context.Background(), b)
@@ -134,7 +134,7 @@ func TestB3_EmptyPositionedBatchAdvancesTheLane(t *testing.T) {
 	l := ledger.New(ledger.Config{Tenant: "default", Pipeline: "p", DefaultBudget: 64})
 	defer l.Close()
 
-	if err := l.Lane(lane, connector.OrderingPrefix, 64); err != nil {
+	if err := l.Lane(lane, connector.OrderingPrefix, 64, connector.WhenFullBlock); err != nil {
 		t.Fatalf("Lane: %v", err)
 	}
 

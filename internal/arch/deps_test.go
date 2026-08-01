@@ -49,7 +49,12 @@ var declared = map[string][]string{
 
 	// internal/ — engine machinery. Nothing under pkg/ may import any of it.
 	"internal/ledger": {"pkg/connector", "pkg/fault", "pkg/record"},
-	"internal/engine": {"internal/ledger", "pkg/config", "pkg/connector", "pkg/fault",
+	// internal/metrics implements connector.Metrics and enforces pkg/telemetry's closed name and
+	// label sets, so those two are its whole dependency surface. It must not reach the engine: a
+	// registry that knows what a pipeline is would be a registry the enterprise deployment cannot
+	// swap for a pusher.
+	"internal/metrics": {"pkg/connector", "pkg/telemetry"},
+	"internal/engine": {"internal/ledger", "internal/metrics", "pkg/config", "pkg/connector", "pkg/fault",
 		"pkg/record", "pkg/registry", "pkg/schema", "pkg/spec", "pkg/store", "pkg/telemetry"},
 
 	// cmd/ — the composition root, and the ONLY package allowed to import both internal/engine and
@@ -59,8 +64,8 @@ var declared = map[string][]string{
 	// The blank imports of the example connectors and pkg/codec are what make this build's
 	// catalogue, and they are why this row is longer than any other. Nothing imports cmd.
 	"cmd/canal": {"internal/engine", "internal/example/linefile", "internal/example/stdoutsink",
-		"pkg/codec", "pkg/config", "pkg/registry", "pkg/spec", "pkg/store", "pkg/store/wal",
-		"pkg/telemetry", "pkg/fault"},
+		"internal/metrics", "pkg/codec", "pkg/config", "pkg/registry", "pkg/spec", "pkg/store",
+		"pkg/store/wal", "pkg/telemetry", "pkg/fault"},
 }
 
 // connectorPrefixes are the trees that stand in for third-party code: the worked examples and the

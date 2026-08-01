@@ -586,15 +586,34 @@ type baseRuntime struct {
 	streams  []connector.ConfiguredStream
 	cfg      *config.Config
 
+	// component is the REGISTERED name, which is what namespaces this connector's metrics. The node
+	// id would not do: two nodes running the same connector should share a series family, and one
+	// connector deployed twice must not look like two different components.
+	component string
+
 	mu     sync.Mutex
 	events []connector.Event
 }
 
-func (b *baseRuntime) Context() context.Context        { return b.ctx }
-func (b *baseRuntime) Tenant() record.TenantID         { return b.tenant }
-func (b *baseRuntime) Pipeline() record.PipelineID     { return b.pipeline }
-func (b *baseRuntime) Node() record.NodeID             { return b.node }
-func (b *baseRuntime) Metrics() connector.Metrics      { return noopMetrics{} }
+func (b *baseRuntime) Context() context.Context    { return b.ctx }
+func (b *baseRuntime) Tenant() record.TenantID     { return b.tenant }
+func (b *baseRuntime) Pipeline() record.PipelineID { return b.pipeline }
+func (b *baseRuntime) Node() record.NodeID         { return b.node }
+
+// Metrics hands the connector a namespaced view of the process registry.
+//
+// A connector can therefore record whatever it likes and can never collide with, shadow or
+// overwrite a core metric: every name it uses becomes canal_connector_<component>_<name>.
+//
+// A deployment with no registry still gets a working handle — noopMetrics — because a connector that
+// increments a counter must not be broken by the host's choice not to export.
+func (b *baseRuntime) Metrics() connector.Metrics {
+	if b.deps.Metrics == nil {
+		return noopMetrics{}
+	}
+	return b.deps.Metrics.ForConnector(b.component)
+}
+
 func (b *baseRuntime) Schemas() connector.SchemaLookup { return noopSchemas{} }
 
 func (b *baseRuntime) Streams() []connector.ConfiguredStream { return b.streams }

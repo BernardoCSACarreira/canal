@@ -6,6 +6,7 @@ import (
 	"runtime/debug"
 
 	"github.com/BernardoCSACarreira/canal/pkg/fault"
+	"github.com/BernardoCSACarreira/canal/pkg/record"
 )
 
 // sandbox runs one plugin call in a goroutine with recover, and selects on ctx.
@@ -22,7 +23,7 @@ import (
 // THE HONEST COST, accepted and measured: the goroutine leaks until the wedged call returns, and every
 // call costs one goroutine. The leak is counted as canal_abandoned_plugin_calls_total, and a non-zero
 // value is an alertable condition rather than a footnote.
-func sandbox[Req, Res any](ctx context.Context, name string, req Req,
+func sandbox[Req, Res any](ctx context.Context, o *obs, node record.NodeID, name string, req Req,
 	fn func(context.Context, Req) (Res, error),
 ) (Res, error) {
 	type result struct {
@@ -68,6 +69,10 @@ func sandbox[Req, Res any](ctx context.Context, name string, req Req,
 	case r := <-done:
 		return r.res, r.err
 	case <-ctx.Done():
+		// The goroutine above is now leaked until the wedged call returns. Counting it here is what
+		// turns the honest cost named in this file's comment into an alertable condition instead of
+		// a footnote nobody can act on.
+		o.abandonedCall(node)
 		var zero Res
 		return zero, fault.Internal(fault.OpUnknown,
 			fmt.Errorf("component %q did not return before its deadline; the call was abandoned: %w", name, ctx.Err()))

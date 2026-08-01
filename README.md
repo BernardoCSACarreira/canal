@@ -19,16 +19,17 @@ go run ./cmd/canal check --spec your-pipeline.json
 | | |
 |---|---|
 | `pkg/` — the connector-author surface | **real, compiling, documented.** 89 files, 14,074 lines. |
-| `internal/engine`, `internal/ledger` | **real for one shape.** 4,679 lines. `Build` resolves, validates and negotiates; `Run` reads, admits, writes, settles, flushes and commits, and routes a fault to retry, dead-letter, drop, stop or stall. Single worker, no transforms, no buffers. |
+| `internal/engine`, `internal/ledger`, `internal/metrics` | **real for one shape.** 5,506 lines. `Build` resolves, validates and negotiates; `Run` reads, admits, writes, settles, flushes and commits, routes a fault to retry, dead-letter, drop, stop or stall, and measures all of it. Single worker, no transforms, no buffers. |
 | `cmd/canal` | **real.** `run` and `check`, 483 lines of wiring and no policy. |
 | Durable state store | **real.** [`pkg/store/wal`](pkg/store/wal) is a hand-rolled write-ahead log: CRC32C framing, fsync before return, a torn tail truncated rather than refused, and a flock the kernel drops when the holder dies. |
 | Codecs | **three.** `raw` and `json` encoders, a `newline` framer. json+newline is ndjson; raw+newline is a log tail. |
 | `internal/stress` — eight hostile connectors | **real.** 15,670 lines, kept as an interface-shape regression suite; the audit found five of the eight genuinely catch drift today. |
 | Fault routing | **real.** A connector states a `Class`, a fact; the engine computes the behaviour from (class, capabilities, policy). Throttling never spends a retry attempt, an indeterminate write against a non-idempotent sink fails loud rather than guessing, and a dead letter is delivered before the record is abandoned. |
-| Metrics, buffers, transforms, multi-worker, a frontend, an API | **do not exist.** The interfaces do, and the negotiation refuses a pipeline that asks for one. Routing decisions are visible in the log only: `noopMetrics` refuses every registration rather than returning a dangling handle. |
+| Metrics | **real for fifteen of twenty-six names.** [`internal/metrics`](internal/metrics) accumulates and renders Prometheus text; `canal run --metrics :9090` serves it. An unmeasurable quantity is OMITTED rather than reported as zero, which is what makes `canal_checkpoint_age_seconds` usable as the primary alert. |
+| Buffers, transforms, multi-worker, a frontend, an API | **do not exist.** The interfaces do, and the negotiation refuses a pipeline that asks for one. |
 
-`go build ./...`, `go vet ./...`, `gofmt -l .` and `go test -race ./...` are clean: 124 test functions
-across 18 packages, 41 of them under `pkg/`. [CI](.github/workflows/ci.yml) runs all of that on Linux
+`go build ./...`, `go vet ./...`, `gofmt -l .` and `go test -race ./...` are clean: 142 test functions
+across 20 packages, 41 of them under `pkg/`. [CI](.github/workflows/ci.yml) runs all of that on Linux
 and macOS, cross-compiles for five targets, and verifies the module still has zero third-party
 dependencies.
 
@@ -402,9 +403,9 @@ pump ([`internal/engine/run.go`](internal/engine/run.go)), the binary
 all exist. R3's milestone is met: the guards in this repository are facts about a running process
 rather than designs.
 
-**Next** is the metric surface — every routing decision above is currently a log line and nothing
-else, and `canal_checkpoint_age_seconds` is described in the docs as the primary alert signal while
-emitting no samples at all. After that, what the single-worker label in
+**Next** is the read model: `telemetry.PipelineStatus` is a declared shape nothing constructs, which
+leaves `canal_condition` as the one metric in the closed set with no producer and leaves an operator
+with no answer to "did my config change take effect". After that, what the single-worker label in
 [`internal/engine/runtime.go`](internal/engine/runtime.go) holds open: a `store.Coordinator`, leases
 and real epoch fencing, plus transforms and buffers.
 

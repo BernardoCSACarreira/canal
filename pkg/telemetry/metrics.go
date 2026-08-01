@@ -84,6 +84,47 @@ var MetricNames = []string{
 	MLedgerLeaks, MUnclassified, MAbandonedPluginCalls, MReconcileDelta, MConditions,
 }
 
+// MetricHelp is the one-line description exported as # HELP.
+//
+// It lives beside the names rather than at the exporter, because a name and its meaning drifting
+// apart is how a dashboard ends up alerting on a quantity nobody can define. TestEveryMetricHasHelp
+// fails on a name added here without one.
+var MetricHelp = map[string]string{
+	MRecordsRead:      "Records read from a source, by lane.",
+	MRecordsWritten:   "Records a sink reported durable.",
+	MRecordsCommitted: "Records whose position reached the source as a durable acknowledgement.",
+	MRecordsAbandoned: "Records that reached a terminal disposition and will not be delivered.",
+	MRecordsDuplicate: "Records a destination recognised as already present, which count as durable.",
+	MRecordsDeduped:   "Records suppressed by a dedupe layer.",
+	MFaults:           "Faults raised, by class and by who owns the problem.",
+
+	MCheckpointAge: "Seconds since this lane's durable cursor last advanced. THE primary alert signal.",
+
+	MInFlight:       "Records admitted and not yet settled.",
+	MInFlightBudget: "The configured in-flight bound for this lane.",
+	MReplayRecords:  "Measured worst-case re-read: records admitted since the last durable position.",
+
+	MOldestPending: "Age of the oldest unsettled record in this lane.",
+	MBlocked:       "Cumulative seconds a node spent blocked on backpressure.",
+	MUtilization:   "Fraction of wall time a node spent working.",
+	MBackoff:       "Cumulative seconds spent waiting to retry, by fault class.",
+
+	MBufferDepth:   "Records held in a buffer node.",
+	MBufferRefused: "Records a buffer refused, by reason.",
+
+	MRevokedUnsettled: "Records in flight when a lane lease lapsed, which the new holder re-delivers.",
+	MStateStaleness:   "Seconds since canal last wrote its own state durably.",
+	MCommitLatency:    "Seconds per phase of the three-phase commit.",
+	MRestorePhase:     "Seconds per phase of restart and restore.",
+
+	MLedgerLeaks:  "Settlement groups abandoned by the leak reaper. MUST stay zero.",
+	MUnclassified: "Faults a connector returned with no class. MUST stay zero.",
+
+	MAbandonedPluginCalls: "Plugin calls the host gave up on. Each leaks one goroutine.",
+	MReconcileDelta:       "Records in minus records out for one checkpoint.",
+	MConditions:           "Every pipeline condition as a bounded series.",
+}
+
 // The CLOSED label vocabulary, enforced at registration.
 //
 // Nothing per-record-key, no error message, no upstream error code, and no unbounded stream label at

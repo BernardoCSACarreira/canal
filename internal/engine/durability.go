@@ -257,7 +257,7 @@ func (r *runner) flushIfDue(ctx context.Context, id record.NodeID) {
 func (r *runner) signalFlush(ctx context.Context, id record.NodeID, sk *registry.ResolvedSink,
 	reason connector.FlushReason,
 ) error {
-	_, err := sandbox(ctx, r.p.obs, id, sk.Name, reason,
+	_, err := sandbox(ctx, r.p, id, sk.Name, reason,
 		func(c context.Context, rn connector.FlushReason) (connector.WriteResult, error) {
 			return sk.Flusher.Flush(c, rn)
 		})
@@ -272,7 +272,7 @@ func (r *runner) signalFlush(ctx context.Context, id record.NodeID, sk *registry
 func (r *runner) flushOne(ctx context.Context, id record.NodeID, sk *registry.ResolvedSink,
 	held []*record.Record, reason connector.FlushReason,
 ) error {
-	res, err := sandbox(ctx, r.p.obs, id, sk.Name, reason,
+	res, err := sandbox(ctx, r.p, id, sk.Name, reason,
 		func(c context.Context, rn connector.FlushReason) (connector.WriteResult, error) {
 			return sk.Flusher.Flush(c, rn)
 		})

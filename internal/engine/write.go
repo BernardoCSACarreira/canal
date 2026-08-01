@@ -159,7 +159,7 @@ func (r *runner) writeOnce(ctx context.Context, id record.NodeID, sk *registry.R
 		// means for a sink node. Counting after a successful return would make it a second, worse
 		// copy of RecordsOut, and the gap between the two is exactly what a stuck sink looks like.
 		r.p.obs.handed(id, len(rq.records))
-		res, werr := sandbox(ctx, r.p.obs, id, sk.Name, rq.req,
+		res, werr := sandbox(ctx, r.p, id, sk.Name, rq.req,
 			func(c context.Context, q *connector.Request) (connector.WriteResult, error) {
 				return sk.Sink.Write(c, q)
 			})
@@ -258,7 +258,7 @@ func (r *runner) deadLetter(ctx context.Context, rec *record.Record, cause error
 			return fmt.Errorf("engine: encoding record %v for dead-letter sink %s: %w", rec.Origin().ID, id, err)
 		}
 		for _, rq := range reqs {
-			if _, err := sandbox(ctx, r.p.obs, id, sk.Name, rq.req,
+			if _, err := sandbox(ctx, r.p, id, sk.Name, rq.req,
 				func(c context.Context, q *connector.Request) (connector.WriteResult, error) {
 					return sk.Sink.Write(c, q)
 				}); err != nil {

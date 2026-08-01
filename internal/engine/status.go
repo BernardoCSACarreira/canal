@@ -229,7 +229,7 @@ func (r *runner) laneStatuses(now time.Time) ([]telemetry.LaneStatus, laneFacts)
 	}
 	var out []telemetry.LaneStatus
 
-	for node, lc := range r.lanes {
+	for node, lc := range r.laneCtls() {
 		lc.mu.Lock()
 		ids := make([]record.LaneID, len(lc.order))
 		copy(ids, lc.order)
@@ -412,7 +412,7 @@ func (r *runner) nodeStatuses(f laneFacts) []telemetry.NodeStatus {
 		}
 		switch n.Kind {
 		case registry.KindSource:
-			_, ns.Connected = r.srcRT[n.ID]
+			ns.Connected = r.sourceRT(n.ID) != nil
 			if agg, ok := f.perNode[n.ID]; ok {
 				ns.RecordsIn, ns.RecordsOut = agg[0], agg[1]
 			}
@@ -507,10 +507,11 @@ func (r *runner) recentEvents() []telemetry.Event {
 			out = append(out, ev)
 		}
 	}
-	for id, rt := range r.srcRT {
+	srcRT, sinkRT := r.runtimes()
+	for id, rt := range srcRT {
 		collect(id, &rt.baseRuntime)
 	}
-	for id, rt := range r.sinkRT {
+	for id, rt := range sinkRT {
 		collect(id, &rt.baseRuntime)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].At.Before(out[j].At) })

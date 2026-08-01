@@ -48,13 +48,61 @@ func (p *Pipeline) Run(ctx context.Context) error {
 	if err := Executable(p.negotiated); err != nil {
 		return fault.Contract(fault.OpOpen, err)
 	}
-	r := &runner{p: p, deps: p.deps}
-	r.status.phase = telemetry.PhaseStarting
+	r := newRunner(p)
 	// Published BEFORE run so that a status read during a slow open sees "starting" rather than
 	// "pending" — the two are different answers, and opening a source against an unreachable upstream
 	// is exactly when somebody is watching.
+	//
+	// WHICH IS WHY newRunner EXISTS. Publishing a runner whose fields the run goroutine was still
+	// assigning was a data race against every concurrent Status: the topology maps, the lane
+	// activity and the start time were all written after the store. A published runner is fully
+	// formed; what happens afterwards is only ever INSERTION into maps that have their own lock.
 	p.active.Store(r)
 	return r.run(ctx)
+}
+
+// newRunner builds a runner that is safe to read from another goroutine the instant it exists.
+func newRunner(p *Pipeline) *runner {
+	now := time.Now()
+	r := &runner{
+		p:    p,
+		deps: p.deps,
+
+		lanes:  map[record.NodeID]*laneCtl{},
+		srcRT:  map[record.NodeID]*sourceRuntime{},
+		sinkRT: map[record.NodeID]*sinkRuntime{},
+
+		lastCheckpoint: map[record.LaneID]time.Time{},
+		started:        now,
+		lastPersist:    now,
+
+		activity:     newLaneActivity(),
+		checkpointer: newCheckpointer(),
+		awaiting:     newAwaitingCommit(),
+	}
+	r.status.phase = telemetry.PhaseStarting
+	r.mainSinks, r.failedSinks = partitionSinks(p.spec, p.sinks)
+
+	// THE TRIGGER MUST FIRE BEFORE ADMISSION BLOCKS, which is why it is half the budget and not the
+	// whole of it.
+	//
+	// With a Flusher every un-durable record counts against the lane budget, so a trigger equal to
+	// the budget is unreachable: the read loop fills the budget, Admit blocks, and the flush that
+	// would release it never happens because the batch that would have triggered it is stuck in
+	// admission. Measured at 3,450 records/s — the budget divided by the tick interval — where half
+	// the budget gives 92,000/s on the same input.
+	//
+	// Half leaves room for at least one more read batch, which is all the margin the invariant
+	// needs. FlushRecords caps it lower when an operator wants a tighter durability window.
+	trigger := p.deps.FlushRecords
+	if half := p.spec.LaneBudget / 2; half > 0 && half < trigger {
+		trigger = half
+	}
+	if trigger <= 0 {
+		trigger = 1
+	}
+	r.deferred = newDeferred(trigger)
+	return r
 }
 
 // runner holds one execution of a pipeline.
@@ -65,9 +113,15 @@ type runner struct {
 	// lanes and srcRT are kept so shutdown can reach the lane table for the final commit, and so the
 	// commit pump can find the source that owns an acknowledged lane. sinkRT is kept so the read model
 	// can collect the events a sink reported through connector.Runtime.Note.
-	lanes  map[record.NodeID]*laneCtl
-	srcRT  map[record.NodeID]*sourceRuntime
-	sinkRT map[record.NodeID]*sinkRuntime
+	//
+	// nodesMu GUARDS ONLY THE MAPS, never the I/O that produces what goes in them. A component is
+	// constructed and opened outside the lock and inserted under it, so a status read during a slow
+	// open is not blocked by that open — it simply sees the nodes that are up so far, with the rest
+	// reporting Connected false, which is the honest answer and a more useful one than waiting.
+	nodesMu sync.RWMutex
+	lanes   map[record.NodeID]*laneCtl
+	srcRT   map[record.NodeID]*sourceRuntime
+	sinkRT  map[record.NodeID]*sinkRuntime
 
 	// status is the read model's own state: the phase, the previous condition set and the rate
 	// samples. See status.go. activity is the control loop's, see control.go.
@@ -208,38 +262,8 @@ func (r *runner) run(ctx context.Context) error {
 	runCtx, stopReading := context.WithCancel(ctx)
 	defer stopReading()
 
-	r.lanes = map[record.NodeID]*laneCtl{}
-	r.srcRT = map[record.NodeID]*sourceRuntime{}
-	r.lastCheckpoint = map[record.LaneID]time.Time{}
-	r.started = time.Now()
-	r.lastPersist = r.started
-	r.mainSinks, r.failedSinks = partitionSinks(r.p.spec, r.p.sinks)
-	// THE TRIGGER MUST FIRE BEFORE ADMISSION BLOCKS, which is why it is half the budget and not the
-	// whole of it.
-	//
-	// With a Flusher every un-durable record counts against the lane budget, so a trigger equal to
-	// the budget is unreachable: the read loop fills the budget, Admit blocks, and the flush that
-	// would release it never happens because the batch that would have triggered it is stuck in
-	// admission. Measured at 3,450 records/s — the budget divided by the tick interval — where half
-	// the budget gives 92,000/s on the same input.
-	//
-	// Half leaves room for at least one more read batch, which is all the margin the invariant
-	// needs. FlushRecords caps it lower when an operator wants a tighter durability window.
-	trigger := r.deps.FlushRecords
-	if half := r.p.spec.LaneBudget / 2; half > 0 && half < trigger {
-		trigger = half
-	}
-	if trigger <= 0 {
-		trigger = 1
-	}
-	r.activity = newLaneActivity()
-	r.deferred = newDeferred(trigger)
-	r.checkpointer = newCheckpointer()
-	r.awaiting = newAwaitingCommit()
-
 	// Sinks open before sources. A source that produces before its sink can accept is a batch with
 	// nowhere to go, held against the lane budget for nothing.
-	r.sinkRT = map[record.NodeID]*sinkRuntime{}
 	if err := r.openSinks(runCtx); err != nil {
 		r.fail(err)
 		r.setPhase(telemetry.PhaseFailed)
@@ -441,7 +465,7 @@ func (r *runner) openSources(ctx context.Context) error {
 		if err := lc.load(ctx); err != nil {
 			return err
 		}
-		r.lanes[id] = lc
+		r.setLaneCtl(id, lc)
 
 		rt := &sourceRuntime{
 			baseRuntime: baseRuntime{
@@ -462,7 +486,7 @@ func (r *runner) openSources(ctx context.Context) error {
 			}); err != nil {
 			return fmt.Errorf("engine: opening source %s: %w", id, err)
 		}
-		r.srcRT[id] = rt
+		r.setSourceRT(id, rt)
 	}
 	return nil
 }
@@ -475,7 +499,7 @@ func (r *runner) openSinks(ctx context.Context) error {
 			tenant: r.p.spec.Tenant, pipeline: r.p.spec.ID, node: id,
 			streams: configuredStreams(r.p.spec), component: sk.Name,
 		}}
-		r.sinkRT[id] = rt
+		r.setSinkRT(id, rt)
 		opening := connector.Opening{
 			Guarantee: r.p.negotiated.Guarantee,
 			Streams:   configuredStreams(r.p.spec),
@@ -515,7 +539,7 @@ const maxReadBatch = 512
 // that second goroutine, shared across sources here because nothing in it is per-source.
 func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 	src := r.p.sources[id]
-	rt := r.srcRT[id]
+	rt := r.sourceRT(id)
 
 	// Delivery does NOT inherit the read context.
 	//
@@ -874,7 +898,7 @@ func (r *runner) flushOnce(ctx context.Context, reason connector.FlushReason) {
 // representation so much as two readers: the lane rows are what a warm start reads to answer
 // Assigned, and the envelope is what makes a committable and the span it covers one atomic record.
 func (r *runner) fillLaneStates(cp *Checkpoint, positions map[record.LaneID]record.Position) {
-	for _, lc := range r.lanes {
+	for _, lc := range r.laneCtls() {
 		lc.mu.Lock()
 		for id, rec := range lc.lanes {
 			cursor := rec.Cursor
@@ -932,7 +956,7 @@ func (r *runner) specFields() specRefFields {
 
 // sourceFor finds the source node that owns a lane.
 func (r *runner) sourceFor(lane record.LaneID) (*registry.ResolvedSource, record.NodeID, bool) {
-	for id, lc := range r.lanes {
+	for id, lc := range r.laneCtls() {
 		lc.mu.Lock()
 		_, ok := lc.lanes[lane]
 		lc.mu.Unlock()

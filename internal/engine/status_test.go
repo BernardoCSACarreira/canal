@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -560,6 +561,80 @@ func TestConnectorEventsReachTheDocument(t *testing.T) {
 		if e.Node == "" {
 			t.Errorf("event %q names no node, so an operator cannot tell which component raised it",
 				e.Message)
+		}
+	}
+}
+
+// THE RUNNER IS PUBLISHED BEFORE IT IS OPEN, and that is deliberate: Pipeline.Run stores it so a
+// status read during a slow open reports "starting" rather than "pending". The two are different
+// answers and opening a source against an unreachable upstream is exactly when somebody is watching.
+//
+// It also means every field the status path touches can be read from another goroutine while the run
+// goroutine is still building the pipeline. That was a real data race on both counts — the topology
+// maps were being inserted into while Status ranged them, and the runner's own fields were being
+// assigned after the store — and it was found by CI on macOS/arm64 rather than by two clean local
+// -race runs, because it needs a Status to land inside the open window at all.
+//
+// This hammers that window on purpose. Four goroutines read the document as fast as they can from
+// before Run is even called, so the reads span construction, the sink open, the checkpoint recovery,
+// the source open and the first records. Both halves of the fix were confirmed by putting the defect
+// back: unlocking the topology accessors reproduces it, and so does publishing the runner before its
+// fields are assigned.
+func TestStatusIsSafeToReadWhileThePipelineIsStillOpening(t *testing.T) {
+	for i := 0; i < 5; i++ {
+		src := &controlSource{emit: 2, release: make(chan struct{}), ordering: connector.OrderingPrefix}
+		srcName := registerControlSource(t, src)
+		sinkName := registerProbe(t, "opening_race_sink", &probeSink{})
+
+		dir := t.TempDir()
+		st, err := wal.Open(filepath.Join(dir, "state"))
+		if err != nil {
+			t.Fatalf("opening the store: %v", err)
+		}
+		p, _, diags := engine.Build(context.Background(), registry.Default, controlSpec(srcName, sinkName),
+			engine.Deps{State: st, Worker: "test", FlushInterval: 5 * time.Millisecond,
+				ControlInterval: 20 * time.Millisecond, GracePeriod: time.Second})
+		if diags.HasErrors() {
+			t.Fatalf("Build: %v", diags)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		stop := make(chan struct{})
+		var readers sync.WaitGroup
+		for j := 0; j < 4; j++ {
+			readers.Add(1)
+			go func() {
+				defer readers.Done()
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+						// The document must be well-formed at every instant, not merely eventually:
+						// a half-built one is what a scrape would render.
+						if s := p.Status(); len(s.Conditions) != len(telemetry.ConditionTypes) {
+							t.Errorf("a document read mid-open carried %d conditions, want the whole "+
+								"closed set of %d", len(s.Conditions), len(telemetry.ConditionTypes))
+							return
+						}
+					}
+				}
+			}()
+		}
+
+		done := make(chan error, 1)
+		go func() { done <- p.Run(ctx) }()
+		time.Sleep(60 * time.Millisecond)
+		close(src.release)
+		cancel()
+		<-done
+		close(stop)
+		readers.Wait()
+
+		_ = p.Close(context.Background())
+		_ = st.Close()
+		if t.Failed() {
+			return
 		}
 	}
 }

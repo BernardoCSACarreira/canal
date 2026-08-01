@@ -482,8 +482,9 @@ func (r *runner) persistCheckpoint(ctx context.Context, cp *Checkpoint,
 			d(landed)
 		}
 	}
-	for _, node := range slices.Sorted(maps.Keys(r.lanes)) {
-		done, err := r.lanes[node].stage(batch, positions)
+	ctls := r.laneCtls()
+	for _, node := range slices.Sorted(maps.Keys(ctls)) {
+		done, err := ctls[node].stage(batch, positions)
 		dones = append(dones, done)
 		if err != nil {
 			finish(false)

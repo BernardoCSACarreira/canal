@@ -242,7 +242,7 @@ func (r *runner) controlLoop(ctx context.Context, id record.NodeID, stop <-chan 
 // A finished lane is excluded from all three calls: its cursor is final, it will never produce again,
 // and heartbeating it would ask the source to hold a slot for something that is done.
 func (r *runner) liveLanes(id record.NodeID) []record.LaneID {
-	lc := r.lanes[id]
+	lc := r.laneCtlFor(id)
 	if lc == nil {
 		return nil
 	}
@@ -394,7 +394,7 @@ func (r *runner) nack(rec *record.Record, at record.Position, ferr error, reason
 
 // sourceOfLane finds the source node that owns a lane.
 func (r *runner) sourceOfLane(lane record.LaneID) (*registry.ResolvedSource, record.NodeID) {
-	for node, lc := range r.lanes {
+	for node, lc := range r.laneCtls() {
 		lc.mu.Lock()
 		_, ok := lc.lanes[lane]
 		lc.mu.Unlock()
@@ -407,7 +407,7 @@ func (r *runner) sourceOfLane(lane record.LaneID) (*registry.ResolvedSource, rec
 
 // laneOrdering reports a lane's declared ordering.
 func (r *runner) laneOrdering(node record.NodeID, lane record.LaneID) connector.Ordering {
-	lc := r.lanes[node]
+	lc := r.laneCtlFor(node)
 	if lc == nil {
 		return connector.OrderingPrefix
 	}
@@ -417,4 +417,74 @@ func (r *runner) laneOrdering(node record.NodeID, lane record.LaneID) connector.
 		return rec.Spec.Ordering
 	}
 	return connector.OrderingPrefix
+}
+
+// --- the runner's topology, read-safely ---------------------------------------------------------
+//
+// These exist because the runner is PUBLISHED BEFORE IT IS OPEN. Pipeline.Run stores it so that a
+// status read during a slow open reports "starting" rather than "pending", which means every map
+// below can be read from another goroutine while the open path is still inserting into it. That was
+// a real data race — found by CI on macOS/arm64, and not by two clean -race runs on the author's
+// machine, because it needs a Status to land inside the open window.
+
+// setLaneCtl publishes a source's lane table.
+func (r *runner) setLaneCtl(id record.NodeID, lc *laneCtl) {
+	r.nodesMu.Lock()
+	r.lanes[id] = lc
+	r.nodesMu.Unlock()
+}
+
+// setSourceRT publishes an opened source's runtime.
+func (r *runner) setSourceRT(id record.NodeID, rt *sourceRuntime) {
+	r.nodesMu.Lock()
+	r.srcRT[id] = rt
+	r.nodesMu.Unlock()
+}
+
+// setSinkRT publishes an opened sink's runtime.
+func (r *runner) setSinkRT(id record.NodeID, rt *sinkRuntime) {
+	r.nodesMu.Lock()
+	r.sinkRT[id] = rt
+	r.nodesMu.Unlock()
+}
+
+// laneCtls snapshots the lane tables. The map is copied and the values are pointers with their own
+// locks, so a caller may range it without holding anything.
+func (r *runner) laneCtls() map[record.NodeID]*laneCtl {
+	r.nodesMu.RLock()
+	defer r.nodesMu.RUnlock()
+	out := make(map[record.NodeID]*laneCtl, len(r.lanes))
+	for id, lc := range r.lanes {
+		out[id] = lc
+	}
+	return out
+}
+
+// laneCtlFor returns one node's lane table, or nil if that node is not open.
+func (r *runner) laneCtlFor(id record.NodeID) *laneCtl {
+	r.nodesMu.RLock()
+	defer r.nodesMu.RUnlock()
+	return r.lanes[id]
+}
+
+// sourceRT returns one source's runtime, or nil if it is not open.
+func (r *runner) sourceRT(id record.NodeID) *sourceRuntime {
+	r.nodesMu.RLock()
+	defer r.nodesMu.RUnlock()
+	return r.srcRT[id]
+}
+
+// runtimes snapshots every opened component's runtime, for the read model's event collection.
+func (r *runner) runtimes() (map[record.NodeID]*sourceRuntime, map[record.NodeID]*sinkRuntime) {
+	r.nodesMu.RLock()
+	defer r.nodesMu.RUnlock()
+	src := make(map[record.NodeID]*sourceRuntime, len(r.srcRT))
+	for id, rt := range r.srcRT {
+		src[id] = rt
+	}
+	snk := make(map[record.NodeID]*sinkRuntime, len(r.sinkRT))
+	for id, rt := range r.sinkRT {
+		snk[id] = rt
+	}
+	return src, snk
 }

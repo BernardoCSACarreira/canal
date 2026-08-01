@@ -106,6 +106,23 @@ const (
 	ReasonNotConnected = "not_connected"
 	ReasonApplied      = "applied"
 	ReasonPending      = "pending"
+
+	// ReasonAssigned, ReasonStalled and ReasonHealthy were added when the conditions first acquired a
+	// producer, because a vocabulary written alongside the condition TYPES had no token for three
+	// states the computation actually reaches.
+	//
+	// ReasonStalled is the important one: [CondProgressing] is the primary health signal and its
+	// false case — lanes assigned, records in flight, no durable cursor advance in the window — had
+	// nothing to name it, so the one condition an operator pages on could not say why. It is
+	// deliberately distinct from ReasonCaughtUp: a lane with nothing to read is not stuck, and
+	// collapsing the two lets a genuinely stuck pipeline hide behind "idle".
+	//
+	// ReasonHealthy is the negative case's reason — nothing is wrong — which several conditions need
+	// and none could express. A reason is the i18n key as well as the wire token, so "" would have
+	// rendered as a blank line in the UI for the most common state of a working pipeline.
+	ReasonAssigned = "assigned"
+	ReasonStalled  = "stalled"
+	ReasonHealthy  = "healthy"
 )
 
 // Condition is one orthogonal fact about a pipeline.

@@ -257,7 +257,7 @@ func (r *runner) applyOutcomes(ctx context.Context, node record.NodeID, id uint6
 	recs := r.awaiting.release(high, node)
 	if len(recs) > 0 {
 		r.p.ledger.Settle(outcomesFor(node, recs, connector.WriteResult{}))
-		r.p.obs.recordsWritten.Add(float64(len(recs)), r.p.obs.pipeline, string(node), r.p.sinks[node].Name)
+		r.p.obs.wrote(node, r.p.sinks[node].Name, len(recs))
 	}
 	r.checkpointer.confirm(high, node)
 	return nil

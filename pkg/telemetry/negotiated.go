@@ -36,17 +36,17 @@ type Negotiated struct {
 	//
 	// They were single-valued strings assigned inside a map-range loop over the sinks, so the
 	// disclosed answer depended on Go's map iteration order — 200 identical Builds of one graph
-	// produced four durability_edge values and two ack_point values. Deriving them from a named branch
+	// produced four DurabilityEdge values and two AckPoint values. Deriving them from a named branch
 	// makes them deterministic.
-	DurabilityEdge string `json:"durability_edge"`
+	DurabilityEdge string `json:"durabilityEdge"`
 
 	// AckPoint is which sink interface earns the ack: "write", "flush", "commit" or "token".
-	AckPoint string `json:"ack_point"`
+	AckPoint string `json:"ackPoint"`
 
 	// ReplayBudget is the CONFIGURED in-flight bound, labelled as the configured worst case rather
 	// than as a measurement. The measured replay window is a separate, computed series; exporting the
 	// budget as if it were the measurement is a config value dressed up as an observation.
-	ReplayBudget int `json:"replay_budget"`
+	ReplayBudget int `json:"replayBudget"`
 
 	// Defaults labels every value the core supplied rather than the operator (design rule R10).
 	Defaults []DefaultNote `json:"defaults,omitempty"`
@@ -61,13 +61,13 @@ type NodeContract struct {
 
 	// AckPoint is which sink interface earns the ack on this branch: "write", "flush", "commit" or
 	// "token". DurabilityEdge names where — "sink:warehouse", "buffer:wal".
-	AckPoint       string `json:"ack_point"`
-	DurabilityEdge string `json:"durability_edge"`
+	AckPoint       string `json:"ackPoint"`
+	DurabilityEdge string `json:"durabilityEdge"`
 
 	// BestEffort is true when every inbound edge of this node is declared spec.Edge.BestEffort, so the
 	// branch bears no progress and cannot lower the pipeline's guarantee. It is disclosed because "this
 	// branch may silently drop by design" is exactly the fact an operator must be able to see.
-	BestEffort bool `json:"best_effort,omitempty"`
+	BestEffort bool `json:"bestEffort,omitempty"`
 }
 
 // DefaultNote records one value the operator did not choose, and who chose it.
@@ -95,7 +95,7 @@ type Downgrade struct {
 
 	Node record.NodeID `json:"node"`
 
-	AcknowledgedBy string    `json:"acknowledged_by"`
-	AcknowledgedAt time.Time `json:"acknowledged_at"`
+	AcknowledgedBy string    `json:"acknowledgedBy"`
+	AcknowledgedAt time.Time `json:"acknowledgedAt"`
 	Reason         string    `json:"reason"`
 }

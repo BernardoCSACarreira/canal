@@ -732,9 +732,17 @@ of the same concept is evidence of a modelling error" — currently has several 
   the spec** (`spec/spec.go:55`) and rendered verbatim into `Negotiated.Why`
   (`engine/negotiate.go:285-286`): a durable operator-signed waiver can name a guarantee outside the
   guarantee vocabulary.
-- **(minor) `pkg/telemetry` uses 41 camelCase json tags against 8 snake_case**, while every other
+- ~~**(minor) `pkg/telemetry` uses 41 camelCase json tags against 8 snake_case**, while every other
   package in `pkg/` is 78/0 snake_case — and both casings appear inside one document
-  (`"observedGeneration"` beside `"ack_point"`).
+  (`"observedGeneration"` beside `"ack_point"`).~~ **Fixed** when the read model acquired a producer
+  and `GET /status` shipped, which is the moment the half-decision below stopped being free.
+  `pkg/telemetry` is now 49/0 camelCase. The rest of `pkg/` stays snake_case deliberately, and the
+  split is not aesthetic: those tags are an **operator input format** (`lane_budget`, `when_full` in a
+  spec file) and a **persisted format** (`record.Position`, the lane row, the checkpoint — all
+  JSON on disk). Renaming either is a migration, and renaming the persisted one is undetectable: no
+  test would fail, because every test starts from a fresh store, and a running deployment would
+  silently resume from zero. The read model is neither; it is a brand-new output nobody was reading
+  yet, and it is the one place the rename was actually free.
 - **(minor) `telemetry` exports three `Phase*`-prefixed vocabularies**; the restart and commit ones are
   untyped string constants (`metrics.go:130-135,138-142`) and are silently assignable into the typed
   `Phase` slot (`status.go:15-29`). `go vet` is silent.
@@ -1420,9 +1428,11 @@ about `spec.Spec` lacking `Downgrades` is now stale — the field ships.
    persisted in `spec.Spec`. Latent today because no buffer is registered — **which is exactly why it
    is cheap now.** (R4, R6.)
 
-**One more, half-decision:** `pkg/telemetry`'s 41 camelCase JSON tags against the rest of `pkg/`'s 78
-snake_case. Nothing consumes `PipelineStatus` yet, so this is free today and a wire break the day the
-API ships. Fold it into the completeness audit's item 4.
+**One more, half-decision — now decided.** `pkg/telemetry`'s 41 camelCase JSON tags against the rest
+of `pkg/`'s 78 snake_case. "Free today and a wire break the day the API ships" was exactly right, and
+the API shipped with `GET /status`, so it was taken then: `Negotiated`'s eight snake_case tags became
+camelCase, making the whole read model one convention. See the resolved entry in (b) for why the rest
+of `pkg/` deliberately did not follow.
 
 ---
 

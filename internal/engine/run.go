@@ -49,6 +49,11 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		return fault.Contract(fault.OpOpen, err)
 	}
 	r := &runner{p: p, deps: p.deps}
+	r.status.phase = telemetry.PhaseStarting
+	// Published BEFORE run so that a status read during a slow open sees "starting" rather than
+	// "pending" — the two are different answers, and opening a source against an unreachable upstream
+	// is exactly when somebody is watching.
+	p.active.Store(r)
 	return r.run(ctx)
 }
 
@@ -58,9 +63,15 @@ type runner struct {
 	deps Deps
 
 	// lanes and srcRT are kept so shutdown can reach the lane table for the final commit, and so the
-	// commit pump can find the source that owns an acknowledged lane.
-	lanes map[record.NodeID]*laneCtl
-	srcRT map[record.NodeID]*sourceRuntime
+	// commit pump can find the source that owns an acknowledged lane. sinkRT is kept so the read model
+	// can collect the events a sink reported through connector.Runtime.Note.
+	lanes  map[record.NodeID]*laneCtl
+	srcRT  map[record.NodeID]*sourceRuntime
+	sinkRT map[record.NodeID]*sinkRuntime
+
+	// status is the read model's own state: the phase, the previous condition set and the rate
+	// samples. See status.go.
+	status statusState
 
 	// mainSinks and failedSinks are the sink nodes split by what their inbound edges carry, computed
 	// once at start because it is a property of the spec and cannot change during a run.
@@ -79,6 +90,11 @@ type runner struct {
 
 	mu       sync.Mutex
 	firstErr error
+
+	// firstErrAt is when the fault that ended the run was recorded. The read model needs it and
+	// fault.Fault carries no timestamp of its own — deliberately, since a fault crosses a wire and a
+	// clock does not travel well, so the moment it was OBSERVED is the host's to record.
+	firstErrAt time.Time
 
 	// lastCheckpoint is when each lane's durable cursor last advanced, and started is the fallback
 	// for a lane that has not advanced at all. Together they are what makes canal_checkpoint_age
@@ -105,6 +121,11 @@ func (r *runner) markCheckpointed(lanes map[record.LaneID]record.Position) {
 // It runs on the flush ticker rather than on events, because an age is only useful if it climbs
 // WITHOUT anything happening. A checkpoint age updated only when a checkpoint is written is frozen
 // at its last good value exactly when the pipeline stalls, which is the one moment it matters.
+//
+// EVERY SERIES HERE IS PROJECTED FROM THE SAME PASS THE STATUS DOCUMENT IS BUILT FROM. The scrape
+// and the document are two serialisations of one observation, so they cannot disagree about the
+// state of the pipeline at a given moment — which is the whole reason [runner.laneStatuses] returns
+// its facts rather than each consumer walking the lanes itself.
 func (r *runner) refreshGauges() {
 	o := r.p.obs
 	if o == nil {
@@ -117,45 +138,42 @@ func (r *runner) refreshGauges() {
 	r.mu.Unlock()
 	o.staleness.Set(now.Sub(persist).Seconds(), o.pipeline)
 
-	for _, lc := range r.lanes {
-		lc.mu.Lock()
-		ids := make([]record.LaneID, 0, len(lc.lanes))
-		done := make(map[record.LaneID]bool, len(lc.lanes))
-		for id, rec := range lc.lanes {
-			ids = append(ids, id)
-			done[id] = rec.Finished
+	lanes, facts := r.laneStatuses(now)
+	for i := range lanes {
+		ls := &lanes[i]
+		lbl := laneLabel(ls.ID)
+
+		// A FINISHED LANE IS NOT A STALLED ONE. Its cursor is final and durable, so an age that keeps
+		// climbing would page somebody about a bounded pipeline that completed exactly as intended.
+		// Forgetting the series is what omit-don't-zero means for a quantity that has stopped
+		// existing rather than one that was never measured.
+		if ls.Finished {
+			o.checkpointAge.Forget(o.pipeline, lbl)
+			o.inFlight.Forget(o.pipeline, lbl)
+			o.inFlightMax.Forget(o.pipeline, lbl)
+			o.replay.Forget(o.pipeline, lbl)
+			o.oldestPending.Forget(o.pipeline, lbl)
+			continue
 		}
-		lc.mu.Unlock()
+		if ls.CheckpointAge != nil {
+			o.checkpointAge.Set(*ls.CheckpointAge, o.pipeline, lbl)
+		}
+		o.inFlight.Set(float64(ls.InFlight), o.pipeline, lbl)
+		o.inFlightMax.Set(float64(ls.InFlightBudget), o.pipeline, lbl)
+		o.replay.Set(float64(ls.ReplayRecords), o.pipeline, lbl)
 
-		for _, id := range ids {
-			// A FINISHED LANE IS NOT A STALLED ONE. Its cursor is final and durable, so an age that
-			// keeps climbing would page somebody about a bounded pipeline that completed exactly as
-			// intended. Forgetting the series is what omit-don't-zero means for a quantity that has
-			// stopped existing rather than one that was never measured.
-			if done[id] {
-				o.checkpointAge.Forget(o.pipeline, laneLabel(id))
-				o.inFlight.Forget(o.pipeline, laneLabel(id))
-				o.inFlightMax.Forget(o.pipeline, laneLabel(id))
-				o.replay.Forget(o.pipeline, laneLabel(id))
-				continue
-			}
-			r.mu.Lock()
-			at, ok := r.lastCheckpoint[id]
-			if !ok {
-				// Never checkpointed. Age from the start of the run, which is the honest answer and
-				// the one that alarms.
-				at = r.started
-				r.lastCheckpoint[id] = at
-			}
-			r.mu.Unlock()
-			o.checkpointAge.Set(now.Sub(at).Seconds(), o.pipeline, laneLabel(id))
-
-			st := r.p.ledger.Stats(id)
-			o.inFlight.Set(float64(st.InFlight), o.pipeline, laneLabel(id))
-			o.inFlightMax.Set(float64(st.InFlightBudget), o.pipeline, laneLabel(id))
-			o.replay.Set(float64(st.ReplayRecords), o.pipeline, laneLabel(id))
+		// OMIT, DO NOT ZERO. A lane with nothing pending has no oldest pending record, and an age of
+		// zero would read as "the oldest one arrived just now" — the opposite of the truth, and the
+		// reading that makes a `> 60` alert quietly stop firing.
+		if ls.OldestPendingAge != nil {
+			o.oldestPending.Set(*ls.OldestPendingAge, o.pipeline, lbl)
+		} else {
+			o.oldestPending.Forget(o.pipeline, lbl)
 		}
 	}
+
+	o.reconcile.Set(float64(int64(facts.admitted)-int64(facts.settled)), o.pipeline)
+	r.publishConditions(r.conditions(now, facts))
 }
 
 func (r *runner) fail(err error) {
@@ -164,9 +182,16 @@ func (r *runner) fail(err error) {
 	}
 	r.mu.Lock()
 	if r.firstErr == nil {
-		r.firstErr = err
+		r.firstErr, r.firstErrAt = err, time.Now()
 	}
 	r.mu.Unlock()
+}
+
+// setPhase moves the pipeline's coarse state, which is the read model's headline.
+func (r *runner) setPhase(p telemetry.Phase) {
+	r.status.mu.Lock()
+	r.status.phase = p
+	r.status.mu.Unlock()
 }
 
 // firstError reports the fault that ended the run, if one has.
@@ -212,19 +237,33 @@ func (r *runner) run(ctx context.Context) error {
 
 	// Sinks open before sources. A source that produces before its sink can accept is a batch with
 	// nowhere to go, held against the lane budget for nothing.
+	r.sinkRT = map[record.NodeID]*sinkRuntime{}
 	if err := r.openSinks(runCtx); err != nil {
+		r.fail(err)
+		r.setPhase(telemetry.PhaseFailed)
 		return err
 	}
+	r.status.mu.Lock()
+	r.status.sinkReady = true
+	r.status.mu.Unlock()
 	// RECOVERY BEFORE ANY RECORD MOVES. A previous run may have left staged artifacts the
 	// destination has and this process does not know about; resolving them after starting to read
 	// would let a new checkpoint advance a cursor past records nobody published. It runs after the
 	// sinks are open because only an open sink can answer for its own committables.
 	if err := r.recoverCheckpoint(runCtx); err != nil {
+		r.fail(err)
+		r.setPhase(telemetry.PhaseFailed)
 		return err
 	}
 	if err := r.openSources(runCtx); err != nil {
+		r.fail(err)
+		r.setPhase(telemetry.PhaseFailed)
 		return err
 	}
+	r.status.mu.Lock()
+	r.status.sourceReady = true
+	r.status.mu.Unlock()
+	r.setPhase(telemetry.PhaseRunning)
 
 	var wg sync.WaitGroup
 
@@ -259,6 +298,15 @@ func (r *runner) run(ctx context.Context) error {
 	}
 	readers.Wait()
 	stopReading()
+
+	// DRAINING IS ITS OWN PHASE, and the two fields that describe it are only meaningful here. An
+	// operator watching a stop wants to know when it started and when canal will give up, and
+	// "drained" and "drain timed out" are distinct events because the second means records replay.
+	r.status.mu.Lock()
+	r.status.phase = telemetry.PhaseDraining
+	r.status.stoppingSince = time.Now()
+	r.status.drainDeadline = r.status.stoppingSince.Add(r.deps.GracePeriod)
+	r.status.mu.Unlock()
 
 	// Drain: settlement continues while the ledger empties. A graceful stop must not discard a
 	// commit that is one millisecond from safe.
@@ -337,6 +385,22 @@ func (r *runner) run(ctx context.Context) error {
 		r.fail(fmt.Errorf("engine: drain: %w", drainErr))
 	}
 
+	// THE TERMINAL PHASE, and the distinction between the last two is the whole reason PhaseCompleted
+	// exists: without it a finished batch job looks identical to a stalled stream. A run that ended
+	// because its input ended is COMPLETED; one that ended because somebody cancelled it is STOPPED
+	// and may well be restarted. A fault outranks both.
+	switch {
+	case r.firstError() != nil:
+		r.setPhase(telemetry.PhaseFailed)
+	case ctx.Err() != nil:
+		r.setPhase(telemetry.PhaseStopped)
+	default:
+		r.setPhase(telemetry.PhaseCompleted)
+	}
+	// One last condition refresh, so the final scrape describes the state the pipeline stopped in
+	// rather than the one it was in a tick earlier.
+	r.refreshGauges()
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.firstErr
@@ -393,6 +457,7 @@ func (r *runner) openSinks(ctx context.Context) error {
 			tenant: r.p.spec.Tenant, pipeline: r.p.spec.ID, node: id,
 			streams: configuredStreams(r.p.spec), component: sk.Name,
 		}}
+		r.sinkRT[id] = rt
 		opening := connector.Opening{
 			Guarantee: r.p.negotiated.Guarantee,
 			Streams:   configuredStreams(r.p.spec),

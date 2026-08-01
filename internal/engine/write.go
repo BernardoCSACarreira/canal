@@ -51,6 +51,16 @@ func (r *runner) writeSet(ctx context.Context, id record.NodeID, records []*reco
 	for len(pending) > 0 {
 		failed, err := r.writeOnce(ctx, id, sk, cc, pending, lane, at)
 		if err != nil {
+			// A FAULT THE ENGINE RAISED ABOUT THIS SINK IS STILL A FAULT AT THIS NODE. Only the faults
+			// a sink RETURNED were counted, so a broken contract — a WriteResult that accounts for
+			// fewer records than the request carried, a non-Flusher deferring — went uncounted, which
+			// made the single clearest case of "this is the connector's bug" the one case
+			// canal_faults_total could not attribute. Found by asserting the node rollup in the read
+			// model against a sink that under-reports.
+			//
+			// Every other fatal path in the engine already counts at the point it gives up:
+			// flushOne, signalFlush and the commit protocol all do. This was the outlier.
+			r.p.obs.fault(id, err)
 			return err
 		}
 		if len(failed) == 0 {
@@ -145,6 +155,10 @@ func (r *runner) writeOnce(ctx context.Context, id record.NodeID, sk *registry.R
 
 	failed := map[record.RecordID]error{}
 	for _, rq := range reqs {
+		// Counted BEFORE the call, because "handed to the sink" is what the read model's RecordsIn
+		// means for a sink node. Counting after a successful return would make it a second, worse
+		// copy of RecordsOut, and the gap between the two is exactly what a stuck sink looks like.
+		r.p.obs.handed(id, len(rq.records))
 		res, werr := sandbox(ctx, r.p.obs, id, sk.Name, rq.req,
 			func(c context.Context, q *connector.Request) (connector.WriteResult, error) {
 				return sk.Sink.Write(c, q)

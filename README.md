@@ -427,9 +427,15 @@ pump ([`internal/engine/run.go`](internal/engine/run.go)), the binary
 all exist. R3's milestone is met: the guards in this repository are facts about a running process
 rather than designs.
 
-**Next** is the read model: `telemetry.PipelineStatus` is a declared shape nothing constructs, which
-leaves `canal_condition` as the one metric in the closed set with no producer and leaves an operator
-with no answer to "did my config change take effect". After that, what the single-worker label in
+**The read model is built too.** `telemetry.PipelineStatus` was a declared shape nothing constructed;
+[`engine.Pipeline.Status`](internal/engine/status.go) now produces it and `canal run --metrics` serves
+it at `GET /status` next to `/metrics`. The conditions are metrics as well as document fields, so
+`canal_condition{condition="spec_applied",status="false"} == 1` is an alert expression rather than an
+absence somebody has to remember to check for — which is the answer to "did my config change take
+effect". Every field the engine cannot measure is a nil pointer and is named as a gap in §16 rather
+than filled with a confident zero.
+
+**Next** is what the single-worker label in
 [`internal/engine/runtime.go`](internal/engine/runtime.go) holds open: a `store.Coordinator`, leases
 and real epoch fencing, plus transforms and buffers.
 

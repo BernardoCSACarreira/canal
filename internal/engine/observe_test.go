@@ -141,12 +141,24 @@ func TestAHealthyRunEmitsItsSeries(t *testing.T) {
 	got := seriesNames(body)
 	expect := []string{
 		"canal_commit_latency_seconds",
+		// canal_condition is here because the read model's conditions are metrics as well as
+		// document fields, which is what turns "my config change silently did not apply" into an
+		// alert instead of a mystery.
+		"canal_condition",
 		"canal_metrics_series_dropped_total",
+		// canal_reconcile_delta_records is records in minus records out. It must be 0 for this run and
+		// it is emitted anyway: a delta of zero is a MEASUREMENT, and an alert on a persistent
+		// non-zero needs the series to exist while everything is fine.
+		"canal_reconcile_delta_records",
 		"canal_records_committed_total",
 		"canal_records_read_total",
 		"canal_records_written_total",
 		"canal_state_persist_staleness_seconds",
 	}
+	// Note what is NOT here. canal_checkpoint_age_seconds and the lane gauges are absent because this
+	// run's lane FINISHED and a finished lane's series are forgotten; canal_oldest_pending_age_seconds
+	// is absent because nothing was pending when it ended. Both are omit-don't-zero doing its job, and
+	// both appear in TestAStalledPipelineStillReportsItsAge.
 	if strings.Join(got, "\n") != strings.Join(expect, "\n") {
 		t.Errorf("the series a healthy run emits have changed.\n got: %v\nwant: %v\n"+
 			"\nIf this is intended, update the list — a name appearing or disappearing is a breaking "+

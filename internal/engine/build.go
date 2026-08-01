@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"maps"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/BernardoCSACarreira/canal/internal/ledger"
@@ -103,6 +104,19 @@ type Pipeline struct {
 	// negotiated is kept so the read model can serve what the operator GOT rather than what they asked
 	// for, for the pipeline's whole life.
 	negotiated telemetry.Negotiated
+
+	// active is the current or MOST RECENT execution, and it is deliberately never cleared. A bounded
+	// pipeline that completed still has to be able to say what it did; clearing the pointer at the end
+	// of Run would make a finished pipeline report the same empty document as one that never started.
+	active atomic.Pointer[runner]
+
+	// version is the read model's monotonic revision, and it is both the ETag and the SSE cursor.
+	//
+	// It counts MATERIALISATIONS rather than changes, and that is honest rather than lazy: the
+	// document carries live ages, so it genuinely differs on every read and a content hash would
+	// change just as often. The number is a cursor a consumer can order and resume from; it is not a
+	// cache key, and nothing here pretends otherwise.
+	version atomic.Uint64
 }
 
 // Negotiated returns the resolved, honest delivery contract.
@@ -312,7 +326,7 @@ func Build(ctx context.Context, r *registry.Registry, s spec.Spec, d Deps) (*Pip
 	// is already disclosed as a default note.
 	s.LaneBudget = budget
 
-	ob, err := newObs(deps.Metrics, s.ID)
+	ob, err := newObs(deps.Metrics, s)
 	if err != nil {
 		// Every name and label in newObs is a constant from telemetry's closed sets, so a failure
 		// here means one of those sets was edited without this engine. That is a build-time mistake

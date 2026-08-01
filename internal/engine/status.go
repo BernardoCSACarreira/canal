@@ -35,7 +35,6 @@ import (
 //     current Scalar, so there is nothing to divide by.
 //   - NodeStatus.Utilization and .BlockedForSeconds. Neither is measured anywhere in the engine.
 //   - Buffers. There is no buffer node type.
-//   - WorkerStatus.LeaseExpires. There are no leases until store.Coordinator exists.
 //
 // Generation used to be on that list in all but name — it was ObservedGeneration's own value,
 // reported twice — and it is not any more: config.go watches store.ConfigStore for the revision this
@@ -200,9 +199,17 @@ func (r *runner) fillStatus(s *telemetry.PipelineStatus, now time.Time, q teleme
 	s.Lanes = lanes
 	s.Nodes = r.nodeStatuses(facts)
 	s.Scan = r.scanProgress(now, facts)
+	// LeaseExpires is the SOONEST of this worker's leases, or nil when there is no coordinator to
+	// have granted one. Leader is what this process believes, which is advisory by construction —
+	// store.Leadership says so — and true by default for a standalone run that is the only planner
+	// there is.
+	leader := true
+	if r.leadership != nil {
+		leader = r.leadership.IsLeader()
+	}
 	s.Workers = []telemetry.WorkerStatus{{
-		ID: string(r.deps.Worker), Since: r.started, Leader: true,
-		Lanes: len(lanes), LastHeard: now,
+		ID: string(r.deps.Worker), Since: r.started, Leader: leader,
+		Lanes: len(lanes), LastHeard: now, LeaseExpires: r.leases.soonestExpiry(),
 	}}
 	s.Throughput = r.throughput(now, facts)
 	s.RecentEvents = r.recentEvents()

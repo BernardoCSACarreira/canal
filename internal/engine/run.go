@@ -14,6 +14,7 @@ import (
 	"github.com/BernardoCSACarreira/canal/pkg/record"
 	"github.com/BernardoCSACarreira/canal/pkg/registry"
 	"github.com/BernardoCSACarreira/canal/pkg/spec"
+	"github.com/BernardoCSACarreira/canal/pkg/store"
 	"github.com/BernardoCSACarreira/canal/pkg/telemetry"
 )
 
@@ -81,6 +82,8 @@ func newRunner(p *Pipeline) *runner {
 		checkpointer: newCheckpointer(),
 		awaiting:     newAwaitingCommit(),
 	}
+	r.leases = newLeaseTable(p.deps, specRefFields{tenant: p.spec.Tenant, pipeline: p.spec.ID},
+		p.spec.Revision)
 	r.status.phase = telemetry.PhaseStarting
 	r.mainSinks, r.failedSinks = partitionSinks(p.spec, p.sinks)
 
@@ -123,6 +126,13 @@ type runner struct {
 	lanes   map[record.NodeID]*laneCtl
 	srcRT   map[record.NodeID]*sourceRuntime
 	sinkRT  map[record.NodeID]*sinkRuntime
+
+	// leases is this worker's claims, membership its row in the worker set and leadership its
+	// advisory planner role. All three are inert for a worker with no store.Coordinator, which is the
+	// standalone deployment. See lease.go.
+	leases     *leaseTable
+	membership store.Membership
+	leadership store.Leadership
 
 	// status is the read model's own state: the phase, the previous condition set and the rate
 	// samples. See status.go. activity is the control loop's, see control.go.
@@ -263,6 +273,13 @@ func (r *runner) run(ctx context.Context) error {
 	runCtx, stopReading := context.WithCancel(ctx)
 	defer stopReading()
 
+	// JOINING BEFORE THE OPENS, for the same reason the config watch starts there: a worker that is
+	// slow to open is still a worker, and a status document that cannot see it during exactly the
+	// window somebody is watching is the document's own failure. Leaving is deferred here so it runs
+	// after everything below has stopped touching a lane.
+	r.joinCluster(ctx)
+	defer r.leaveCluster(context.WithoutCancel(ctx))
+
 	// THE CONFIG WATCH STARTS BEFORE ANYTHING IS OPENED, and takes ctx rather than runCtx so it keeps
 	// answering through the drain. "Did my config take effect" is asked most often while a pipeline is
 	// stuck opening against an unreachable upstream, which is exactly the window a watch started after
@@ -324,6 +341,15 @@ func (r *runner) run(ctx context.Context) error {
 	// THE SECOND GOROUTINE PER SOURCE. It takes ctx rather than runCtx so heartbeats keep an
 	// upstream's retention moving while the pipeline drains, and it is stopped by a channel so every
 	// call into a connector has returned before Run does — and therefore before the host calls Close.
+	// The lease loop takes ctx rather than runCtx, so leases keep being renewed while the pipeline
+	// drains — a worker that stopped renewing when it stopped reading would have its lanes reassigned
+	// underneath a drain that is still settling records for them.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		r.leaseLoop(ctx)
+	}()
+
 	controlStop := make(chan struct{})
 	for id := range r.p.sources {
 		wg.Add(1)
@@ -469,11 +495,17 @@ func (r *runner) openSources(ctx context.Context) error {
 					Budget:   int(st.InFlightBudget),
 					Headroom: int(st.InFlightBudget) - int(st.InFlight),
 				}
-			})
+			}, r.leases)
 		if err := lc.load(ctx); err != nil {
 			return err
 		}
 		r.setLaneCtl(id, lc)
+
+		// CLAIMED BEFORE THE SOURCE IS OPENED, for the warm-start path: load() has just read this
+		// node's durable lanes, and the source will ask Assigned inside Open. The cold-start path goes
+		// through afterAnnounce, because those lanes do not exist yet.
+		lc.afterAnnounce = func(c context.Context) { r.planAndClaim(c, id, lc) }
+		r.planAndClaim(ctx, id, lc)
 
 		rt := &sourceRuntime{
 			baseRuntime: baseRuntime{
@@ -986,6 +1018,17 @@ func (r *runner) commitPump(ctx context.Context) {
 		if !ok {
 			continue
 		}
+
+		// THE FENCE WITH TEETH. Every other lease check decides what this worker READS; this one
+		// decides what it tells an upstream it may forget. A worker that lost a lane and acknowledged
+		// it anyway discards records the new holder has not delivered, and no epoch undoes that
+		// because by then the data is gone from the source. See lease.go.
+		if !r.commitAllowed(ack.Lane) {
+			r.deps.Log.Warn("not acknowledging a lane this worker no longer holds; its upstream keeps "+
+				"the records for the new holder", "lane", ack.Lane)
+			continue
+		}
+
 		start := time.Now()
 		if _, err := sandbox(ctx, r.p, srcNode, src.Name, ack,
 			func(c context.Context, a connector.Ack) (struct{}, error) {

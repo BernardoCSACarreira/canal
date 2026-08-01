@@ -27,6 +27,14 @@ import (
 // change are marked. Nothing here PRETENDS to be coordinated: laneCtl.Revoked always answers false
 // because in a single process it truthfully never happens, rather than because the check is missing.
 
+// STILL TO DO, AND LABELLED RATHER THAN IMPLIED: every durable write here carries singleWorkerEpoch,
+// including a lane's cursor. The engine now holds real per-lane leases and refuses to advance an
+// upstream for a lane it has lost (lease.go), which is the fence that protects an upstream — but the
+// STATE STORE's own per-key epoch check is not yet fed the lane's lease epoch, so two workers racing
+// on one lane are separated by the coordinator rather than by the store. store.Batch.PutFenced
+// exists for exactly that write and is the next change; it is a per-call-site edit because the
+// batches here span several lanes and one of them is not lane-scoped at all.
+
 // singleWorkerEpoch is the fencing token every durable write carries while canal is single-process.
 //
 // It is 1 rather than 0 because store.Versioned treats a zero epoch as "use the batch's", and
@@ -84,6 +92,20 @@ type laneCtl struct {
 
 	ledgerFor func(id record.LaneID, ord connector.Ordering, budget int) error
 	admission func(id record.LaneID) connector.Admission
+
+	// afterAnnounce plans and claims the lanes that have just appeared, and it is called from
+	// Announce rather than on a timer for a reason every source in this module demonstrates: a source
+	// announces its lanes inside Open and then immediately asks Assigned. Assigned now answers "the
+	// lanes you hold a lease on", so a claim that waited for the next tick would tell a source it has
+	// nothing to read — and a source that believes that announces them all over again.
+	//
+	// Nil for a worker with no coordinator, where a lane is held from the moment it is announced.
+	afterAnnounce func(context.Context)
+
+	// leases is this worker's claims, or a table with no coordinator behind it. Every question this
+	// type answers about WHO HOLDS a lane goes through it; every question about what a lane IS comes
+	// from the durable row. See lease.go.
+	leases *leaseTable
 }
 
 // specRefFields is the slice of the pipeline spec the runtime needs, kept narrow so the runtime does
@@ -97,8 +119,10 @@ type specRefFields struct {
 func newLaneCtl(deps Deps, f specRefFields, node record.NodeID,
 	ledgerFor func(record.LaneID, connector.Ordering, int) error,
 	admission func(record.LaneID) connector.Admission,
+	leases *leaseTable,
 ) *laneCtl {
 	return &laneCtl{
+		leases:    leases,
 		deps:      deps,
 		node:      node,
 		fields:    f,
@@ -241,6 +265,9 @@ func (l *laneCtl) AnnounceMany(ctx context.Context, specs []connector.LaneSpec) 
 	}
 
 	l.notify()
+	if l.afterAnnounce != nil {
+		l.afterAnnounce(ctx)
+	}
 	return ids, nil
 }
 
@@ -249,6 +276,7 @@ func (l *laneCtl) AnnounceMany(ctx context.Context, specs []connector.LaneSpec) 
 // A finished lane is omitted, which is the discriminator linefile uses: an empty result is a cold
 // start, a non-empty one is a warm start carrying the durable cursor.
 func (l *laneCtl) Assigned(context.Context) ([]connector.LaneAssignment, error) {
+	now := time.Now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -256,6 +284,12 @@ func (l *laneCtl) Assigned(context.Context) ([]connector.LaneAssignment, error) 
 	for _, id := range l.order {
 		rec := l.lanes[id]
 		if rec.Finished {
+			continue
+		}
+		// A LANE THIS WORKER DOES NOT HOLD IS NOT OFFERED. In a standalone run holds() is true for
+		// everything and this changes nothing; with a coordinator it is the difference between a
+		// source reading its own lanes and a source reading somebody else's.
+		if !l.leases.holds(id, now) {
 			continue
 		}
 		if gated := l.gatedOnLocked(rec); len(gated) > 0 {
@@ -268,7 +302,7 @@ func (l *laneCtl) Assigned(context.Context) ([]connector.LaneAssignment, error) 
 			ID:     id,
 			Spec:   rec.Spec,
 			Cursor: rec.Cursor,
-			Epoch:  singleWorkerEpoch,
+			Epoch:  l.leases.epochFor(id),
 			Worker: string(l.deps.Worker),
 		})
 	}
@@ -300,7 +334,7 @@ func (l *laneCtl) Table(_ context.Context, q connector.LaneQuery) ([]connector.L
 		}
 		out = append(out, connector.LaneAssignment{
 			ID: id, Spec: rec.Spec, Cursor: rec.Cursor,
-			Epoch: singleWorkerEpoch, Worker: string(l.deps.Worker),
+			Epoch: l.leases.epochFor(id), Worker: string(l.deps.Worker),
 			Finished: rec.Finished, FinishedAt: rec.FinishedAt,
 			GatedOn: l.gatedOnLocked(rec),
 		})
@@ -507,10 +541,33 @@ func (l *laneCtl) notify() {
 
 // Revoked reports whether this worker has lost a lane.
 //
-// Always false, TRUTHFULLY: in a single process nothing can reclaim a lease, because there is no
-// lease and no other worker. When store.Coordinator arrives this consults it, and the connectors
-// that already check Revoked keep working unchanged — which is the point of them checking now.
-func (l *laneCtl) Revoked(record.LaneID) bool { return false }
+// FALSE FOR A STANDALONE RUN, TRUTHFULLY: with no coordinator there is no lease and no other worker,
+// so nothing can reclaim anything. With one, this is the lease table's answer, and the connectors
+// that were already checking it keep working unchanged — which is what they were checking for.
+func (l *laneCtl) Revoked(id record.LaneID) bool { return !l.leases.holds(id, time.Now()) }
+
+// laneRows projects the durable lane table as the coordinator sees it.
+//
+// THE SPEC IS OPAQUE TO THE STORE, which store.LaneRow says in its own doc: the engine owns the
+// codec and the version, and the coordinator moves bytes. So the row carries identity, gating and
+// finish state — everything a planner needs to decide placement — and the connector's LaneSpec stays
+// on this side of the seam.
+func (l *laneCtl) laneRows() []store.LaneRow {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]store.LaneRow, 0, len(l.order))
+	for _, id := range l.order {
+		rec := l.lanes[id]
+		out = append(out, store.LaneRow{
+			ID: id, Name: rec.Spec.Name, Group: rec.Spec.Group, After: rec.Spec.StartAfter,
+			Bounded:    rec.Spec.Boundedness == connector.Bounded,
+			Finished:   rec.Finished,
+			FinishedAt: rec.FinishedAt,
+			Weight:     rec.Spec.Weight,
+		})
+	}
+	return out
+}
 
 // Admission reports the lane's in-flight budget and headroom.
 func (l *laneCtl) Admission(id record.LaneID) connector.Admission {

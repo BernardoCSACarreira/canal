@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"maps"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -79,19 +78,12 @@ func NewCoordinator() *Coordinator {
 	}
 }
 
-// AssignmentIDFor derives the stable id of one lane's assignment in one generation.
+// AssignmentIDFor is store.AssignmentIDFor, re-exported so this package's own tests can name it.
 //
-// STABLE ACROSS RE-PLANS, DISTINCT ACROSS GENERATIONS, which is exactly what [store.AssignmentID]
-// says it identifies. The first half is what lets Plan run on a timer without dropping every claim
-// it already made; the second is what makes "an assignment from an older generation is not claimed"
-// enforceable at all, because the row simply is not the same row.
-//
-// It escapes the same way record.DeriveLaneID does, so a tenant containing a slash cannot address
-// another tenant's assignment.
+// It is deliberately NOT a second derivation. A planner and a worker that derived assignment ids
+// differently would plan rows nobody could claim, so there is one function and every caller uses it.
 func AssignmentIDFor(t record.TenantID, p record.PipelineID, gen uint64, lane record.LaneID) store.AssignmentID {
-	esc := strings.NewReplacer("%", "%25", "/", "%2F")
-	return store.AssignmentID(fmt.Sprintf("%s/%s/%d/%s",
-		esc.Replace(string(t)), esc.Replace(string(p)), gen, esc.Replace(string(lane))))
+	return store.AssignmentIDFor(t, p, gen, lane)
 }
 
 // --- membership ----------------------------------------------------------------------------------

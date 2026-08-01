@@ -335,6 +335,30 @@ func TestALaneThatIsProducingIsNotHeartbeated(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- p.Run(ctx) }()
 
+	// GATED ON THE FIRST RECORD, not on the clock. Sleeping from the moment Run is launched assumes
+	// the pipeline is past openSinks, recoverCheckpoint, openSources and an Announce that fsyncs — the
+	// same assumption that made TestACancelledRunFlushesWithDrain pass locally and fail in CI.
+	//
+	// The beat count is snapshotted at the gate rather than required to be zero, because a heartbeat
+	// BEFORE the first record is correct: until a lane has produced anything, quietness is measured
+	// from the start of the run and such a lane genuinely is quiet. What must not happen is a
+	// heartbeat while records are flowing.
+	before := -1
+	gate := time.Now().Add(30 * time.Second)
+	for time.Now().Before(gate) {
+		if s := p.Status(); len(s.Lanes) == 1 && s.Lanes[0].RecordsRead > 0 {
+			beats, _, _ := src.seen()
+			before = len(beats)
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if before < 0 {
+		cancel()
+		<-done
+		t.Fatal("the source never produced a record, so this test proves nothing")
+	}
+
 	// Six control intervals of continuous production. Every one of them is an opportunity to
 	// heartbeat a lane that is plainly not quiet.
 	time.Sleep(6 * iv)
@@ -343,17 +367,14 @@ func TestALaneThatIsProducingIsNotHeartbeated(t *testing.T) {
 	cancel()
 	<-done
 
-	if len(beats) != 0 {
+	if len(beats) != before {
 		t.Errorf("a lane producing a batch every millisecond was heartbeated %d times over 6 control "+
-			"intervals; the idle flag would then mean nothing at all", len(beats))
+			"intervals; the idle flag would then mean nothing at all", len(beats)-before)
 	}
 	for _, l := range s.Lanes {
 		if l.Idle {
 			t.Errorf("lane %s is reported idle while it is producing continuously", l.ID)
 		}
-	}
-	if len(s.Lanes) == 0 || s.Lanes[0].RecordsRead == 0 {
-		t.Fatal("the source produced nothing, so this test proves nothing")
 	}
 }
 

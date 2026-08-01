@@ -75,6 +75,23 @@ const (
 	// MConditions exports every condition as a bounded series, so a silently unapplied config change
 	// becomes an alert instead of a mystery.
 	MConditions = "canal_condition" // {pipeline,condition,status}
+
+	// MClockSkew counts records whose source timestamp led the local clock by more than the
+	// configured max_skew, by what the policy did about it.
+	//
+	// It exists because spec.ClockPolicy says all three behaviours are COUNTED, and none of the other
+	// twenty-six names could carry it: clamp and pass are not faults, so canal_faults_total is the
+	// wrong home, and a pass policy with no counter is completely invisible — which is the worst of
+	// the three, since pass means "I accept implausible timestamps" and how often is the only
+	// question an operator has about it.
+	MClockSkew = "canal_clock_skew_records_total" // {pipeline,node,outcome}
+)
+
+// The outcomes [MClockSkew] is labelled by, one per spec.ClockBehaviour.
+const (
+	ClockClamped  = "clamped"
+	ClockRejected = "rejected"
+	ClockPassed   = "passed"
 )
 
 // MetricNames is every metric this build exports, for the golden-file test that pins them. A metric
@@ -86,6 +103,7 @@ var MetricNames = []string{
 	MBlocked, MUtilization, MBackoff, MBufferDepth, MBufferRefused,
 	MRevokedUnsettled, MStateStaleness, MCommitLatency, MRestorePhase,
 	MLedgerLeaks, MUnclassified, MAbandonedPluginCalls, MReconcileDelta, MConditions,
+	MClockSkew,
 }
 
 // MetricHelp is the one-line description exported as # HELP.
@@ -127,6 +145,7 @@ var MetricHelp = map[string]string{
 	MAbandonedPluginCalls: "Plugin calls the host gave up on. Each leaks one goroutine.",
 	MReconcileDelta:       "Records read minus records settled and abandoned: what is unaccounted for.",
 	MConditions:           "Every pipeline condition as a bounded series.",
+	MClockSkew:            "Records whose source timestamp led the local clock past max_skew, by what the policy did.",
 }
 
 // The CLOSED label vocabulary, enforced at registration.

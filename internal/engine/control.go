@@ -217,7 +217,8 @@ func (r *runner) controlLoop(ctx context.Context, id record.NodeID, stop <-chan 
 		// assertion behind the operator's back.
 		return
 	}
-	t := time.NewTicker(r.deps.ControlInterval)
+	interval := r.controlIntervalFor(id)
+	t := time.NewTicker(interval)
 	defer t.Stop()
 
 	for {
@@ -265,7 +266,7 @@ func (r *runner) heartbeatQuietLanes(ctx context.Context, id record.NodeID, src 
 	now := time.Now()
 	for _, lane := range r.liveLanes(id) {
 		quiet := r.activity.quietFor(lane, now, r.started)
-		if quiet < r.deps.ControlInterval {
+		if quiet < r.controlIntervalFor(id) {
 			continue
 		}
 		type hb struct {

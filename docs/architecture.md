@@ -9063,6 +9063,27 @@ and `cmd/canal/main_test.go` kills the binary three times to prove a position su
 Each node runs one goroutine with one `select`. The edges are bounded channels of `*record.Batch` with
 capacity 2. There is no shared mutable state between nodes; a batch is handed over, never shared.
 
+**`clock` is read now, and it was the last inert field on `spec.Spec`.** A source could stamp a record
+a year in the future and every window, retention rule and event-time lag computed from it was wrong
+with nothing to say so. The check runs at the SOURCE EDGE, before admission, because that is where a
+timestamp enters canal and the only point at which the record is still the source's alone.
+
+It is ONE-SIDED, as the field says: `max_skew` is how far a timestamp may LEAD the local clock. A
+timestamp in the past is history, not skew, and a batch source replaying last year's data is the
+normal case — clamping it would destroy the field the policy exists to protect. A zero `max_skew`
+disables the check entirely, which is the default.
+
+| Behaviour | What happens |
+| --- | --- |
+| `clamp` | `EventTime` is set to now and the adjustment is recorded on the record through `Meta.NoteChange`, so a consumer six months later can see the timestamp was altered and by how much rather than finding out in a reconciliation |
+| `reject` | The record is routed on the failed edge and dropped from the batch before admission, so it never takes a settlement reference |
+| `pass` | Accepted verbatim, and counted anyway — a pass policy with no counter is a decision to accept implausible timestamps with no way to learn how often |
+
+All three are counted by `canal_clock_skew_records_total{pipeline,node,outcome}`, which had to be
+added to the closed metric set: clamp and pass are not faults, so `canal_faults_total` was the wrong
+home, and the alternative was leaving the arm an operator picks when they believe it never happens
+entirely invisible.
+
 **`when_full` is read now, in both places it can be set.** `spec.Spec.WhenFull` is pipeline-wide and
 `pkg/registry` adds `when_full` to every node's stage-standard form, so it reaches the generated JSON
 Schema and the submit screen — and neither was read anywhere, so whatever an operator chose,

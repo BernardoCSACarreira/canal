@@ -445,6 +445,15 @@ passed the gate and pinned its upstream's retention anyway.
 [`internal/engine/control.go`](internal/engine/control.go) is that goroutine; `Backlog`, `Idle` and
 `EventTimeLag` in the read model come from it.
 
+**Nothing on `spec.Spec` is inert any more, and there is a test that keeps it that way.**
+[`internal/arch/inert_test.go`](internal/arch/inert_test.go) walks `Deps` and `spec.Spec` for fields
+nothing reads, and the stage-standard config fields the registry puts on every node's form. A field
+that is legitimately unread has to say so in an allowlist with a reason, which turns a silence into a
+declaration somebody wrote down. It found three things on its first run, one of them in code written
+the day before: a source's own `heartbeat_interval` was offered on its form and the control goroutine
+used the deployment-wide interval instead. `spec.Clock` was the last unread policy and is
+implemented — one-sided by definition, clamp/reject/pass, all three counted.
+
 **`when_full` does something now.** It was offered pipeline-wide *and* on every node's config form,
 and read in neither place: whatever an operator picked, admission blocked. `block` still blocks and
 is still the only policy that never loses data; `drop_newest` and `reject` shed, and a shed is a

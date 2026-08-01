@@ -29,6 +29,7 @@ type obs struct {
 	recordsDuplicate *metrics.Counter
 
 	faults       *metrics.Counter
+	clockSkew    *metrics.Counter
 	unclassified *metrics.Counter
 	backoff      *metrics.Counter
 	leaks        *metrics.Counter
@@ -126,6 +127,7 @@ func newObs(r *metrics.Registry, s spec.Spec) (*obs, error) {
 	o.recordsDuplicate = counter(telemetry.MRecordsDuplicate, P, N)
 
 	o.faults = counter(telemetry.MFaults, P, N, telemetry.LabelOp, telemetry.LabelClass, telemetry.LabelBlame)
+	o.clockSkew = counter(telemetry.MClockSkew, P, N, telemetry.LabelOutcome)
 	o.unclassified = counter(telemetry.MUnclassified, P, N)
 	o.backoff = counter(telemetry.MBackoff, P, N, telemetry.LabelClass)
 	o.leaks = counter(telemetry.MLedgerLeaks, P, N)

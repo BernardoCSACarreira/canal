@@ -572,9 +572,10 @@ func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 	lane := assigned[0]
 	alloc := record.NewAllocator(r.p.spec.Tenant, r.p.spec.ID, id, lane.ID, lane.Spec.Stream, 1, 1)
 
-	// Resolved once. It cannot change during a run, and the shed path logs it on a line that can fire
-	// twenty thousand times a second.
+	// Resolved once. Neither can change during a run, and the shed path logs its policy on a line
+	// that can fire twenty thousand times a second.
 	policy := r.whenFullFor(id)
+	clock := r.clockFor(id)
 
 	// readAttempt is RESET after every successful read. Carrying it across successes would make
 	// MaxAttempts a lifetime budget rather than a per-failure one, so a source that hiccuped four
@@ -629,6 +630,15 @@ func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 			continue
 		}
 		readAttempt = attempt{}
+
+		// THE CLOCK CHECK RUNS BEFORE ADMISSION, because that is where a timestamp enters canal and
+		// the only point at which the record is still the source's alone. Once admitted its event
+		// time has already been used by the lane's event-time lag.
+		batch, err = r.applyClock(deliverCtx, clock, batch)
+		if err != nil {
+			r.fail(err)
+			return
+		}
 
 		r.p.obs.recordsRead.Add(float64(batch.Len()), r.p.obs.pipeline, laneLabel(lane.ID), src.Name)
 		if batch.Len() > 0 {
@@ -1011,6 +1021,25 @@ func configuredStreams(s spec.Spec) []connector.ConfiguredStream {
 		})
 	}
 	return out
+}
+
+// controlIntervalFor resolves a source node's control cadence.
+//
+// pkg/registry attaches heartbeat_interval to a source's config form ONLY when it declares
+// Heartbeater, which makes it the most specific statement anyone has made about how often that
+// source wants to be told its lanes are quiet — and yesterday's control goroutine ignored it in
+// favour of the deployment-wide Deps.ControlInterval. Found by the inert-field guard on its first
+// run, in code written the day before.
+func (r *runner) controlIntervalFor(id record.NodeID) time.Duration {
+	cfg := r.p.configs[id]
+	if cfg == nil || !cfg.Has(config.FieldHeartbeatInterval) {
+		return r.deps.ControlInterval
+	}
+	d, err := config.Get[time.Duration](cfg, config.FieldHeartbeatInterval)
+	if err != nil || d <= 0 {
+		return r.deps.ControlInterval
+	}
+	return d
 }
 
 // whenFullFor resolves a source node's admission policy.

@@ -89,6 +89,22 @@ func startConfigFixture(t *testing.T, cfg store.ConfigStore, s spec.Spec,
 	var once sync.Once
 	f.stop = func() {
 		once.Do(func() {
+			// STOPPING WAITS FOR THE OPENS, AND NOT BECAUSE ANY TEST HERE CARES.
+			//
+			// Cancelling while openSources is running trips a race that has nothing to do with the
+			// config watch: sandbox abandons the in-flight Open and leaks its goroutine — its
+			// documented cost — Run returns the abandoned error, and the host then calls Close, which
+			// enters the connector while the abandoned Open is still assigning its fields. Every
+			// connector in the module is exposed; linefile writes s.f in Open and reads it in Close
+			// with nothing between them.
+			//
+			// It reproduces on main with no config store anywhere in the picture, by sweeping a cancel
+			// across the startup window. These tests happen to sit in that window because they cancel
+			// as soon as a config read lands, which is milliseconds in. Waited out here rather than
+			// papered over: the fix belongs in the engine, where Close has to learn that a node with
+			// an abandoned call outstanding cannot be closed.
+			f.awaitStarted(t)
+
 			close(release)
 			cancel()
 			<-f.done
@@ -116,6 +132,21 @@ func (f *configFixture) await(t *testing.T, what string, want func(telemetry.Con
 	}
 	t.Fatalf("spec_applied never became %s; it is %s/%s: %s", what, last.Status, last.Reason, last.Message)
 	return last
+}
+
+// awaitStarted polls until the pipeline is past PhaseStarting, whichever way it went.
+//
+// Bounded, and it does NOT fail on the bound: a pipeline still opening after ten seconds is a
+// different problem, and the test that is on its way out is not the one to report it.
+func (f *configFixture) awaitStarted(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if f.p.Status(telemetry.StatusQuery{}).Phase != telemetry.PhaseStarting {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // awaitPhase polls until the pipeline reaches a phase.
@@ -189,11 +220,14 @@ func TestAStoredRevisionThisWorkerHasNotAppliedIsReportedAsNotApplied(t *testing
 			"not applied; they are two numbers or the condition above cannot mean anything")
 	}
 
-	// AND THE PIPELINE IS STILL RUNNING. The whole control plane could be down and the data path
-	// would be unaffected; a divergent revision is a report, not a stop.
-	if s.Phase != telemetry.PhaseRunning {
-		t.Errorf("phase is %s, want running: a config change nobody applied must not stop anything", s.Phase)
-	}
+	// AND THE PIPELINE STILL RUNS. The whole control plane could be down and the data path would be
+	// unaffected; a divergent revision is a report, not a stop.
+	//
+	// Gated on the phase rather than read off the snapshot above. The config watch starts BEFORE the
+	// opens, so both revisions can be observed while the pipeline is still starting — under load that
+	// is often — and asserting the phase from a snapshot timed by a config transition asserts the
+	// scheduler, not the engine.
+	f.awaitPhase(t, telemetry.PhaseRunning)
 }
 
 // A CONFIG STORE THAT DOES NOT ANSWER IS UNKNOWN, NOT APPLIED. This is the honesty case: reporting

@@ -2,6 +2,7 @@ package ledger
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -61,6 +62,11 @@ type laneState struct {
 	ordering connector.Ordering
 	budget   int
 
+	// whenFull is what admission does when the budget is exhausted. Blocking is the default and the
+	// only one that never loses data; the others SHED, and shedding is a configured, counted and
+	// reported loss rather than a silent one.
+	whenFull connector.WhenFull
+
 	// tracker is non-nil only for a prefix-ordered lane. A discrete lane has no cursor, so there is no
 	// prefix to resolve.
 	tracker *Tracker[record.Position]
@@ -104,7 +110,13 @@ type laneState struct {
 
 	recordsRead      uint64
 	recordsCommitted uint64
-	recordsAbandoned uint64
+	// shed counts records dropped at ADMISSION under a non-blocking when_full.
+	//
+	// Separate from the tracker's abandoned count because a shed never takes a ticket: the batch does
+	// not enter the tracker at all, so the settlement machinery has nothing to count. Stats adds the
+	// two, and canal_records_abandoned_total's reason label is what tells an operator which kind of
+	// loss they are looking at.
+	shed uint64
 }
 
 // Ledger is the per-pipeline settlement graph. One Ledger holds one [Tracker] per prefix-ordered lane
@@ -160,7 +172,7 @@ func New(cfg Config) *Ledger {
 
 // Lane registers a lane. Called by the engine when a source announces one. It is idempotent on the
 // lane id, because Announce is idempotent on the lane name.
-func (l *Ledger) Lane(id record.LaneID, ord connector.Ordering, budget int) error {
+func (l *Ledger) Lane(id record.LaneID, ord connector.Ordering, budget int, whenFull connector.WhenFull) error {
 	if id == "" {
 		return fault.Contract(fault.OpBuffer, fmt.Errorf("ledger: lane id is empty"))
 	}
@@ -176,7 +188,7 @@ func (l *Ledger) Lane(id record.LaneID, ord connector.Ordering, budget int) erro
 		}
 		return nil
 	}
-	st := &laneState{id: id, ordering: ord, budget: budget}
+	st := &laneState{id: id, ordering: ord, budget: budget, whenFull: whenFull}
 
 	// EVERY lane gets a tracker, including a discrete one.
 	//
@@ -288,6 +300,7 @@ func (l *Ledger) Admit(ctx context.Context, b *record.Batch) error {
 		g.node = b.Records[0].Origin().Node
 	}
 	tracker := st.tracker
+	whenFull := st.whenFull
 	l.mu.Unlock()
 
 	if empty {
@@ -310,12 +323,32 @@ func (l *Ledger) Admit(ctx context.Context, b *record.Batch) error {
 	}
 
 	// Track blocks OUTSIDE the ledger's mutex, so a full lane does not stall settlement on another lane.
+	//
+	// WHETHER IT BLOCKS AT ALL IS THE OPERATOR'S CHOICE, and this is the one place that choice is
+	// made. connector.WhenFull offers block, drop_newest, reject and overflow; block is the default
+	// and the only one that never loses data. The other two reachable here SHED: the batch does not
+	// enter the pipeline, its position advances anyway so the source is not asked to re-read what was
+	// deliberately dropped, and the records are counted as abandoned and reported on the next
+	// acknowledgement. A source whose commit is destructive sees the non-zero Ack.Abandoned and may
+	// refuse to advance; the core surfaces the number and never makes that choice for it.
+	//
+	// SHEDDING IS AT BATCH GRANULARITY. Admission is per batch, so the unit that is dropped is a
+	// batch; a partial shed would need per-record admission and would make the position that advances
+	// past it a lie about the records it skipped.
 	var ticket Ticket
 	if tracker != nil {
-		var err error
-		ticket, err = tracker.Track(ctx, pos, weight, refs)
-		if err != nil {
-			return err
+		if sheds(whenFull) {
+			var ok bool
+			ticket, ok = tracker.TryTrack(pos, weight, refs)
+			if !ok {
+				return l.shed(st, tracker, pos, uint64(b.Len()), whenFull)
+			}
+		} else {
+			var err error
+			ticket, err = tracker.Track(ctx, pos, weight, refs)
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -453,7 +486,7 @@ func (l *Ledger) Settle(outs []Outcome) {
 			st.ackRecords += uint64(g.records)
 			st.ackAbandoned += g.abandoned
 			if o.Disposition == Abandoned {
-				st.recordsAbandoned += g.abandoned
+
 			}
 			for node, n := range g.abandonedBy {
 				if st.ackAbandonedBy == nil {
@@ -698,7 +731,8 @@ func (l *Ledger) Stats(lane record.LaneID) LaneStats {
 	}
 	tracker := st.tracker
 	out.Admitted = st.recordsRead
-	out.AbandonedTotal = st.recordsAbandoned
+	shed := st.shed
+	out.AbandonedTotal = shed
 	l.mu.Unlock()
 
 	if tracker != nil {
@@ -706,7 +740,10 @@ func (l *Ledger) Stats(lane record.LaneID) LaneStats {
 		_, settled, abandoned := tracker.Counts()
 		out.InFlight = weight
 		out.Settled = settled
-		out.AbandonedTotal = abandoned
+		// THE TRACKER'S COUNT PLUS WHAT NEVER REACHED IT. A shed batch takes no ticket, so the
+		// tracker cannot see it, and reading only the tracker made every admission-time drop
+		// invisible in the read model and in LaneStats — which is how this was found.
+		out.AbandonedTotal = abandoned + shed
 		out.OldestPendingAge = oldest
 		out.OldestPendingPosition = oldestPos
 	}
@@ -856,4 +893,57 @@ func (l *Ledger) Close() error {
 	l.sending.Wait()
 	close(l.acks)
 	return nil
+}
+
+// ErrShed reports that a batch was deliberately not admitted because the lane was at its budget and
+// the configured connector.WhenFull is not "block".
+//
+// It is an ERROR because the caller must not carry on as if the records were delivered, and a
+// SENTINEL because it is not a failure: the read loop counts it, logs it and keeps reading. Design
+// rule R6 asks for a rejection path that is expressible; this is where it is expressed.
+var ErrShed = errors.New("ledger: the lane is at its in-flight budget and its when_full policy sheds")
+
+// sheds reports whether a policy declines to block.
+//
+// WhenFullOverflow is NOT here: it means "spill to the next buffer in the graph", no buffer node
+// type exists, and treating it as a shed would silently lose data an operator asked to have moved
+// somewhere else. It is refused at Build instead, which is the difference between an unimplemented
+// feature and a wrong one.
+func sheds(w connector.WhenFull) bool {
+	return w == connector.WhenFullDropNewest || w == connector.WhenFullReject
+}
+
+// shed drops a batch, advances past it and counts it.
+//
+// IT TAKES l.mu ITSELF, because Admit has already released it: the tracker call above deliberately
+// happens outside the ledger's lock so a full lane does not stall settlement on another one. An
+// earlier version of this comment claimed the lock was already held and it was not, which the race
+// detector found the first time the suite ran with a shedding lane in it. TrackResolved runs outside
+// the lock too, mirroring the zero-record path, so the ordering is the same on both routes.
+//
+// THE POSITION STILL ADVANCES, and that is the whole point of a shed rather than an oversight. If it
+// did not, the source would re-read exactly the records the operator configured the pipeline to
+// drop, the lane would still be full, and the shed would repeat forever — backpressure with extra
+// steps and a permanently non-advancing cursor. TrackResolved is how a position enters the ordered
+// prefix carrying no references, so it takes its place BEHIND everything still outstanding rather
+// than committing past it.
+func (l *Ledger) shed(st *laneState, tracker *Tracker[record.Position], pos record.Position,
+	n uint64, whenFull connector.WhenFull,
+) error {
+	advanced, moved := tracker.TrackResolved(pos)
+
+	l.mu.Lock()
+	if moved {
+		st.resolved, st.resolvedOK = advanced, true
+		if advanced.Safe {
+			st.pendingFlush, st.pendingFlushOK = advanced, true
+		}
+	}
+	st.recordsRead += n
+	st.shed += n
+	st.ackAbandoned += n
+	st.blocked = false
+	l.mu.Unlock()
+
+	return fmt.Errorf("%w: %d records dropped under %s", ErrShed, n, whenFull)
 }

@@ -24,6 +24,9 @@ type resolved struct {
 	// codecs is the resolved wire format per byte sink, and nil for a structured one. Negotiation
 	// does not read it; Build carries it here so Run does not have to resolve anything.
 	codecs map[record.NodeID]*codecChain
+
+	// configs is each node's validated config, carried for the same reason.
+	configs map[record.NodeID]*config.Config
 }
 
 // negotiate computes the honest delivery tier and every reason for it, and appends a diagnostic for
@@ -44,6 +47,8 @@ func negotiate(s *spec.Spec, res resolved, sc store.StoreCaps, d config.Diagnost
 		Downgrades:     s.Downgrades,
 		DurabilityEdge: "",
 	}
+
+	d = refuseOverflow(s, res, d)
 
 	// ---- the deployment's own stores are part of what is validated -------------------
 	//
@@ -515,4 +520,38 @@ func hasFailedEdge(s *spec.Spec) bool {
 		}
 	}
 	return false
+}
+
+// refuseOverflow rejects a when_full this build cannot honour.
+//
+// OVERFLOW HAS NOWHERE TO OVERFLOW TO. It means "spill to the next buffer in the graph", no buffer
+// node type exists, and the two alternatives are both worse than refusing: honouring it as written
+// is impossible, and treating it as a shed would drop data the operator explicitly asked to have
+// moved somewhere else. This is the same reason engine.Executable refuses a TokenSink rather than
+// quietly settling on Write — an unimplemented feature said out loud beats a wrong one.
+//
+// Checked pipeline-wide AND per node, because the registry offers when_full on every node's config
+// form and a refusal that only looked at one of the two places would be a gate with a hole in it.
+func refuseOverflow(s *spec.Spec, res resolved, d config.Diagnostics) config.Diagnostics {
+	const fix = "set when_full to block, drop_newest or reject"
+	msg := func(where string) string {
+		return where + " sets when_full to overflow, which spills to the next buffer in the graph, " +
+			"and this build has no buffer node type"
+	}
+	if s.WhenFull == connector.WhenFullOverflow {
+		d = append(d, capDiag("", msg("the pipeline"), fix, "connector.Buffer"))
+	}
+	for id, cfg := range res.configs {
+		if cfg == nil || !cfg.Has(config.FieldWhenFull) {
+			continue
+		}
+		raw, err := config.Get[string](cfg, config.FieldWhenFull)
+		if err != nil {
+			continue
+		}
+		if w, ok := connector.ParseWhenFull(raw); ok && w == connector.WhenFullOverflow {
+			d = append(d, capDiag(id, msg("node "+string(id)), fix, "connector.Buffer"))
+		}
+	}
+	return d
 }

@@ -445,6 +445,15 @@ passed the gate and pinned its upstream's retention anyway.
 [`internal/engine/control.go`](internal/engine/control.go) is that goroutine; `Backlog`, `Idle` and
 `EventTimeLag` in the read model come from it.
 
+**`when_full` does something now.** It was offered pipeline-wide *and* on every node's config form,
+and read in neither place: whatever an operator picked, admission blocked. `block` still blocks and
+is still the only policy that never loses data; `drop_newest` and `reject` shed, and a shed is a
+*configured* loss — counted, logged at ERROR, and reported to the source so a destructive-commit
+source can refuse to advance. `overflow` is refused at build, because there is no buffer to overflow
+into. Fixing it turned up two more: `connector.Runtime.Config` returned nil to every connector that
+ever asked, and the ledger's own per-lane abandoned counter was written in two places and read in
+none.
+
 **Next** is what the single-worker label in
 [`internal/engine/runtime.go`](internal/engine/runtime.go) holds open: a `store.Coordinator`, leases
 and real epoch fencing — which is also the assignment refresh, the one part of the control goroutine

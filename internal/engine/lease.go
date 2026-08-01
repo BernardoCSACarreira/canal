@@ -361,6 +361,15 @@ func (r *runner) planAndClaim(ctx context.Context, node record.NodeID, lc *laneC
 		}
 	}
 	r.leases.claim(ctx, r.deps.Log, rows)
+
+	// THE EPOCH REACHES THE LEDGER HERE, and until this line it reached nothing. Ledger.SetEpoch
+	// exists so an emitted acknowledgement carries the lease epoch a lane is held under — it says so
+	// in its own doc — and nothing called it, so every connector.Ack in the system carried epoch 0.
+	// A source using it to tell a current holder's acknowledgement from a fenced one's had a
+	// constant to work with. Found by the unreachable-function guard, which is what it is for.
+	for _, row := range rows {
+		r.p.ledger.SetEpoch(row.ID, r.leases.epochFor(row.ID))
+	}
 }
 
 // laneRevoked records the cost of losing a lane.

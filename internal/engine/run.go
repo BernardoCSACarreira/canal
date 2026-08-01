@@ -487,7 +487,17 @@ func (r *runner) openSources(ctx context.Context) error {
 		whenFull := r.whenFullFor(id)
 		lc := newLaneCtl(r.deps, r.specFields(), id,
 			func(lane record.LaneID, ord connector.Ordering, budget int) error {
-				return r.p.ledger.Lane(lane, ord, budget, whenFull)
+				if err := r.p.ledger.Lane(lane, ord, budget, whenFull); err != nil {
+					return err
+				}
+				// STAMPED WHERE THE LEDGER LEARNS THE LANE, so it happens in BOTH deployment shapes.
+				// Setting it only after a successful claim covered the coordinated one and left every
+				// standalone acknowledgement carrying epoch 0 — which is the only shape cmd/canal
+				// builds, so the defect the unreachable-function guard found would have stayed live
+				// in the shipping binary while the guard read as satisfied. epochFor answers
+				// singleWorkerEpoch here; planAndClaim raises it to the lease's when there is one.
+				r.p.ledger.SetEpoch(lane, r.leases.epochFor(lane))
+				return nil
 			},
 			func(lane record.LaneID) connector.Admission {
 				st := r.p.ledger.Stats(lane)

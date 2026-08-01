@@ -287,10 +287,11 @@ func TestALaneTakenAwayIsNotAcknowledgedAndIsReportedRevoked(t *testing.T) {
 // commitPump left them passing, which is the same defect this repo hunts in production code: a thing
 // that is declared and observed by nothing.
 type leaseSource struct {
-	mu      sync.Mutex
-	commits []record.LaneID
-	epochs  []uint64
-	seq     uint64
+	mu        sync.Mutex
+	commits   []record.LaneID
+	ackEpochs []uint64
+	epochs    []uint64
+	seq       uint64
 }
 
 func (s *leaseSource) Open(ctx context.Context, rt connector.SourceRuntime) error {
@@ -346,8 +347,15 @@ func (s *leaseSource) Read(ctx context.Context, dst *record.Batch) error {
 func (s *leaseSource) Commit(_ context.Context, a connector.Ack) error {
 	s.mu.Lock()
 	s.commits = append(s.commits, a.Lane)
+	s.ackEpochs = append(s.ackEpochs, a.Epoch)
 	s.mu.Unlock()
 	return nil
+}
+
+func (s *leaseSource) ackedEpochs() []uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]uint64(nil), s.ackEpochs...)
 }
 
 func (s *leaseSource) committed() int {
@@ -518,5 +526,64 @@ func TestARevokedLaneIsNotReclaimedByTheSameRun(t *testing.T) {
 	}
 	if rows[0].Worker == "w1" {
 		t.Error("the coordinator shows the lane back on w1")
+	}
+}
+
+// AN ACKNOWLEDGEMENT CARRIES A REAL EPOCH IN BOTH DEPLOYMENT SHAPES.
+//
+// Ledger.SetEpoch exists so an ack carries the lease epoch its lane is held under, and nothing
+// called it: every connector.Ack in the module carried zero. The unreachable-function guard found
+// that, and the first fix for it went in planAndClaim — which returns immediately for a worker with
+// no coordinator, so it left the defect live in the only shape cmd/canal builds while the guard read
+// as satisfied.
+//
+// This asserts the number a source actually receives, in the standalone shape, because that is the
+// one the fix originally missed.
+func TestAnAcknowledgementCarriesTheLanesEpochStandalone(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "input.txt")
+	writeLines(t, path, 2)
+	src := &leaseSource{}
+
+	st, err := wal.Open(filepath.Join(dir, "state"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	defer st.Close()
+
+	spec := pipelineSpec(registerCollector(t, "epoch_sink", &collector{}), path)
+	spec.Graph[0].Name, spec.Graph[0].Config = registerLeaseSource(t, src), map[string]any{}
+	spec.Streams[0].Read = []connector.LaneKind{connector.LaneKindStream}
+
+	p, _, diags := engine.Build(context.Background(), registry.Default, spec,
+		engine.Deps{State: st, Worker: "single", FlushInterval: 5 * time.Millisecond,
+			GracePeriod: time.Second})
+	if diags.HasErrors() {
+		t.Fatalf("Build: %v", diags)
+	}
+	defer p.Close(context.Background())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	done := make(chan error, 1)
+	go func() { done <- p.Run(ctx) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for len(src.ackedEpochs()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	got := src.ackedEpochs()
+	if len(got) == 0 {
+		t.Fatal("the source was never acknowledged, so this test cannot see an epoch at all")
+	}
+	for i, e := range got {
+		if e == 0 {
+			t.Fatalf("acknowledgement %d carried epoch 0.\n"+
+				"  A source using this field to tell a current holder's acknowledgement from a "+
+				"fenced one's has a constant to work with, which is what SetEpoch existed to "+
+				"prevent and what nothing calling it produced", i)
+		}
 	}
 }

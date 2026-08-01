@@ -292,6 +292,30 @@ func TestDeferredHoldsWithoutResending(t *testing.T) {
 	}
 }
 
+// waitForWrite blocks until the sink has been handed at least one record.
+//
+// SLEEPING AT A STARTUP RACE IS NOT SYNCHRONISATION. This test used to sleep 40ms and cancel,
+// which assumes the run is past openSinks, recoverCheckpoint and openSources by then. It is not a
+// safe assumption: those three take runCtx, so a cancellation that lands during any of them makes
+// run return the open error immediately — before the terminal flush, before the drain, before
+// anything. The sink is then genuinely never flushed, and the failure looks exactly like the
+// regression this test is here to catch. It passed for months locally and failed in CI, where the
+// package binaries run alongside each other and 40ms buys less than it looks like it does.
+//
+// Waiting on the sink's own state instead makes the precondition an assertion: cancellation cannot
+// land before the first write, because the cancel does not happen until the first write has.
+func waitForWrite(t *testing.T, f *flusher) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if accepted, _, _ := f.snapshot(); len(accepted) > 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("the run never reached the sink, so cancelling it proves nothing about the drain")
+}
+
 // A cancelled run is DRAINING, not finalising, and a staging sink is right to keep holding an
 // undersized artifact it would seal at end of input.
 func TestACancelledRunFlushesWithDrain(t *testing.T) {
@@ -317,7 +341,7 @@ func TestACancelledRunFlushesWithDrain(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- p.Run(ctx) }()
-	time.Sleep(40 * time.Millisecond)
+	waitForWrite(t, f)
 	cancel()
 	<-done
 

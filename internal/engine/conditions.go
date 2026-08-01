@@ -47,7 +47,7 @@ func (r *runner) progressWindow() time.Duration {
 // Transition times are preserved across calls: a condition whose status and reason are unchanged
 // keeps the moment it last CHANGED, which is the only thing that field can usefully mean. Computing
 // it as "now" would make every scrape look like a transition.
-func (r *runner) conditions(now time.Time, f laneFacts) []telemetry.Condition {
+func (r *runner) conditions(now time.Time, f laneFacts, cfg *configView) []telemetry.Condition {
 	r.status.mu.Lock()
 	defer r.status.mu.Unlock()
 
@@ -59,7 +59,7 @@ func (r *runner) conditions(now time.Time, f laneFacts) []telemetry.Condition {
 	// how a stale condition is identifiable as stale, and the generation this process computed
 	// against is the one it is running.
 	gen := r.p.spec.Revision
-	fresh := r.computeLocked(now, f)
+	fresh := r.computeLocked(now, f, cfg)
 
 	out := make([]telemetry.Condition, 0, len(telemetry.ConditionTypes))
 	for _, t := range telemetry.ConditionTypes {
@@ -77,7 +77,9 @@ func (r *runner) conditions(now time.Time, f laneFacts) []telemetry.Condition {
 }
 
 // computeLocked evaluates every condition. It runs under status.mu.
-func (r *runner) computeLocked(now time.Time, f laneFacts) map[telemetry.ConditionType]telemetry.Condition {
+func (r *runner) computeLocked(now time.Time, f laneFacts,
+	cfg *configView,
+) map[telemetry.ConditionType]telemetry.Condition {
 	cond := func(s telemetry.Status, reason, msg string) telemetry.Condition {
 		return telemetry.Condition{Status: s, Reason: reason, Message: msg}
 	}
@@ -95,7 +97,7 @@ func (r *runner) computeLocked(now time.Time, f laneFacts) map[telemetry.Conditi
 	// from somewhere else: the config watch's last observation of store.ConfigStore. A worker with no
 	// config store still gets true, because the spec it loaded is the only revision in existence —
 	// but it is no longer true by construction, and that is the whole difference. See config.go.
-	out[telemetry.CondSpecApplied] = configCondition(r.deps.Config != nil, r.p.configView(), r.p.spec.Revision)
+	out[telemetry.CondSpecApplied] = configCondition(r.deps.Config != nil, cfg, r.p.spec.Revision)
 
 	switch {
 	case f.total == 0:

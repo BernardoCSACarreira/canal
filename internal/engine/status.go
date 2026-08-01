@@ -95,6 +95,14 @@ type nodeTally struct {
 // [telemetry.PhasePending] rather than an empty document.
 func (p *Pipeline) Status(q telemetry.StatusQuery) telemetry.PipelineStatus {
 	now := time.Now()
+
+	// LOADED ONCE AND THREADED THROUGH, for the same reason refreshGauges and the document are built
+	// from one pass over the lanes: two loads of an atomic that another goroutine is publishing to can
+	// return different observations, and Generation and the spec_applied message are computed from
+	// opposite ends of this function. A document reading "generation 2" beside "revision 1 is stored"
+	// contradicts itself in exactly the field pair the config watch exists to produce.
+	cfg := p.configView()
+
 	s := telemetry.PipelineStatus{
 		Tenant:   p.spec.Tenant,
 		Pipeline: p.spec.ID,
@@ -104,7 +112,7 @@ func (p *Pipeline) Status(q telemetry.StatusQuery) telemetry.PipelineStatus {
 		// worker did not pick itself. A worker with no store.ConfigStore still reports one revision
 		// twice — the spec it loaded is the only one that exists — but it now does so because that is
 		// the answer, not because there was nowhere else to look. See config.go.
-		Generation:         p.configView().generation(p.spec.Revision),
+		Generation:         cfg.generation(p.spec.Revision),
 		ObservedGeneration: p.spec.Revision,
 
 		AsOf:    now,
@@ -124,10 +132,10 @@ func (p *Pipeline) Status(q telemetry.StatusQuery) telemetry.PipelineStatus {
 	r := p.active.Load()
 	if r == nil {
 		s.Phase = telemetry.PhasePending
-		s.Conditions = pendingConditions(now, p)
+		s.Conditions = pendingConditions(now, p, cfg)
 		return s
 	}
-	r.fillStatus(&s, now, q)
+	r.fillStatus(&s, now, q, cfg)
 	return s
 }
 
@@ -136,7 +144,7 @@ func (p *Pipeline) Status(q telemetry.StatusQuery) telemetry.PipelineStatus {
 // Everything the run would establish is UNKNOWN rather than false. "Not connected" is a claim about
 // a connection that was attempted; a pipeline that has not started has attempted nothing, and
 // reporting false would make a never-started pipeline indistinguishable from a broken one.
-func pendingConditions(now time.Time, p *Pipeline) []telemetry.Condition {
+func pendingConditions(now time.Time, p *Pipeline, cfg *configView) []telemetry.Condition {
 	gen := p.spec.Revision
 	out := make([]telemetry.Condition, 0, len(telemetry.ConditionTypes))
 	for _, t := range telemetry.ConditionTypes {
@@ -154,7 +162,7 @@ func pendingConditions(now time.Time, p *Pipeline) []telemetry.Condition {
 		// no config store and unknown for one whose store has not been read yet, which is what keeps
 		// "built and never started" from claiming its config landed on the strength of never looking.
 		case telemetry.CondSpecApplied:
-			applied := configCondition(p.deps.Config != nil, p.configView(), gen)
+			applied := configCondition(p.deps.Config != nil, cfg, gen)
 			c.Status, c.Reason, c.Message = applied.Status, applied.Reason, applied.Message
 		}
 		out = append(out, c)
@@ -163,7 +171,9 @@ func pendingConditions(now time.Time, p *Pipeline) []telemetry.Condition {
 }
 
 // fillStatus completes a document from live runner state.
-func (r *runner) fillStatus(s *telemetry.PipelineStatus, now time.Time, q telemetry.StatusQuery) {
+func (r *runner) fillStatus(s *telemetry.PipelineStatus, now time.Time, q telemetry.StatusQuery,
+	cfg *configView,
+) {
 	r.status.mu.Lock()
 	phase := r.status.phase
 	stopping, deadline := r.status.stoppingSince, r.status.drainDeadline
@@ -197,7 +207,7 @@ func (r *runner) fillStatus(s *telemetry.PipelineStatus, now time.Time, q teleme
 	s.Throughput = r.throughput(now, facts)
 	s.RecentEvents = r.recentEvents()
 	s.LastFault = r.lastFault()
-	s.Conditions = r.conditions(now, facts)
+	s.Conditions = r.conditions(now, facts, cfg)
 }
 
 // maxLanesPerDocument is the DEFAULT page, not a hard cap: a caller that wants more asks for more,

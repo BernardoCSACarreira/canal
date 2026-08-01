@@ -229,7 +229,7 @@ func (r *runner) refreshGauges() {
 	}
 
 	o.reconcile.Set(float64(int64(facts.admitted)-int64(facts.settled)-int64(facts.abandoned)), o.pipeline)
-	r.publishConditions(r.conditions(now, facts))
+	r.publishConditions(r.conditions(now, facts, r.p.configView()))
 }
 
 func (r *runner) fail(err error) {

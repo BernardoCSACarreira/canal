@@ -109,8 +109,7 @@ func configCondition(hasStore bool, v *configView, applied uint64) telemetry.Con
 			Message: fmt.Sprintf("revision %d is running and no config store holds another", applied)}
 
 	case v == nil:
-		return telemetry.Condition{Status: telemetry.StatusUnknown, Reason: telemetry.ReasonStarting,
-			Message: fmt.Sprintf("revision %d is running; the config store has not been read yet", applied)}
+		return unread(applied)
 
 	case v.deleted:
 		return telemetry.Condition{Status: telemetry.StatusFalse, Reason: telemetry.ReasonSpecDeleted,
@@ -128,8 +127,21 @@ func configCondition(hasStore bool, v *configView, applied uint64) telemetry.Con
 			Reason: telemetry.ReasonConfigStoreUnreachable,
 			Message: fmt.Sprintf("revision %d is running; the config store last answered %s: %v",
 				applied, since, v.err)}
+
+	case !v.known:
+		// A VIEW THAT IS NEITHER AN ANSWER NOR A FAILURE HAS OBSERVED NOTHING, and falling through
+		// would compare its zero revision — a confident "revision 0 is stored but 5 is running" from
+		// a value that holds no revision at all. readConfig cannot produce one today; this is here so
+		// that an edit which can is caught by the arm rather than by an operator.
+		return unread(applied)
 	}
 	return specApplied(v.revision, applied)
+}
+
+// unread is the answer for a store nobody has got a revision out of yet.
+func unread(applied uint64) telemetry.Condition {
+	return telemetry.Condition{Status: telemetry.StatusUnknown, Reason: telemetry.ReasonStarting,
+		Message: fmt.Sprintf("revision %d is running; the config store has not been read yet", applied)}
 }
 
 // watchConfig starts the config watch and returns the function that stops it.

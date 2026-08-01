@@ -59,6 +59,18 @@ func TestConfigConditionSeparatesTheFourWaysThereIsNoComparison(t *testing.T) {
 		t.Errorf("the message %q invents an age for a store that has never answered", never.Message)
 	}
 
+	// A VIEW HOLDING NO OBSERVATION AT ALL — neither an answer nor a failure — must not fall through
+	// to the arithmetic, which would compare its zero and report "revision 0 is stored but 5 is
+	// running" from a value that holds no revision. readConfig cannot produce one today; the arm
+	// exists so an edit that can is caught here rather than in front of an operator.
+	empty := configCondition(true, &configView{at: now}, 5)
+	if empty.Status != telemetry.StatusUnknown || empty.Reason != telemetry.ReasonStarting {
+		t.Errorf("a view with no observation is %s/%s: %s\n"+
+			"  want unknown/starting — comparing a revision it does not hold is a confident wrong "+
+			"answer, which is the one thing this condition must never give", empty.Status, empty.Reason,
+			empty.Message)
+	}
+
 	gone := configCondition(true, &configView{deleted: true, at: now}, 5)
 	if gone.Status != telemetry.StatusFalse || gone.Reason != telemetry.ReasonSpecDeleted {
 		t.Errorf("with a withdrawn spec: %s/%s, want false/spec_deleted", gone.Status, gone.Reason)

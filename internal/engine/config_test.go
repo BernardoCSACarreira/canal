@@ -3,6 +3,7 @@ package engine_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -41,7 +42,9 @@ type configFixture struct {
 	stop context.CancelFunc
 }
 
-func startConfigFixture(t *testing.T, cfg store.ConfigStore, s spec.Spec) *configFixture {
+func startConfigFixture(t *testing.T, cfg store.ConfigStore, s spec.Spec,
+	tune ...func(*engine.Deps),
+) *configFixture {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "input.txt")
@@ -62,14 +65,18 @@ func startConfigFixture(t *testing.T, cfg store.ConfigStore, s spec.Spec) *confi
 		t.Fatalf("opening the store: %v", err)
 	}
 
-	p, _, diags := engine.Build(context.Background(), registry.Default, full, engine.Deps{
+	deps := engine.Deps{
 		State: st, Worker: "test", Config: cfg,
 		// Short enough that the reconcile timer alone carries every assertion here, which is what
 		// lets the declined-watch case be tested at all.
 		ConfigInterval: 5 * time.Millisecond,
 		FlushInterval:  5 * time.Millisecond,
 		GracePeriod:    time.Second,
-	})
+	}
+	for _, f := range tune {
+		f(&deps)
+	}
+	p, _, diags := engine.Build(context.Background(), registry.Default, full, deps)
 	if diags.HasErrors() {
 		t.Fatalf("Build: %v", diags)
 	}
@@ -439,7 +446,72 @@ func TestSettingOnlyTheConfigStoreIsEnoughToRun(t *testing.T) {
 	}
 }
 
+// ONE DOCUMENT REPORTS ONE STORED REVISION. Generation and the spec_applied message are computed at
+// opposite ends of Status, and the config watch publishes to the atomic between them — so loading
+// the observation twice yields a document that reads "generation 9" beside "revision 8 is stored",
+// contradicting itself in exactly the field pair this whole feature exists to produce.
+//
+// The store hands back a new revision on every call and the watch runs flat out, so the two loads
+// land on different observations constantly rather than once in a blue moon. Reverting Status to two
+// loads fails this within a few dozen reads.
+func TestOneDocumentReportsOneStoredRevision(t *testing.T) {
+	cfg := &advancingConfig{spec: spec.Spec{Tenant: "acme", ID: "p1"}}
+	f := startConfigFixture(t, cfg, spec.Spec{Tenant: "acme", ID: "p1", Revision: 1},
+		func(d *engine.Deps) { d.ConfigInterval = 100 * time.Microsecond })
+
+	f.await(t, "false", func(c telemetry.Condition) bool { return c.Reason == telemetry.ReasonPending })
+
+	for i := 0; i < 20000; i++ {
+		s := f.p.Status(telemetry.StatusQuery{})
+		c := conditionOf(t, s, telemetry.CondSpecApplied)
+		if c.Reason != telemetry.ReasonPending {
+			continue
+		}
+		var stored, running uint64
+		if n, err := fmt.Sscanf(c.Message, "revision %d is stored but %d is running", &stored, &running); n != 2 {
+			t.Fatalf("the message %q no longer names both revisions (%v); this test reads them out "+
+				"of it, so a reworded message must be reflected here", c.Message, err)
+		}
+		if stored != s.Generation {
+			t.Fatalf("read %d: the document says generation %d and its own spec_applied condition "+
+				"says revision %d is stored.\n  message: %s\n"+
+				"  one document must report one observation of the config store", i, s.Generation, stored, c.Message)
+		}
+		if running != s.ObservedGeneration {
+			t.Fatalf("read %d: the document says observedGeneration %d and the message says %d is running",
+				i, s.ObservedGeneration, running)
+		}
+	}
+	if got := cfg.calls.Load(); got < 100 {
+		t.Errorf("the config store was read %d times; the watch was not publishing fast enough for "+
+			"this test to have raced anything", got)
+	}
+}
+
 // --- store doubles -------------------------------------------------------------------------------
+
+// advancingConfig hands back a different revision on every call, so a document built from two
+// separate loads of the observation is wrong almost every time rather than once in a while.
+type advancingConfig struct {
+	spec  spec.Spec
+	calls atomic.Int64
+}
+
+func (c *advancingConfig) Get(context.Context, record.TenantID, record.PipelineID) (spec.Spec, uint64, error) {
+	// Starts at 2, so it is never equal to the fixture's applied revision of 1 and the condition is
+	// always the false/pending arm this test reads its numbers out of.
+	return c.spec, uint64(c.calls.Add(1)) + 1, nil
+}
+func (c *advancingConfig) List(context.Context, record.TenantID) ([]spec.Summary, error) {
+	return nil, nil
+}
+func (c *advancingConfig) Put(context.Context, spec.Spec, uint64) (uint64, error) { return 0, nil }
+func (c *advancingConfig) Delete(context.Context, record.TenantID, record.PipelineID, uint64) error {
+	return nil
+}
+func (c *advancingConfig) Watch(context.Context, uint64) (<-chan store.ConfigEvent, error) {
+	return nil, errors.New("this store has no watch")
+}
 
 // cancelAwareConfig answers the first Get and then blocks until its context is cancelled, which is
 // the state a config read is in when a running pipeline is stopped mid-poll.

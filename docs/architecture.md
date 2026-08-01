@@ -1618,7 +1618,7 @@ flowchart TD
     OI -->|"IndeterminateDeadLetter"| DLQ
     OI -->|"IndeterminateStall"| STALL
 
-    subgraph NB["engine response — NOT BUILT: Run classifies and reports faults, but retries none of them"]
+    subgraph NB["engine response — internal/engine/retry.go decides, write.go acts"]
         RETRY["retry with backoff<br/>Counted() true — spends an attempt"]
         TH["wait fault.RetryAfterOf(err)<br/>Counted() false — spends NO attempt"]
         DLQ["dead-letter this record<br/>pipeline stays healthy"]
@@ -1635,10 +1635,16 @@ flowchart TD
 
 A connector states only the `Class`, a fact; every branch to the right of it is behaviour the engine
 *computes* from `(class, capabilities, policy)` — the classes are defined in `pkg/fault/class.go` and
-the dispositions in `pkg/fault/retry.go`. Everything inside the boxed region is documented intent
-only. `Pipeline.Run` classifies faults and fails the pipeline on one; it does not retry, dead-letter
-or stall, and no caller of `RetryPolicy.Next` exists anywhere in the module. Routing a fault by this
-tree is the next thing the engine owes.
+the dispositions in `pkg/fault/retry.go`. Everything inside the boxed region runs, in
+`internal/engine/retry.go` — one pure `route(err, idempotent, policy, attempt, now)` whose entire
+output is a disposition, a delay and a reason. `internal/engine/write.go` acts on it: retry
+re-presents the records, dead-letter writes them on the failed edge BEFORE abandoning them, drop
+abandons, stop ends the run, and stall refuses to guess about a write that may have landed.
+
+The one arm narrower than the diagram is STALL, which is specified as blocking one lane while the
+rest of the pipeline keeps running. With one lane per source and no control plane to unblock it,
+that is indistinguishable from stopping, so it stops and says so rather than claiming a granularity
+the engine does not have.
 
 ```go
 // Package fault defines canal's closed error-classification set, the per-record
@@ -1971,8 +1977,8 @@ stateDiagram-v2
       delay = fault.RetryAfterOf(err) when the chain
       carries a hint, otherwise RetryPolicy.Next(attempt),
       which is full-jitter uniform in [0, exponential].
-      NOT BUILT: Run fails the pipeline on a fault rather
-      than retrying it. No caller of RetryPolicy.Next exists.
+      internal/engine/retry.go route() computes this, and
+      internal/engine/write.go waits and re-presents the records.
     end note
 ```
 
@@ -8931,8 +8937,10 @@ Delivered and verifiable today:
 Designed and specified, but **not built** — do not plan around them landing on a date:
 
 - retry with classified faults, the dead-letter route, the metric set, position rendering and scan
-  progress. `Pipeline.Run` classifies a fault and fails on it; nothing retries, dead-letters or
-  stalls, and `noopMetrics` refuses every registration rather than returning a dangling handle.
+  progress. Retry, dead-letter, drop, stop and stall all run now — what is missing is the
+  MEASUREMENT: `noopMetrics` refuses every registration rather than returning a dangling handle, so
+  `canal_faults_total` and `canal_records_abandoned_total` have nowhere to go and every routing
+  decision is visible only in the log.
 - an out-of-process deployment. There is no `engine/remote` package.
 
 Durable resumable progress is no longer on this list: `pkg/store/wal` is a real `store.StateStore`

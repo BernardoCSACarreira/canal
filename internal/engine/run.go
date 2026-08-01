@@ -25,12 +25,16 @@ import (
 //   - TRANSFORMS AND BUFFERS. No component of either kind is registered anywhere in the module, so
 //     there is no node to run. The ledger already models the fan-out they need through Expand.
 //   - MULTI-WORKER COORDINATION. See the note in runtime.go.
+//   - REOPENING A COMPONENT. fault.NotConnected asks for Open to be called again before any further
+//     call. It is routed as an uncounted retry, which is the right WAIT but not the right ACTION:
+//     nothing reopens, so a component that needs it retries until MaxElapsed. Reopening a source
+//     mid-run has to reconcile its lane state, which is why it is not a two-line change.
 //
-// Neither is a hidden gap: each is a component kind with no instances, and the negotiation refuses
-// a pipeline that asks for one.
+// None is a hidden gap: the first two are component kinds with no instances and the negotiation
+// refuses a pipeline that asks for one; the third is labelled here and in route.
 //
-// Codecs used to be on this list. They are resolved now — see codec.go — which is what let the
-// one-encoded-record-per-request fallback become the no-framer case rather than the only case.
+// Codecs used to be on this list, and so did fault routing. Codecs are resolved in codec.go; faults
+// are routed by retry.go and acted on in write.go.
 
 // Run executes the pipeline until ctx is cancelled, the input ends, or a terminal fault occurs.
 func (p *Pipeline) Run(ctx context.Context) error {
@@ -52,6 +56,11 @@ type runner struct {
 	lanes map[record.NodeID]*laneCtl
 	srcRT map[record.NodeID]*sourceRuntime
 
+	// mainSinks and failedSinks are the sink nodes split by what their inbound edges carry, computed
+	// once at start because it is a property of the spec and cannot change during a run.
+	mainSinks   []record.NodeID
+	failedSinks []record.NodeID
+
 	mu       sync.Mutex
 	firstErr error
 }
@@ -67,6 +76,13 @@ func (r *runner) fail(err error) {
 	r.mu.Unlock()
 }
 
+// firstError reports the fault that ended the run, if one has.
+func (r *runner) firstError() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.firstErr
+}
+
 func (r *runner) run(ctx context.Context) error {
 	// The run context is cancelled to stop reading; the shutdown work that follows must NOT inherit
 	// that cancellation, or the final flush is cancelled at exactly the moment it matters most.
@@ -75,6 +91,7 @@ func (r *runner) run(ctx context.Context) error {
 
 	r.lanes = map[record.NodeID]*laneCtl{}
 	r.srcRT = map[record.NodeID]*sourceRuntime{}
+	r.mainSinks, r.failedSinks = partitionSinks(r.p.spec, r.p.sinks)
 
 	// Sinks open before sources. A source that produces before its sink can accept is a batch with
 	// nowhere to go, held against the lane budget for nothing.
@@ -119,9 +136,22 @@ func (r *runner) run(ctx context.Context) error {
 
 	// Drain: settlement continues while the ledger empties. A graceful stop must not discard a
 	// commit that is one millisecond from safe.
-	drainCtx, cancelDrain := context.WithTimeout(context.WithoutCancel(ctx), r.deps.GracePeriod)
-	defer cancelDrain()
-	drainErr := r.p.ledger.Drain(drainCtx)
+	//
+	// A FAILING RUN IS NOT DRAINED, and that is a deliberate exception rather than an oversight. The
+	// records a fault-stop left in flight are held by a write that gave up, so nothing will ever
+	// present them again and the ledger can never empty: draining is then a guaranteed wait of the
+	// whole grace period — thirty seconds by default — for an outcome that is already known. It is
+	// also not free of consequence, so it is logged and the leak is reported below: those records
+	// replay on restart, which at-least-once permits and an operator should be told about.
+	var drainErr error
+	if r.firstError() != nil {
+		r.deps.Log.Warn("the pipeline is stopping on a fault, so it is not draining; in-flight records will replay",
+			"pipeline", r.p.spec.ID)
+	} else {
+		drainCtx, cancelDrain := context.WithTimeout(context.WithoutCancel(ctx), r.deps.GracePeriod)
+		defer cancelDrain()
+		drainErr = r.p.ledger.Drain(drainCtx)
+	}
 
 	// One final flush, so anything that settled during the drain is durable before we stop.
 	r.flushOnce(context.WithoutCancel(ctx))
@@ -266,6 +296,12 @@ func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 	lane := assigned[0]
 	alloc := record.NewAllocator(r.p.spec.Tenant, r.p.spec.ID, id, lane.ID, lane.Spec.Stream, 1, 1)
 
+	// readAttempt is RESET after every successful read. Carrying it across successes would make
+	// MaxAttempts a lifetime budget rather than a per-failure one, so a source that hiccuped four
+	// times over a week would stop on the fourth — a week apart, and correctly reported as
+	// "retries exhausted".
+	var readAttempt attempt
+
 	for {
 		if ctx.Err() != nil {
 			return
@@ -289,9 +325,28 @@ func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 		case errors.Is(err, context.Canceled):
 			return
 		case err != nil:
-			r.fail(fmt.Errorf("engine: source %s read: %w", id, err))
-			return
+			// A READ FAULT CANNOT BE DEAD-LETTERED OR DROPPED: there is no record yet to route, so
+			// the only two answers are wait-and-try-again and stop. Both terminal dispositions and
+			// a stall collapse into stopping this source, which is why the disposition is used
+			// only to decide whether to keep going.
+			if readAttempt.started.IsZero() {
+				readAttempt.started = time.Now()
+			}
+			rt := route(err, false, r.p.spec.Retry, &readAttempt, time.Now())
+			if rt.disp != dispRetry {
+				r.fail(fmt.Errorf("engine: source %s read (%s after %d attempts): %w",
+					id, rt.reason, readAttempt.count, err))
+				return
+			}
+			r.deps.Log.Warn("retrying a read",
+				"node", id, "wait", rt.delay, "attempt", readAttempt.count,
+				"class", fault.ClassOf(err), "error", err)
+			if serr := sleep(ctx, rt.delay); serr != nil {
+				return
+			}
+			continue
 		}
+		readAttempt = attempt{}
 
 		if err := r.p.ledger.Admit(ctx, batch); err != nil {
 			if ctx.Err() != nil {
@@ -329,44 +384,48 @@ type request struct {
 // record is decided by [codecChain.batches], and the rule it encodes — a framer is what makes
 // batching legal — is a correctness constraint, not a tuning knob. See that method for the blob
 // this used to produce without one.
-func buildRequests(ctx context.Context, sk *registry.ResolvedSink, cc *codecChain, batch *record.Batch) ([]request, error) {
+// It takes a record slice rather than the batch, because a retry re-presents a SUBSET: the records
+// a previous attempt failed on, re-encoded from scratch. Encoding is not cached across attempts —
+// an encoder is allowed to be stateful, and reusing bytes it produced for a call that failed would
+// assume otherwise.
+func buildRequests(ctx context.Context, sk *registry.ResolvedSink, cc *codecChain, records []*record.Record) ([]request, error) {
 	if sk.Structured != nil {
 		req := &connector.Request{
-			Count:   batch.Len(),
-			Records: make([]record.Ref, 0, batch.Len()),
-			Rows:    batch.Records,
+			Count:   len(records),
+			Records: make([]record.Ref, 0, len(records)),
+			Rows:    records,
 		}
-		for _, rec := range batch.Records {
+		for _, rec := range records {
 			req.Records = append(req.Records, rec.Ref())
 		}
-		return []request{{req: req, records: batch.Records}}, nil
+		return []request{{req: req, records: records}}, nil
 	}
 
 	if cc.batches() {
 		var body []byte
-		refs := make([]record.Ref, 0, batch.Len())
-		for _, rec := range batch.Records {
+		refs := make([]record.Ref, 0, len(records))
+		for _, rec := range records {
 			var err error
 			if body, err = cc.encode(ctx, body, rec); err != nil {
-				return nil, fault.Permanent(fault.OpEncode, fmt.Errorf("encoding record %v: %w", rec.Origin().ID, err))
+				return nil, fault.Mapping(fault.OpEncode, fmt.Errorf("encoding record %v: %w", rec.Origin().ID, err))
 			}
 			refs = append(refs, rec.Ref())
 		}
 		// The terminator closes the request rather than any single record — a JSON array's "]".
 		// Appended once, after the last frame, exactly as the Framer contract says.
 		body = append(body, cc.framer.Terminator()...)
-		req, err := finish(cc, body, refs, batch.Len())
+		req, err := finish(cc, body, refs, len(records))
 		if err != nil {
 			return nil, err
 		}
-		return []request{{req: req, records: batch.Records}}, nil
+		return []request{{req: req, records: records}}, nil
 	}
 
-	out := make([]request, 0, batch.Len())
-	for _, rec := range batch.Records {
+	out := make([]request, 0, len(records))
+	for _, rec := range records {
 		body, err := cc.encode(ctx, nil, rec)
 		if err != nil {
-			return nil, fault.Permanent(fault.OpEncode, fmt.Errorf("encoding record %v: %w", rec.Origin().ID, err))
+			return nil, fault.Mapping(fault.OpEncode, fmt.Errorf("encoding record %v: %w", rec.Origin().ID, err))
 		}
 		req, err := finish(cc, body, []record.Ref{rec.Ref()}, 1)
 		if err != nil {
@@ -400,31 +459,16 @@ func finish(cc *codecChain, body []byte, refs []record.Ref, count int) (*connect
 	}, nil
 }
 
-// deliver writes one batch to every sink and settles the outcomes.
+// deliver writes one batch to every sink that takes main records and settles the outcomes.
+//
+// Sinks are filtered by EDGE SELECT rather than written to indiscriminately. Before this, every
+// sink in the graph received every batch, which is accidentally right when all edges carry main
+// and silently wrong the moment one carries failed — a dead-letter sink would have received the
+// whole stream.
 func (r *runner) deliver(ctx context.Context, batch *record.Batch) error {
-	for id, sk := range r.p.sinks {
-		reqs, err := buildRequests(ctx, sk, r.p.codecs[id], batch)
-		if err != nil {
-			return fmt.Errorf("engine: encoding for sink %s: %w", id, err)
-		}
-		for _, rq := range reqs {
-			res, err := sandbox(ctx, sk.Name, rq.req,
-				func(c context.Context, q *connector.Request) (connector.WriteResult, error) {
-					return sk.Sink.Write(c, q)
-				})
-			if err != nil {
-				return fmt.Errorf("engine: sink %s write: %w", id, err)
-			}
-
-			// A sink that under-reports is a sink whose success cannot be trusted, and settling on
-			// it would advance the source past records nobody wrote.
-			if ok, want := res.Reconcile(rq.req.Count); !ok {
-				return fault.Contract(fault.OpWrite, fmt.Errorf(
-					"engine: sink %s accounted for %d of %d records; a WriteResult must name every record it did not write",
-					id, want, rq.req.Count))
-			}
-
-			r.p.ledger.Settle(outcomesFor(id, rq.records, res))
+	for _, id := range r.mainSinks {
+		if err := r.writeSet(ctx, id, batch.Records); err != nil {
+			return err
 		}
 	}
 	return nil

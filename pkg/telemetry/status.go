@@ -90,14 +90,22 @@ const (
 	ReasonAbandonedPluginCall   = "abandoned_plugin_call"
 	ReasonReconcileDelta        = "reconcile_delta"
 	ReasonSchemaChangePending   = "schema_change_pending"
-	ReasonDrainTimeout          = "drain_timeout"
-	ReasonDrained               = "drained"
-	ReasonCaughtUp              = "caught_up"
-	ReasonProgressing           = "progressing"
-	ReasonConnected             = "connected"
-	ReasonNotConnected          = "not_connected"
-	ReasonApplied               = "applied"
-	ReasonPending               = "pending"
+	// ReasonRetriesExhausted and ReasonTerminalFault are the two ways a record reaches a terminal
+	// disposition, and they are separate because the operator response differs. Exhausted means the
+	// remote kept failing and MaxAttempts ran out — raise the budget, or fix the remote. Terminal
+	// means retrying could never have helped, because the class says so: a mapping error, a
+	// permanent refusal, a contract violation. Reporting both as "failed" hid which one it was.
+	ReasonRetriesExhausted = "retries_exhausted"
+	ReasonTerminalFault    = "terminal_fault"
+
+	ReasonDrainTimeout = "drain_timeout"
+	ReasonDrained      = "drained"
+	ReasonCaughtUp     = "caught_up"
+	ReasonProgressing  = "progressing"
+	ReasonConnected    = "connected"
+	ReasonNotConnected = "not_connected"
+	ReasonApplied      = "applied"
+	ReasonPending      = "pending"
 )
 
 // Condition is one orthogonal fact about a pipeline.

@@ -37,8 +37,6 @@ import (
 //
 // Removing an entry is how a field graduates. Adding one should feel like a decision.
 var unreadFields = map[string]string{
-	"Deps.Status": "store.StatusStore.Report publishes the read model per worker and Aggregate " +
-		"merges them. With one worker the document is complete by construction.",
 	"spec.Spec.Title": "display only, for a frontend that does not exist. Nothing in the engine " +
 		"should branch on it even when one does.",
 }
@@ -306,12 +304,12 @@ func TestTheInertMatcherWorksInBothDirections(t *testing.T) {
 		t.Error("Deps.GracePeriod is read all over the engine and the matcher did not see it; " +
 			"every result from this file is now suspect")
 	}
-	// The negative pin was Deps.Coordinator until the lease work gave it a reader. Deps.Status is
-	// the remaining one, and it is a better pin for the same reason Coordinator was: .Status is
-	// spelled all over the engine on OTHER receivers — p.Status(), r.status — so a matcher whose
-	// base-expression filter stopped filtering would report it as read.
-	if selected["Status"] {
-		t.Error("Deps.Status has no reader, and the matcher saw one: " +
+	// THE NEGATIVE PIN IS NO LONGER A Deps FIELD, because every Deps field now has a reader — which
+	// is the point of the allowlist emptying out. It is a name instead: Title is selected all over
+	// the module on registry.Meta, and never once off deps or d. A matcher whose base-expression
+	// filter stopped filtering would see those and report it.
+	if selected["Title"] {
+		t.Error("Title reads as selected off deps, and it is only ever selected off registry.Meta: " +
 			"the base-expression filter is not filtering")
 	}
 }

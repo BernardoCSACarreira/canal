@@ -273,6 +273,10 @@ func (r *runner) run(ctx context.Context) error {
 	runCtx, stopReading := context.WithCancel(ctx)
 	defer stopReading()
 
+	// THE LAST WORD, published after everything below has finished and the run has settled on the
+	// phase it ended in. Registered here so it runs last; see reportFinal.
+	defer r.reportFinal(ctx)
+
 	// JOINING BEFORE THE OPENS, for the same reason the config watch starts there: a worker that is
 	// slow to open is still a worker, and a status document that cannot see it during exactly the
 	// window somebody is watching is the document's own failure. Leaving is deferred here so it runs
@@ -344,10 +348,24 @@ func (r *runner) run(ctx context.Context) error {
 	// The lease loop takes ctx rather than runCtx, so leases keep being renewed while the pipeline
 	// drains — a worker that stopped renewing when it stopped reading would have its lanes reassigned
 	// underneath a drain that is still settling records for them.
+	// STOPPED BY A CHANNEL, NOT ONLY BY ctx, exactly as the control and flush loops are.
+	//
+	// Both of these take ctx so they keep working while the pipeline DRAINS — a worker that stopped
+	// renewing or publishing the moment it stopped reading would have its lanes reassigned under a
+	// live drain, and would read as missing in an aggregate rather than as stopping. But ctx belongs
+	// to the caller and a bounded pipeline finishes without it ever being cancelled, so a loop that
+	// exits on ctx alone holds wg.Wait() open until the caller gives up. That is a hang, and it is
+	// how this comment came to be written.
+	bgStop := make(chan struct{})
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		r.leaseLoop(ctx)
+		r.leaseLoop(ctx, bgStop)
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		r.reportLoop(ctx, bgStop)
 	}()
 
 	controlStop := make(chan struct{})
@@ -439,6 +457,7 @@ func (r *runner) run(ctx context.Context) error {
 	// nothing else will ever tell the upstream about.
 	close(controlStop)
 	close(flushStop)
+	close(bgStop)
 	<-flushDone
 	_ = r.p.ledger.Close() // closing the ack channel is what ends the pump
 	<-pumpDone
@@ -590,7 +609,6 @@ const maxReadBatch = 512
 // blocking Read is unsatisfiable: an idle tail source would then never commit. The commit pump is
 // that second goroutine, shared across sources here because nothing in it is per-source.
 func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
-	src := r.p.sources[id]
 	rt := r.sourceRT(id)
 
 	// Delivery does NOT inherit the read context.
@@ -602,8 +620,23 @@ func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 	// 500 with the write for the five-hundredth having already succeeded at the sink.
 	//
 	// The grace period bounds it, so a wedged sink cannot make shutdown hang forever.
-	deliverCtx, cancelDeliver := context.WithTimeout(context.WithoutCancel(ctx), r.deps.GracePeriod)
+	//
+	// THE GRACE PERIOD STARTS WHEN READING STOPS, NOT WHEN IT STARTS. It was a WithTimeout from run
+	// start, which made it a deadline on the WHOLE RUN rather than on the drain: every delivery after
+	// the first GracePeriod failed with "context deadline exceeded", the read loop took that as a
+	// terminal read fault and stopped, and a pipeline configured with a one-second grace died one
+	// second in. It went unnoticed because the default is thirty seconds and no test ran that long
+	// while asserting the pipeline was still alive.
+	deliverCtx, cancelDeliver := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelDeliver()
+
+	// Spelled out over `defer context.AfterFunc(...)()`, which reads as though it defers the
+	// REGISTRATION and in fact defers the unregister. One subtle context expression in this function
+	// has already cost a day.
+	stopGrace := context.AfterFunc(ctx, func() {
+		time.AfterFunc(r.deps.GracePeriod, cancelDeliver)
+	})
+	defer stopGrace()
 
 	assigned, err := rt.lanes.Assigned(ctx)
 	if err != nil {
@@ -615,9 +648,36 @@ func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 		return
 	}
 
+	// ONE LANE PER SOURCE NODE, AND THAT IS THE CONTRACT RATHER THAN AN OVERSIGHT.
+	//
+	// Source.Read says "Read is never called concurrently with itself", so the engine cannot simply
+	// fan out a goroutine per lane — doing that broke the promise every connector in the module is
+	// written against, and the race detector found it inside one run.
+	//
+	// The interface for more than one lane is connector.LaneReader, whose ReadLanes takes a SET of
+	// pre-bound batches on ONE goroutine for exactly this reason. THE ENGINE HAS NEVER CALLED IT: a
+	// source declaring ReadsLanes and announcing thirty scan chunks has twenty-nine read by nobody,
+	// and spec.Parallelism is validated against SourceCaps.MaxLanes at build time and then never
+	// read again. Wiring ReadLanes is the next change; until then this says so out loud instead of
+	// silently dropping the rest.
+	if len(assigned) > 1 {
+		r.deps.Log.Warn("this build reads one lane per source node; the rest are not being read",
+			"node", id, "assigned", len(assigned), "reading", assigned[0].ID,
+			"needs", "connector.LaneReader.ReadLanes, which the engine does not call yet")
+	}
+	r.readLane(ctx, deliverCtx, id, assigned[0])
+
+}
+
+// readLane reads one lane until it ends, is revoked, or the run stops.
+func (r *runner) readLane(ctx, deliverCtx context.Context, id record.NodeID,
+	lane connector.LaneAssignment,
+) {
+	src := r.p.sources[id]
+	rt := r.sourceRT(id)
+
 	// One allocator per lane. It owns record identity: ids, group ids and the origin stamp are the
 	// core's to assign, never the connector's.
-	lane := assigned[0]
 	alloc := record.NewAllocator(r.p.spec.Tenant, r.p.spec.ID, id, lane.ID, lane.Spec.Stream, 1, 1)
 
 	// Resolved once. Neither can change during a run, and the shed path logs its policy on a line
@@ -633,6 +693,17 @@ func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 
 	for {
 		if ctx.Err() != nil {
+			return
+		}
+
+		// A LANE THIS WORKER NO LONGER HOLDS IS NOT READ, which is what makes laneCtl.Revoked mean
+		// something on the CORE's side. Ten places across the stress connector corpus consult it and
+		// the engine consulted it in none: a revoked lane went on being read, and every record it
+		// produced was work for a lane somebody else now owns. The fences on the acknowledgement path
+		// stopped the upstream being advanced; nothing stopped the reading.
+		if rt.lanes.Revoked(lane.ID) {
+			r.deps.Log.Warn("this worker no longer holds the lane it was reading; stopping",
+				"node", id, "lane", lane.ID)
 			return
 		}
 

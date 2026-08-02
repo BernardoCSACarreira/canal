@@ -75,6 +75,16 @@ type Deps struct {
 	// It is the reconcile timer store.ConfigStore.Watch names when it says a watch is a convenience
 	// and never a correctness dependency, so it applies whether or not the store offers one.
 	ConfigInterval time.Duration
+
+	// StatusInterval is how often this worker publishes its read model to store.StatusStore, and it
+	// is a FOURTH cadence because it is the one an aggregator's staleness threshold is a function of:
+	// PipelineStatus.StaleAfterSeconds answers "past what age does a worker's last report stop
+	// counting", and that number is meaningless unless somebody knows how often reports arrive.
+	//
+	// Nothing waits for it and nothing on the data path is affected by it — a report that fails is
+	// dropped rather than retried, because the next one carries a fresher document than the one that
+	// failed.
+	StatusInterval time.Duration
 }
 
 // withDefaults fills the values an operator did not set, and records where each came from so the
@@ -107,6 +117,10 @@ func (d Deps) withDefaults() (Deps, []telemetry.DefaultNote) {
 	if d.ConfigInterval <= 0 {
 		d.ConfigInterval = 30 * time.Second
 		notes = append(notes, telemetry.DefaultNote{Path: []string{"config", "config_interval"}, Value: "30s", From: "core default"})
+	}
+	if d.StatusInterval <= 0 {
+		d.StatusInterval = 5 * time.Second
+		notes = append(notes, telemetry.DefaultNote{Path: []string{"status", "status_interval"}, Value: "5s", From: "core default"})
 	}
 	return d, notes
 }

@@ -70,14 +70,25 @@ func TestThePastIsNeverSkew(t *testing.T) {
 func TestTheBoundaryIsInclusive(t *testing.T) {
 	now := time.Now()
 	r, c := testRunner(spec.ClockPolicy{MaxSkew: time.Minute, Behaviour: spec.ClockClamp})
-	b := skewBatch(t, now, time.Minute, time.Minute+time.Millisecond)
+
+	// THE SECOND OFFSET IS A SECOND, NOT A MILLISECOND, AND THE MARGIN IS THE POINT.
+	//
+	// applyClock takes its own time.Now(), so every microsecond between this line and that one makes
+	// a leading timestamp look LESS skewed. At a millisecond past the boundary, a loaded machine
+	// scheduled the two far enough apart that the record fell back inside tolerance and the test
+	// failed for a reason that had nothing to do with the boundary.
+	//
+	// Nothing is lost: inclusivity is what the FIRST record asserts, exactly at max_skew. This one
+	// is the control that proves clamping happens at all, and >= and > differ only at the boundary
+	// itself.
+	b := skewBatch(t, now, time.Minute, time.Minute+time.Second)
 
 	out, _ := r.applyClock(context.Background(), c, b)
 	if n := len(out.Records[0].Meta.Changes()); n != 0 {
 		t.Errorf("a record exactly at max_skew was clamped; the field is how far it MAY lead")
 	}
 	if n := len(out.Records[1].Meta.Changes()); n != 1 {
-		t.Errorf("a record one millisecond past max_skew was not clamped")
+		t.Errorf("a record past max_skew was not clamped")
 	}
 }
 

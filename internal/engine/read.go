@@ -102,6 +102,14 @@ func (r *runner) readLanes(ctx, deliverCtx context.Context, id record.NodeID,
 	assigned []connector.LaneAssignment,
 ) {
 	src := r.p.sources[id]
+
+	// THE ASSIGNMENT IS READ ONCE AND NOT REVISITED, which is the next gap along and not this one.
+	//
+	// laneCtl.Changes() exists, notify() fires it on every announce and finish, and nothing anywhere
+	// selects on it — so a lane announced after this line is never picked up, whichever interface
+	// the source implements. A lane LOST is handled, because the read loop rechecks Revoked every
+	// pass; a lane GAINED needs the read set to be rebuilt, which needs the groups below to be
+	// rebuilt with it.
 	groups := partitionLanes(assigned, src.ReadConcurrency(r.p.spec.Parallelism))
 
 	r.deps.Log.Info("reading lanes",

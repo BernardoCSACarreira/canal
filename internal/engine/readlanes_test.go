@@ -492,6 +492,183 @@ func TestAPlainSourceReportingNothingTwiceIsAContractFault(t *testing.T) {
 	}
 }
 
+// scriptedSource emits one record per Read until it has emitted n, retires its lane on the last
+// one, and then blocks — so a test can hold every record in flight and drive settlement itself.
+type scriptedSource struct {
+	records int
+
+	mu   sync.Mutex
+	sent int
+	acks []connector.Ack
+}
+
+func (s *scriptedSource) Open(ctx context.Context, rt connector.SourceRuntime) error {
+	as, err := rt.Lanes().Assigned(ctx)
+	if err != nil || len(as) > 0 {
+		return err
+	}
+	_, err = rt.Lanes().AnnounceMany(ctx, []connector.LaneSpec{{
+		Name: "only", Stream: "lines", Kind: connector.LaneKindScan,
+		Ordering: connector.OrderingPrefix, Boundedness: connector.Bounded,
+	}})
+	return err
+}
+
+func (s *scriptedSource) Close(context.Context) error { return nil }
+
+func (s *scriptedSource) Commit(_ context.Context, a connector.Ack) error {
+	s.mu.Lock()
+	s.acks = append(s.acks, a)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *scriptedSource) Read(ctx context.Context, dst *record.Batch) error {
+	s.mu.Lock()
+	if s.sent >= s.records {
+		s.mu.Unlock()
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	s.sent++
+	n := s.sent
+	s.mu.Unlock()
+
+	if r := dst.Add(); r != nil {
+		r.Payload = record.BytesPayload([]byte(fmt.Sprintf("row-%03d", n)))
+	}
+	// ONE BATCH PER RECORD, so each takes its own settlement group and the lane can be partly
+	// settled — which is the state this fixture exists to reach.
+	dst.EndOfLane = n == s.records
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(n))
+	dst.Position = record.Position{
+		Token: record.Blob{Version: 1, Bytes: buf[:]}, Order: buf[:], Safe: true, At: time.Now(),
+	}
+	return nil
+}
+
+func (s *scriptedSource) finishedAcks() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var n int
+	for _, a := range s.acks {
+		if a.LaneFinished {
+			n++
+		}
+	}
+	return n
+}
+
+// A LANE IS NOT ACKNOWLEDGED AS FINISHED WHILE IT STILL HAS RECORDS IN FLIGHT.
+//
+// Ack.LaneFinished says it is "true on the FINAL ack for a finished lane. After it, Commit is not
+// called for the lane again", and a prefix lane's ack reports the RESOLVED prefix — so an ungated
+// flag rides an ack for position one while two through five are still in a sink that has not made
+// them durable. The source is then told the lane is done, four records early, and never told about
+// the rest.
+//
+// It needs a sink whose durability boundary falls mid-lane, which is why this drives the flusher's
+// durableUpTo by hand rather than waiting for a timing accident.
+func TestALaneWithRecordsStillInFlightIsNotAcknowledgedAsFinished(t *testing.T) {
+	dir := t.TempDir()
+	state, err := wal.Open(filepath.Join(dir, "state"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	t.Cleanup(func() { state.Close() })
+
+	src := &scriptedSource{records: 5}
+	name := fmt.Sprintf("scripted_%d", sinkSeq.Add(1))
+	registry.AddSource(registry.Default, registry.SourceDef[*scriptedSource]{
+		Meta: registry.Meta{
+			Name: name, Version: "1.0.0", Title: "Scripted source",
+			Summary: "Emits a fixed number of one-record batches and retires its lane on the last.",
+			Support: registry.SupportCommunity,
+		},
+		Spec: config.NewSpec(),
+		Caps: connector.SourceCaps{
+			Caps:              connector.Caps{APIVersion: connector.APIVersion},
+			DefaultOrdering:   connector.OrderingPrefix,
+			Boundedness:       []connector.Boundedness{connector.Bounded},
+			LaneKinds:         []connector.LaneKind{connector.LaneKindScan},
+			MaxLanes:          1,
+			Replayable:        true,
+			UpstreamRetention: connector.RetentionUnbounded,
+		},
+		New: func(context.Context, *config.Config) (*scriptedSource, error) { return src, nil },
+	})
+
+	// Nothing is durable until the test says so, so all five records pile up in flight and the
+	// EndOfLane batch is admitted while every one of them is unsettled.
+	sink := &flusher{deferAll: true}
+	s := pipelineSpec(registerFlusher(t, "gate_sink", sink), filepath.Join(dir, "unused.txt"))
+	s.Graph[0].Name, s.Graph[0].Config = name, map[string]any{}
+
+	p, _, diags := engine.Build(context.Background(), registry.Default, s, engine.Deps{
+		State: state, Worker: "w1", FlushInterval: 5 * time.Millisecond, GracePeriod: 2 * time.Second,
+	})
+	if diags.HasErrors() {
+		t.Fatalf("Build: %v", diags)
+	}
+	t.Cleanup(func() { p.Close(context.Background()) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	done := make(chan error, 1)
+	go func() { done <- p.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	// Every record accepted by the sink, none durable.
+	waitFor(t, "all five records to reach the sink", func() bool {
+		accepted, _, _ := sink.snapshot()
+		return len(accepted) == 5
+	})
+	if got := src.finishedAcks(); got != 0 {
+		t.Fatalf("%d finished-acknowledgements arrived while nothing is durable; this test "+
+			"isolates nothing", got)
+	}
+
+	// One record becomes durable. The lane's prefix advances to it and an acknowledgement goes
+	// out — carrying four records that are still in the sink.
+	sink.set(func(f *flusher) { f.deferAll, f.durableUpTo = false, 1 })
+	waitFor(t, "the first record to become durable", func() bool {
+		_, durable, _ := sink.snapshot()
+		return len(durable) >= 1
+	})
+	// Given a moment for the acknowledgement that advance produces to be delivered.
+	waitFor(t, "the source to be acknowledged for the settled prefix", func() bool {
+		src.mu.Lock()
+		defer src.mu.Unlock()
+		return len(src.acks) > 0
+	})
+	if got := src.finishedAcks(); got != 0 {
+		_, durable, _ := sink.snapshot()
+		t.Fatalf("the lane was acknowledged as finished with %d of 5 records durable; after that "+
+			"acknowledgement the source is entitled to stop expecting any more", 5-len(durable))
+	}
+
+	// The rest settles. Now — and only now — the lane is finished, exactly once.
+	sink.set(func(f *flusher) { f.durableUpTo = 0 })
+	waitFor(t, "the lane's final acknowledgement", func() bool { return src.finishedAcks() > 0 })
+	if got := src.finishedAcks(); got != 1 {
+		t.Errorf("%d acknowledgements claimed the lane had finished, want exactly 1", got)
+	}
+}
+
+// waitFor polls until cond holds, which keeps every gate in these tests on STATE rather than on a
+// sleep long enough to usually work.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
 // A SOURCE THAT REPORTS NOTHING TWICE RUNNING IS A CONTRACT FAULT.
 //
 // Both Source.Read and LaneReader.ReadLanes say the core raises fault.PermanentContract on the

@@ -32,10 +32,11 @@ import (
 // it, the source stops producing, the run winds down, and the acknowledgement that should have been
 // refused is never generated. There is nothing for a fence to stop.
 //
-// This one holds TWO LANES on one source and revokes only the first. The second keeps producing, so
-// the read loop stays alive and the run stays in PhaseRunning — while the first lane's records, held
-// in a sink that refuses to return for them, settle AFTER it has been revoked. That is the state
-// every one of those rules exists for and none of them had ever been in.
+// This one holds TWO LANES on one source and revokes only the first, so the run stays alive instead
+// of winding down — and both lanes' records are held in the sink across the revocation and settle
+// after it. That is the state every one of those rules exists for and none of them had ever been in.
+//
+// It does not get there yet. See the skip on the test below for exactly where it stops and why.
 
 // twoLaneSource holds two lanes and produces on both, so revoking one leaves the pipeline running.
 type twoLaneSource struct {
@@ -94,8 +95,10 @@ func (s *twoLaneSource) ReadLanes(ctx context.Context, dst []*record.Batch) erro
 		s.seq[b.Lane]++
 		n := s.seq[b.Lane]
 		if r := b.Add(); r != nil {
-			// The payload NAMES ITS LANE, which is how the sink below can hold one lane's records
-			// while letting the other through. A Request carries bytes, not a lane.
+			// The payload names its lane, which was how the sink was meant to hold one lane and pass
+			// the other. That does not work — see holdingSink — but the naming stays: it is what
+			// makes a held batch identifiable when this fixture is finished, and a Request carries
+			// bytes rather than a lane.
 			r.Payload = record.BytesPayload([]byte(fmt.Sprintf("%s-%d", laneTag(b.Lane), n)))
 		}
 		var buf [8]byte
@@ -148,7 +151,12 @@ func laneTag(id record.LaneID) string {
 	return s
 }
 
-// holdingSink parks in Write for records belonging to one lane and accepts everything else.
+// holdingSink parks in Write until it is released.
+//
+// It HOLDS EVERYTHING, and the matcher is a formality kept only because the next version of this
+// fixture will not need it either. Holding one lane selectively was the first design and cannot
+// work: the engine writes serially per sink node, so a blocked write for one lane stalls every other
+// lane behind it — which is the whole reason this test is skipped.
 type holdingSink struct {
 	hold    []byte
 	release chan struct{}

@@ -313,7 +313,7 @@ func (r *runner) leaveCluster(ctx context.Context) {
 // It takes ctx rather than the read context, so leases keep being renewed while the pipeline DRAINS.
 // A worker that stopped renewing the moment it stopped reading would have its lanes reassigned
 // underneath a drain that is still settling records for them.
-func (r *runner) leaseLoop(ctx context.Context) {
+func (r *runner) leaseLoop(ctx context.Context, stop <-chan struct{}) {
 	if !r.leases.coordinated() {
 		return
 	}
@@ -321,6 +321,8 @@ func (r *runner) leaseLoop(ctx context.Context) {
 	defer t.Stop()
 	for {
 		select {
+		case <-stop:
+			return
 		case <-ctx.Done():
 			return
 		case <-t.C:

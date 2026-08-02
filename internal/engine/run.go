@@ -273,6 +273,10 @@ func (r *runner) run(ctx context.Context) error {
 	runCtx, stopReading := context.WithCancel(ctx)
 	defer stopReading()
 
+	// THE LAST WORD, published after everything below has finished and the run has settled on the
+	// phase it ended in. Registered here so it runs last; see reportFinal.
+	defer r.reportFinal(ctx)
+
 	// JOINING BEFORE THE OPENS, for the same reason the config watch starts there: a worker that is
 	// slow to open is still a worker, and a status document that cannot see it during exactly the
 	// window somebody is watching is the document's own failure. Leaving is deferred here so it runs
@@ -344,10 +348,24 @@ func (r *runner) run(ctx context.Context) error {
 	// The lease loop takes ctx rather than runCtx, so leases keep being renewed while the pipeline
 	// drains — a worker that stopped renewing when it stopped reading would have its lanes reassigned
 	// underneath a drain that is still settling records for them.
+	// STOPPED BY A CHANNEL, NOT ONLY BY ctx, exactly as the control and flush loops are.
+	//
+	// Both of these take ctx so they keep working while the pipeline DRAINS — a worker that stopped
+	// renewing or publishing the moment it stopped reading would have its lanes reassigned under a
+	// live drain, and would read as missing in an aggregate rather than as stopping. But ctx belongs
+	// to the caller and a bounded pipeline finishes without it ever being cancelled, so a loop that
+	// exits on ctx alone holds wg.Wait() open until the caller gives up. That is a hang, and it is
+	// how this comment came to be written.
+	bgStop := make(chan struct{})
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		r.leaseLoop(ctx)
+		r.leaseLoop(ctx, bgStop)
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		r.reportLoop(ctx, bgStop)
 	}()
 
 	controlStop := make(chan struct{})
@@ -439,6 +457,7 @@ func (r *runner) run(ctx context.Context) error {
 	// nothing else will ever tell the upstream about.
 	close(controlStop)
 	close(flushStop)
+	close(bgStop)
 	<-flushDone
 	_ = r.p.ledger.Close() // closing the ack channel is what ends the pump
 	<-pumpDone

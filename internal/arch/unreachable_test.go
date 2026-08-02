@@ -56,6 +56,12 @@ var unreachableFuncs = map[string]string{
 	"internal/example/memstore.NewCoordinator": "scaffolding. The in-memory coordinator exists to " +
 		"give the engine's lease tests a real placement protocol to run against; cmd/canal builds " +
 		"the standalone shape, which has no coordinator at all.",
+	"internal/example/memstore.NewStatus": "scaffolding, like NewCoordinator. The in-memory status " +
+		"store exists to give a worker somewhere real to publish its read model; cmd/canal builds " +
+		"the standalone shape, where the document is complete by construction and nothing aggregates.",
+	"internal/example/memstore.Reports": "reads back what a worker published, which is the only " +
+		"observation this store supports until Aggregate exists — and it is the point of the store: " +
+		"a report nothing can read back is a write to /dev/null with extra steps.",
 	"internal/example/memstore.Dropped": "the watch buffer's drop counter, and it is read only by " +
 		"the test that asserts a full watcher loses events rather than blocking a Put. A drop " +
 		"policy nothing can observe is indistinguishable from a delivery guarantee that happens to " +

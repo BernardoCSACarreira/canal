@@ -29,9 +29,9 @@ import (
 // and a source with 32 independent chunk readers are then the same interface at ReadConcurrency 1
 // and 32 respectively, rather than two interfaces.
 //
-// Two further promises the read loop made and did not keep are kept here, because they are the same
-// twenty lines and the multi-lane shape makes both reachable in ordinary operation rather than only
-// under a hostile connector:
+// Three further promises the read loop made and did not keep are kept here, because they are the
+// same twenty lines and the multi-lane shape makes all three reachable in ordinary operation rather
+// than only under a hostile connector:
 //
 //   - record.Batch.EndOfLane, which the engine never read. It is how a source retires ONE lane of
 //     the many it holds — "a single finished lane is signalled by that batch's EndOfLane, not by an
@@ -42,9 +42,15 @@ import (
 //   - The spin rule. Both Source.Read and LaneReader.ReadLanes say the core raises
 //     fault.PermanentContract on the second consecutive empty unpositioned return. Nothing did. See
 //     [spinner].
+//   - "The engine admits what is in the batch BEFORE handling the error", which every error branch
+//     contradicted by returning without looking at the batch — so a source draining on cancellation
+//     exactly as instructed lost its last window. See the admission loop in [runner.readLaneGroup],
+//     and the two things it must not do: touch an ABANDONED call's batches, which the component is
+//     still writing to, and admit a batch with nothing in it, which puts a zero position into a
+//     lane's prefix.
 
-// idsPerLane is how many record ids and group ids one lane may hand out in a run, and
-// maxLanesPerRun is how many lanes may draw a slice of that space.
+// laneIDShift splits the id space into one slice per lane: the ordinal goes in the high bits and a
+// lane counts up through the low ones. maxLanesPerRun is how many slices there are.
 //
 // EVERY ALLOCATOR USED TO START AT 1, AND THE LEDGER KEYS IDS GLOBALLY. l.groups is
 // map[record.GroupID] and l.byRec is map[record.RecordID], and neither carries a lane — so lane A's
@@ -221,7 +227,17 @@ func (r *runner) readLaneGroup(ctx, deliverCtx context.Context, id record.NodeID
 			b := dst[i]
 			// Counted from what the SOURCE produced, before admission filters anything: the question
 			// the spin rule asks is whether the source reported something, not whether it survived.
-			progress = progress || b.Len() > 0 || !b.Position.IsZero() || b.EndOfLane
+			//
+			// A BATCH WITH NOTHING IN IT IS NOT ADMITTED. Here that is the common case rather than an
+			// edge — a source multiplexing thirty lanes fills the two that had data and leaves the
+			// other twenty-eight untouched every single call — and admitting an untouched one would
+			// enter a ZERO position into that lane's prefix tracker, which becomes the lane's
+			// resolved position once the prefix reaches it.
+			said := b.Len() > 0 || !b.Position.IsZero() || b.EndOfLane
+			progress = progress || said
+			if !said {
+				continue
+			}
 			if b.EndOfLane {
 				// MARKED BEFORE THE BATCH IS ADMITTED, so the flag cannot lose a race with the flush
 				// loop: this batch's position is not flushable until it is admitted, and the ledger
@@ -296,14 +312,18 @@ func (r *runner) retireFinished(ctx context.Context, rt *sourceRuntime, live []l
 }
 
 // finishLane retires a lane: durably in the lane table, so a gate that depends on it opens exactly
-// once, and then in the ledger, so the next acknowledgement carries LaneFinished and the source
+// once, and in the ledger, so the lane's final acknowledgement carries LaneFinished and the source
 // learns the retirement became durable rather than inferring it from silence.
 //
-// IT DOES NOT WAIT FOR THE LANE'S ADMITTED GROUPS TO SETTLE, and both Ledger.FinishLane and
-// record.Batch.EndOfLane say the engine should. The gap predates this file — the ErrEndOfInput path
-// has always finished immediately — and closing it needs the ledger to say when a lane's last group
-// settles, which it has no way to report. Every caller goes through here so that when it can, this
-// is the one place that changes.
+// THE WAIT FOR THE LANE'S ADMITTED GROUPS TO SETTLE IS THE LEDGER'S, not this function's. Both
+// Ledger.FinishLane and record.Batch.EndOfLane say the engine must not tell a source its lane has
+// finished while records are still in flight, and the engine cannot see when the last one settles —
+// so the ledger holds the flag until its own in-flight count for the lane reaches zero. Calling
+// this while work is outstanding is therefore correct and is what the EndOfLane path does.
+//
+// The DURABLE half does not wait, and that is a gap this branch does not close: a lane marked
+// finished in the table opens its downstream gate immediately, so a StartAfter tail can begin
+// before the scan it waits behind is fully settled. The ErrEndOfInput path has always done this.
 func (r *runner) finishLane(ctx context.Context, rt *sourceRuntime, lane record.LaneID) {
 	if err := rt.lanes.Finish(context.WithoutCancel(ctx), lane); err != nil {
 		r.fail(err)
@@ -319,9 +339,13 @@ func (r *runner) finishLane(ctx context.Context, rt *sourceRuntime, lane record.
 // LaneReader.ReadLanes state that the core raises fault.PermanentContract on the second consecutive
 // one; nothing did, in either shape, for as long as either contract had existed.
 //
-// THE SECOND AND NOT THE FIRST, because one is legal and ordinary: a source draining on
-// cancellation returns early with nothing to report, and faulting on that would turn every clean
-// shutdown into a contract violation against a source that behaved perfectly.
+// THE SECOND AND NOT THE FIRST, because both contracts say so and because one is ordinary: a poll
+// that timed out inside the source, a multiplexed reader whose one ready lane turned out to hold
+// only filtered rows. Faulting on a single quiet return would make a contract violation out of a
+// source that was merely idle for a moment.
+//
+// Only a read that RETURNED NIL is counted. A source draining on cancellation returns ctx.Err() and
+// never reaches here, which is why shutdown cannot trip this.
 type spinner struct{ consecutive int }
 
 // saw records one read and reports whether the source has now spun twice running.

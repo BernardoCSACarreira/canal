@@ -3,6 +3,7 @@ package engine_test
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -18,6 +19,7 @@ import (
 	"github.com/BernardoCSACarreira/canal/pkg/record"
 	"github.com/BernardoCSACarreira/canal/pkg/registry"
 	"github.com/BernardoCSACarreira/canal/pkg/store/wal"
+	"github.com/BernardoCSACarreira/canal/pkg/telemetry"
 )
 
 // THESE ASSERT THAT RECORDS ARRIVE, not that ReadLanes was called.
@@ -490,6 +492,329 @@ func TestAPlainSourceReportingNothingTwiceIsAContractFault(t *testing.T) {
 	if got := fault.ClassOf(err); got != fault.PermanentContract {
 		t.Errorf("the run failed as %s, want permanent_contract: %v", got, err)
 	}
+}
+
+// A LANE A ReadLanes CALL LEFT UNTOUCHED KEEPS ITS PROGRESS.
+//
+// This is the same rule as the one below and the common case rather than the edge: a source
+// multiplexing thirty lanes fills the two that had data and leaves twenty-eight batches untouched on
+// EVERY call. Admitting those entered a zero position into each quiet lane's prefix tracker, so a
+// lane that had genuinely got to "row 2" reported nothing for as long as it stayed quiet.
+func TestALaneLeftUntouchedByAReadKeepsItsProgress(t *testing.T) {
+	src := &quietingSource{quietAfter: 2}
+	dir := t.TempDir()
+	state, err := wal.Open(filepath.Join(dir, "state"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	t.Cleanup(func() { state.Close() })
+
+	name := fmt.Sprintf("quieting_%d", sinkSeq.Add(1))
+	registry.AddSource(registry.Default, registry.SourceDef[*quietingSource]{
+		Meta: registry.Meta{
+			Name: name, Version: "1.0.0", Title: "Quieting source",
+			Summary: "Two lanes; one goes quiet and is left untouched while the other keeps producing.",
+			Support: registry.SupportCommunity,
+		},
+		Spec: config.NewSpec(),
+		Caps: connector.SourceCaps{
+			Caps:              connector.Caps{APIVersion: connector.APIVersion},
+			DefaultOrdering:   connector.OrderingPrefix,
+			Boundedness:       []connector.Boundedness{connector.Unbounded},
+			LaneKinds:         []connector.LaneKind{connector.LaneKindStream},
+			MaxLanes:          2,
+			ReadsLanes:        true,
+			ReadConcurrency:   1,
+			Replayable:        true,
+			UpstreamRetention: connector.RetentionUnbounded,
+		},
+		New: func(context.Context, *config.Config) (*quietingSource, error) { return src, nil },
+	})
+
+	out := &collector{}
+	s := pipelineSpec(registerCollector(t, "quiet_sink", out), filepath.Join(dir, "unused.txt"))
+	s.Graph[0].Name, s.Graph[0].Config = name, map[string]any{}
+	s.Streams[0].Read = []connector.LaneKind{connector.LaneKindStream}
+
+	p, _, diags := engine.Build(context.Background(), registry.Default, s, engine.Deps{
+		State: state, Worker: "w1", FlushInterval: 5 * time.Millisecond, GracePeriod: time.Second,
+	})
+	if diags.HasErrors() {
+		t.Fatalf("Build: %v", diags)
+	}
+	t.Cleanup(func() { p.Close(context.Background()) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	done := make(chan error, 1)
+	go func() { done <- p.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	resolvedOf := func(tag string) string {
+		for _, l := range p.Status(telemetry.StatusQuery{}).Lanes {
+			if laneTag(l.ID) == tag && l.Resolved != nil {
+				return *l.Resolved
+			}
+		}
+		return ""
+	}
+
+	// Its LAST real position, not merely a real one: the lane legitimately advances while it is
+	// still producing, and comparing against the first would call correct progress a regression.
+	before := fmt.Sprintf("quiet row %d", src.quietAfter)
+	waitFor(t, "the quiet lane to resolve its final position", func() bool {
+		return resolvedOf("quiet") == before
+	})
+
+	// The loud lane goes on producing for a good many more calls, every one of which hands the
+	// source an untouched batch for the quiet lane.
+	waitFor(t, "the loud lane to keep going", func() bool { return src.loudSent() >= 20 })
+
+	select {
+	case err := <-done:
+		t.Fatalf("the run ended early: %v", err)
+	default:
+	}
+
+	if got := resolvedOf("quiet"); got != before {
+		t.Errorf("the quiet lane resolved %q and then reported %q after %d calls left its batch "+
+			"untouched; an untouched batch has nothing to admit", before, got, src.loudSent())
+	}
+}
+
+// quietingSource announces two lanes and stops touching one of them.
+type quietingSource struct {
+	quietAfter int
+
+	mu    sync.Mutex
+	loud  int
+	quiet int
+}
+
+func (s *quietingSource) Open(ctx context.Context, rt connector.SourceRuntime) error {
+	as, err := rt.Lanes().Assigned(ctx)
+	if err != nil || len(as) > 0 {
+		return err
+	}
+	_, err = rt.Lanes().AnnounceMany(ctx, []connector.LaneSpec{
+		{Name: "loud", Stream: "lines", Kind: connector.LaneKindStream,
+			Ordering: connector.OrderingPrefix, Boundedness: connector.Unbounded},
+		{Name: "quiet", Stream: "lines", Kind: connector.LaneKindStream,
+			Ordering: connector.OrderingPrefix, Boundedness: connector.Unbounded},
+	})
+	return err
+}
+
+func (s *quietingSource) Close(context.Context) error                 { return nil }
+func (s *quietingSource) Commit(context.Context, connector.Ack) error { return nil }
+func (s *quietingSource) Read(context.Context, *record.Batch) error {
+	return fault.Internal(fault.OpRead, errors.New("this source declares ReadsLanes"))
+}
+
+func (s *quietingSource) loudSent() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.loud
+}
+
+func (s *quietingSource) ReadLanes(ctx context.Context, dst []*record.Batch) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(time.Millisecond):
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, b := range dst {
+		tag := laneTag(b.Lane)
+		if tag == "quiet" && s.quiet >= s.quietAfter {
+			// LEFT ENTIRELY ALONE: no records, no position, no EndOfLane. Exactly what a
+			// multiplexed source does for every lane that had nothing this call.
+			continue
+		}
+		n := &s.loud
+		if tag == "quiet" {
+			n = &s.quiet
+		}
+		*n++
+		if r := b.Add(); r != nil {
+			r.Payload = record.BytesPayload([]byte(fmt.Sprintf("%s-%03d", tag, *n)))
+		}
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], uint64(*n))
+		b.Position = record.Position{
+			Token: record.Blob{Version: 1, Bytes: buf[:]}, Order: buf[:], Safe: true,
+			At: time.Now(), Label: fmt.Sprintf("%s row %d", tag, *n),
+		}
+	}
+	return nil
+}
+
+// A FAILED READ DOES NOT ERASE THE LANE'S PROGRESS.
+//
+// Admitting the batch before handling the error is right for a batch with something in it and wrong
+// for one with nothing: an empty unpositioned batch still enters a ZERO position into the lane's
+// prefix tracker, and once the prefix reaches it that becomes the lane's resolved position. A source
+// that read a thousand rows and then hit one reconnect reported having got nowhere — once per retry.
+func TestAFailedReadDoesNotEraseTheLanesProgress(t *testing.T) {
+	src := &faultingSource{good: 3}
+	dir := t.TempDir()
+	state, err := wal.Open(filepath.Join(dir, "state"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	t.Cleanup(func() { state.Close() })
+
+	name := fmt.Sprintf("faulting_%d", sinkSeq.Add(1))
+	registry.AddSource(registry.Default, registry.SourceDef[*faultingSource]{
+		Meta: registry.Meta{
+			Name: name, Version: "1.0.0", Title: "Faulting source",
+			Summary: "Reads a few positioned batches and then fails transiently, forever.",
+			Support: registry.SupportCommunity,
+		},
+		Spec: config.NewSpec(),
+		Caps: connector.SourceCaps{
+			Caps:              connector.Caps{APIVersion: connector.APIVersion},
+			DefaultOrdering:   connector.OrderingPrefix,
+			Boundedness:       []connector.Boundedness{connector.Bounded},
+			LaneKinds:         []connector.LaneKind{connector.LaneKindScan},
+			MaxLanes:          1,
+			Replayable:        true,
+			UpstreamRetention: connector.RetentionUnbounded,
+		},
+		New: func(context.Context, *config.Config) (*faultingSource, error) { return src, nil },
+	})
+
+	out := &collector{}
+	s := pipelineSpec(registerCollector(t, "faulting_sink", out), filepath.Join(dir, "unused.txt"))
+	s.Graph[0].Name, s.Graph[0].Config = name, map[string]any{}
+
+	// The DEFAULT policy is four attempts, so the fourth failure stops the run — and this test
+	// samples the lane WHILE the source is failing, which raced that stop and failed under load for
+	// a reason that had nothing to do with the prefix. A wide budget keeps the source failing and
+	// the run alive for as long as the assertion needs.
+	s.Retry.MaxAttempts = 100
+
+	p, _, diags := engine.Build(context.Background(), registry.Default, s, engine.Deps{
+		State: state, Worker: "w1", FlushInterval: 5 * time.Millisecond, GracePeriod: time.Second,
+	})
+	if diags.HasErrors() {
+		t.Fatalf("Build: %v", diags)
+	}
+	t.Cleanup(func() { p.Close(context.Background()) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	done := make(chan error, 1)
+	go func() { done <- p.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	// Its LAST real position, not merely a real one. Sampling as soon as ANY position resolved
+	// caught "row 1" while rows two and three were still settling, and the legitimate advance to
+	// "row 3" then read as a regression — which failed under -race, where the gap is widest.
+	before := fmt.Sprintf("row %d", src.good)
+	waitFor(t, "the lane to resolve its last real position", func() bool {
+		d := p.Status(telemetry.StatusQuery{})
+		return len(d.Lanes) == 1 && d.Lanes[0].Resolved != nil && *d.Lanes[0].Resolved == before
+	})
+
+	// Now let it fail, repeatedly, with nothing in the batch.
+	src.release()
+	waitFor(t, "several failed reads", func() bool { return src.failures() >= 3 })
+
+	// The assertion is about a RUNNING pipeline's reported progress, so a run that ended underneath
+	// it proves nothing either way.
+	select {
+	case err := <-done:
+		t.Fatalf("the run ended while the source was still failing: %v", err)
+	default:
+	}
+
+	d := p.Status(telemetry.StatusQuery{})
+	got := d.Lanes[0].Resolved
+	if got == nil || *got == "" {
+		t.Fatalf("the lane resolved %q and then reported nothing after %d failed reads; a read "+
+			"that produced nothing must not move the prefix\n  lanes=%d id=%s position=%v "+
+			"inflight=%d phase=%s",
+			before, src.failures(), len(d.Lanes), d.Lanes[0].ID, d.Lanes[0].Position,
+			d.Lanes[0].InFlight, d.Phase)
+	}
+	if *got != before {
+		t.Errorf("the lane resolved %q and then reported %q after failing; a failed read moved it",
+			before, *got)
+	}
+}
+
+// faultingSource emits `good` positioned batches, waits to be released, and then fails every read
+// with a transient fault and an untouched batch.
+type faultingSource struct {
+	good int
+
+	mu     sync.Mutex
+	sent   int
+	failed int
+	gate   chan struct{}
+	once   sync.Once
+}
+
+func (s *faultingSource) Open(ctx context.Context, rt connector.SourceRuntime) error {
+	s.gate = make(chan struct{})
+	as, err := rt.Lanes().Assigned(ctx)
+	if err != nil || len(as) > 0 {
+		return err
+	}
+	_, err = rt.Lanes().AnnounceMany(ctx, []connector.LaneSpec{{
+		Name: "only", Stream: "lines", Kind: connector.LaneKindScan,
+		Ordering: connector.OrderingPrefix, Boundedness: connector.Bounded,
+	}})
+	return err
+}
+
+func (s *faultingSource) Close(context.Context) error                 { return nil }
+func (s *faultingSource) Commit(context.Context, connector.Ack) error { return nil }
+
+func (s *faultingSource) release() { s.once.Do(func() { close(s.gate) }) }
+
+func (s *faultingSource) failures() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.failed
+}
+
+func (s *faultingSource) Read(ctx context.Context, dst *record.Batch) error {
+	s.mu.Lock()
+	n := s.sent
+	s.mu.Unlock()
+
+	if n >= s.good {
+		// Held until the test has read the lane's resolved position, so "before" is a real value
+		// rather than whatever the race happened to leave.
+		select {
+		case <-s.gate:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		s.mu.Lock()
+		s.failed++
+		s.mu.Unlock()
+		// The batch is untouched: no records, no position. Exactly what a source hands back when it
+		// could not reach its upstream at all.
+		return fault.Transient(fault.OpRead, errors.New("the upstream is unreachable"))
+	}
+
+	s.mu.Lock()
+	s.sent++
+	n = s.sent
+	s.mu.Unlock()
+
+	if r := dst.Add(); r != nil {
+		r.Payload = record.BytesPayload([]byte(fmt.Sprintf("row-%03d", n)))
+	}
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(n))
+	dst.Position = record.Position{
+		Token: record.Blob{Version: 1, Bytes: buf[:]}, Order: buf[:], Safe: true,
+		At: time.Now(), Label: fmt.Sprintf("row %d", n),
+	}
+	return nil
 }
 
 // scriptedSource emits one record per Read until it has emitted n, retires its lane on the last

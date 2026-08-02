@@ -740,25 +740,34 @@ func (r *runner) readLane(ctx, deliverCtx context.Context, id record.NodeID,
 		//
 		// Counted before admission, because the spin rule asks what the SOURCE reported, not what
 		// survived the clock check.
+		// A BATCH WITH NOTHING IN IT IS NOT ADMITTED, and that matters because of the error path this
+		// now reaches. A read that produced no records, advanced no position and retired no lane has
+		// nothing for the ledger to take; admitting it anyway enters a ZERO position into the lane's
+		// prefix tracker, and once the prefix reaches it that becomes the lane's resolved position —
+		// so a lane that had got to "row 3" reports having got nowhere. A reconnecting source did it
+		// once per retry.
 		progress := batch.Len() > 0 || !batch.Position.IsZero() || batch.EndOfLane
-		if batch.EndOfLane {
-			// Marked before admission for the reason read.go gives: after it, the flush loop may
-			// already have acknowledged this batch's position and there is no later ack to carry
-			// the flag on.
-			r.p.ledger.FinishLane(lane.ID)
-		}
-		if !r.admit(ctx, deliverCtx, id, src.Name, lane.ID, batch, policy, clock) {
-			return
-		}
+		if progress {
+			if batch.EndOfLane {
+				// Marked before admission for the reason read.go gives: after it, the flush loop may
+				// already have acknowledged this batch's position and there is no later ack to carry
+				// the flag on.
+				r.p.ledger.FinishLane(lane.ID)
+			}
+			if !r.admit(ctx, deliverCtx, id, src.Name, lane.ID, batch, policy, clock) {
+				return
+			}
 
-		// A lane its source has retired is finished HERE rather than one round-trip later. linefile
-		// has always emitted a zero-record EndOfLane batch and then returned ErrEndOfInput on the
-		// next call, which hid this: nothing in the engine read the field, so a bounded lane retired
-		// late and an unbounded one — a revoked partition, a dropped stream — never retired at all
-		// and its source never got the LaneFinished ack that says the retirement became durable.
-		if batch.EndOfLane {
-			r.finishLane(ctx, rt, lane.ID)
-			return
+			// A lane its source has retired is finished HERE rather than one round-trip later.
+			// linefile has always emitted a zero-record EndOfLane batch and then returned
+			// ErrEndOfInput on the next call, which hid this: nothing in the engine read the field,
+			// so a bounded lane retired late and an unbounded one — a revoked partition, a dropped
+			// stream — never retired at all, and its source never got the LaneFinished ack that says
+			// the retirement became durable.
+			if batch.EndOfLane {
+				r.finishLane(ctx, rt, lane.ID)
+				return
+			}
 		}
 
 		switch {

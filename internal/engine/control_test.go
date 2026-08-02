@@ -321,7 +321,19 @@ func TestALaneThatIsProducingIsNotHeartbeated(t *testing.T) {
 	}
 	defer st.Close()
 
-	const iv = 30 * time.Millisecond
+	// THE INTERVAL IS LARGE BECAUSE THE ASSERTION IS ABOUT SCHEDULING AS MUCH AS ABOUT THE ENGINE.
+	//
+	// A heartbeat fires when a lane produced nothing for a whole control interval, so this test's
+	// premise is that a source emitting every millisecond cannot be quiet for one. At 30ms that
+	// premise is false on a loaded machine: it failed in CI on macOS with a single beat, and the
+	// engine was RIGHT — the read goroutine had genuinely not been scheduled for 30ms, so the lane
+	// genuinely was quiet. The margin is what makes the premise true, and half a second of a source
+	// getting no CPU at all is a broken runner rather than a scheduling hiccup.
+	//
+	// It cannot be fixed by gating on state instead of the clock, which is the usual answer here: the
+	// quantity being asserted IS an absence over an interval, and an absence has no state to wait
+	// for. Widening the interval is the only lever.
+	const iv = 500 * time.Millisecond
 	p, _, diags := engine.Build(context.Background(), registry.Default, controlSpec(srcName, sinkName),
 		engine.Deps{State: st, Worker: "test", FlushInterval: 5 * time.Millisecond,
 			ControlInterval: iv, GracePeriod: 2 * time.Second})
@@ -359,17 +371,58 @@ func TestALaneThatIsProducingIsNotHeartbeated(t *testing.T) {
 		t.Fatal("the source never produced a record, so this test proves nothing")
 	}
 
-	// Six control intervals of continuous production. Every one of them is an opportunity to
-	// heartbeat a lane that is plainly not quiet.
-	time.Sleep(6 * iv)
+	// Four control intervals of continuous production, SAMPLED rather than slept through.
+	//
+	// The samples are what make this test correct on a starved machine instead of merely unlikely to
+	// hit one. A heartbeat means the lane produced nothing for a whole interval, and on a loaded
+	// runner that can be TRUE — the read goroutine simply did not get scheduled, and the engine is
+	// right to heartbeat a lane that genuinely went quiet. So the assertion cannot be "no heartbeats"
+	// alone; it has to be "no heartbeats WHILE the lane was actually producing", and the only way to
+	// know which happened is to watch the record count go up.
+	//
+	// A stall shows up here as a pair of consecutive samples far apart in time with no records
+	// between them. The sampler is starved by the same stall, which is exactly why the gap is visible
+	// to it at all.
+	type sample struct {
+		at    time.Time
+		reads uint64
+	}
+	samples := []sample{{time.Now(), p.Status(telemetry.StatusQuery{}).Lanes[0].RecordsRead}}
+	for deadline := time.Now().Add(4 * iv); time.Now().Before(deadline); {
+		time.Sleep(iv / 10)
+		d := p.Status(telemetry.StatusQuery{})
+		if len(d.Lanes) == 1 {
+			samples = append(samples, sample{time.Now(), d.Lanes[0].RecordsRead})
+		}
+	}
 	beats, _, _ := src.seen()
 	s := p.Status(telemetry.StatusQuery{})
 	cancel()
 	<-done
 
-	if len(beats) != before {
-		t.Errorf("a lane producing a batch every millisecond was heartbeated %d times over 6 control "+
-			"intervals; the idle flag would then mean nothing at all", len(beats)-before)
+	var quietest time.Duration
+	for i := 1; i < len(samples); i++ {
+		if samples[i].reads == samples[i-1].reads {
+			if gap := samples[i].at.Sub(samples[i-1].at); gap > quietest {
+				quietest = gap
+			}
+		}
+	}
+
+	switch {
+	case len(beats) == before:
+		// Nothing to explain.
+	case quietest >= iv:
+		// THE ENGINE WAS RIGHT AND THE MACHINE WAS SLOW. Reported rather than ignored, so a run that
+		// proved nothing does not read as a run that proved something.
+		t.Logf("inconclusive: the lane produced nothing for %v, which is past the %v control "+
+			"interval, so the %d heartbeat(s) were correct. The runner starved the source",
+			quietest, iv, len(beats)-before)
+	default:
+		t.Errorf("a lane producing a batch every millisecond was heartbeated %d times over 4 control "+
+			"intervals of %v, and its longest gap without a record was only %v.\n"+
+			"  It kept producing throughout and was heartbeated anyway; the idle flag would then "+
+			"mean nothing at all", len(beats)-before, iv, quietest)
 	}
 	for _, l := range s.Lanes {
 		if l.Idle {

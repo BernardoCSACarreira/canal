@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/BernardoCSACarreira/canal/internal/ledger"
@@ -138,6 +139,10 @@ type runner struct {
 	// samples. See status.go. activity is the control loop's, see control.go.
 	status   statusState
 	activity *laneActivity
+
+	// laneOrdinal numbers the lanes this run reads, so each one's allocator stamps ids no other
+	// lane's can collide with. See allocatorFor in read.go, which is where the reason is.
+	laneOrdinal atomic.Uint64
 
 	// mainSinks and failedSinks are the sink nodes split by what their inbound edges carry, computed
 	// once at start because it is a property of the spec and cannot change during a run.
@@ -648,25 +653,26 @@ func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 		return
 	}
 
-	// ONE LANE PER SOURCE NODE, AND THAT IS THE CONTRACT RATHER THAN AN OVERSIGHT.
+	// HOW MANY LANES A SOURCE READS IS THE SOURCE'S OWN DECLARATION, not the engine's choice.
 	//
-	// Source.Read says "Read is never called concurrently with itself", so the engine cannot simply
-	// fan out a goroutine per lane — doing that broke the promise every connector in the module is
-	// written against, and the race detector found it inside one run.
+	// Source.Read is handed ONE batch and a batch is bound to one lane, so a plain source reads one
+	// lane per node and that is its contract rather than a limitation to work around: fanning Read
+	// out over goroutines breaks "Read is never called concurrently with itself", which every
+	// connector in this module is written against, and the race detector found the violation inside
+	// one run of the version that tried.
 	//
-	// The interface for more than one lane is connector.LaneReader, whose ReadLanes takes a SET of
-	// pre-bound batches on ONE goroutine for exactly this reason. THE ENGINE HAS NEVER CALLED IT: a
-	// source declaring ReadsLanes and announcing thirty scan chunks has twenty-nine read by nobody,
-	// and spec.Parallelism is validated against SourceCaps.MaxLanes at build time and then never
-	// read again. Wiring ReadLanes is the next change; until then this says so out loud instead of
-	// silently dropping the rest.
+	// A source with more to read implements connector.LaneReader and says so with
+	// SourceCaps.ReadsLanes. See read.go.
+	if r.p.sources[id].LaneReader != nil {
+		r.readLanes(ctx, deliverCtx, id, assigned)
+		return
+	}
 	if len(assigned) > 1 {
-		r.deps.Log.Warn("this build reads one lane per source node; the rest are not being read",
+		r.deps.Log.Warn("this source reads one lane per node; the rest are not being read",
 			"node", id, "assigned", len(assigned), "reading", assigned[0].ID,
-			"needs", "connector.LaneReader.ReadLanes, which the engine does not call yet")
+			"needs", "connector.LaneReader, which this source does not implement")
 	}
 	r.readLane(ctx, deliverCtx, id, assigned[0])
-
 }
 
 // readLane reads one lane until it ends, is revoked, or the run stops.
@@ -677,8 +683,13 @@ func (r *runner) readLane(ctx, deliverCtx context.Context, id record.NodeID,
 	rt := r.sourceRT(id)
 
 	// One allocator per lane. It owns record identity: ids, group ids and the origin stamp are the
-	// core's to assign, never the connector's.
-	alloc := record.NewAllocator(r.p.spec.Tenant, r.p.spec.ID, id, lane.ID, lane.Spec.Stream, 1, 1)
+	// core's to assign, never the connector's — and its id slice is this lane's alone, which it was
+	// not until allocatorFor existed.
+	alloc, err := r.allocatorFor(id, lane)
+	if err != nil {
+		r.fail(err)
+		return
+	}
 
 	// Resolved once. Neither can change during a run, and the shed path logs its policy on a line
 	// that can fire twenty thousand times a second.
@@ -690,6 +701,7 @@ func (r *runner) readLane(ctx, deliverCtx context.Context, id record.NodeID,
 	// times over a week would stop on the fourth — a week apart, and correctly reported as
 	// "retries exhausted".
 	var readAttempt attempt
+	var idle spinner
 
 	for {
 		if ctx.Err() != nil {
@@ -713,111 +725,62 @@ func (r *runner) readLane(ctx, deliverCtx context.Context, id record.NodeID,
 				return struct{}{}, src.Source.Read(c, b)
 			})
 
+		// An abandoned call's batch is not ours to read; see errAbandoned. The component is still
+		// writing to it.
+		if errors.Is(err, errAbandoned) {
+			return
+		}
+
+		// THE ENGINE ADMITS WHAT IS IN THE BATCH BEFORE HANDLING THE ERROR, which is the promise
+		// Source.Read makes when it tells a source never to discard records it has already produced
+		// on an error path. Cancellation means DRAIN: a source that buffered four records and then
+		// saw its context expire hands over those four AND ctx.Err(), and this loop used to throw
+		// them away because the second value was non-nil. The same went for a source returning its
+		// last records alongside ErrEndOfInput.
+		//
+		// Counted before admission, because the spin rule asks what the SOURCE reported, not what
+		// survived the clock check.
+		progress := batch.Len() > 0 || !batch.Position.IsZero() || batch.EndOfLane
+		if batch.EndOfLane {
+			// Marked before admission for the reason read.go gives: after it, the flush loop may
+			// already have acknowledged this batch's position and there is no later ack to carry
+			// the flag on.
+			r.p.ledger.FinishLane(lane.ID)
+		}
+		if !r.admit(ctx, deliverCtx, id, src.Name, lane.ID, batch, policy, clock) {
+			return
+		}
+
+		// A lane its source has retired is finished HERE rather than one round-trip later. linefile
+		// has always emitted a zero-record EndOfLane batch and then returned ErrEndOfInput on the
+		// next call, which hid this: nothing in the engine read the field, so a bounded lane retired
+		// late and an unbounded one — a revoked partition, a dropped stream — never retired at all
+		// and its source never got the LaneFinished ack that says the retirement became durable.
+		if batch.EndOfLane {
+			r.finishLane(ctx, rt, lane.ID)
+			return
+		}
+
 		switch {
+		case err == nil:
+			readAttempt = attempt{}
+			if idle.saw(progress) {
+				r.fail(fault.Contract(fault.OpRead, fmt.Errorf(
+					"engine: source %s returned from %d consecutive reads of lane %s with no records and no position; Read blocks until it has something to report",
+					id, idle.consecutive, lane.ID)))
+				return
+			}
 		case errors.Is(err, fault.ErrEndOfInput):
 			// A bounded lane is complete. Finishing it is durable, which is what lets a gate that
 			// depends on it open exactly once.
-			if ferr := rt.lanes.Finish(context.WithoutCancel(ctx), lane.ID); ferr != nil {
-				r.fail(ferr)
-			}
-			r.p.ledger.FinishLane(lane.ID)
+			r.finishLane(ctx, rt, lane.ID)
 			return
 		case errors.Is(err, context.Canceled):
 			return
-		case err != nil:
-			// A READ FAULT CANNOT BE DEAD-LETTERED OR DROPPED: there is no record yet to route, so
-			// the only two answers are wait-and-try-again and stop. Both terminal dispositions and
-			// a stall collapse into stopping this source, which is why the disposition is used
-			// only to decide whether to keep going.
-			if readAttempt.started.IsZero() {
-				readAttempt.started = time.Now()
-			}
-			r.p.obs.fault(id, err)
-			rt := route(err, false, r.p.spec.Retry, &readAttempt, time.Now())
-			if rt.disp != dispRetry {
-				r.fail(fmt.Errorf("engine: source %s read (%s after %d attempts): %w",
-					id, rt.reason, readAttempt.count, err))
+		default:
+			if !r.retryRead(ctx, id, err, &readAttempt) {
 				return
 			}
-			r.deps.Log.Warn("retrying a read",
-				"node", id, "wait", rt.delay, "attempt", readAttempt.count,
-				"class", fault.ClassOf(err), "error", err)
-			r.p.obs.waited(id, fault.ClassOf(err), rt.delay)
-			if serr := sleep(ctx, rt.delay); serr != nil {
-				return
-			}
-			continue
-		}
-		readAttempt = attempt{}
-
-		// THE CLOCK CHECK RUNS BEFORE ADMISSION, because that is where a timestamp enters canal and
-		// the only point at which the record is still the source's alone. Once admitted its event
-		// time has already been used by the lane's event-time lag.
-		batch, err = r.applyClock(deliverCtx, clock, batch)
-		if err != nil {
-			r.fail(err)
-			return
-		}
-
-		// A record its own source declared broken is disposed of before admission, for the same
-		// reason: it never takes a settlement reference and the position still advances over it.
-		batch, err = r.routeMarked(deliverCtx, id, batch)
-		if err != nil {
-			r.fail(err)
-			return
-		}
-
-		r.p.obs.recordsRead.Add(float64(batch.Len()), r.p.obs.pipeline, laneLabel(lane.ID), src.Name)
-		if batch.Len() > 0 {
-			// A lane that produced records is not quiet, which ends any idleness the control loop had
-			// reported. A ZERO-RECORD POSITIONED BATCH deliberately does not count: it advances the
-			// cursor without producing, so the lane genuinely has nothing to say and a heartbeat is
-			// exactly what should keep holding its slot.
-			r.activity.saw(lane.ID, time.Now())
-		}
-
-		if err := r.p.ledger.Admit(ctx, batch); err != nil {
-			// A SHED IS NOT A FAILURE, it is the policy working. The lane was at its budget and the
-			// operator configured something other than block, so the batch does not enter the
-			// pipeline, its position advances past it and the source is told on the next
-			// acknowledgement. Reading continues — stopping here would turn a load-shedding policy
-			// into a slightly noisier version of stopping.
-			//
-			// LOUDLY, though. This is the one configured path in the engine that loses data on
-			// purpose, and every record it drops is counted under buffer_full and named in a log
-			// line at ERROR. An operator who chose it should see exactly what it cost.
-			//
-			// COUNTED BEFORE THE CANCELLATION CHECK, deliberately. The ledger has already dropped
-			// these records and advanced past them, so returning first because shutdown happened to
-			// win the race would leave the engine's count short of the ledger's — the one number an
-			// operator has for a configured loss, quietly undercounting at every shutdown.
-			shed := errors.Is(err, ledger.ErrShed)
-			if shed {
-				r.deps.Log.Error("records were dropped because the lane is full and its policy sheds",
-					"node", id, "lane", lane.ID, "records", batch.Len(),
-					"when_full", policy, "budget", r.p.spec.LaneBudget)
-				r.p.obs.recordsAbandoned.Add(float64(batch.Len()), r.p.obs.pipeline,
-					laneLabel(lane.ID), telemetry.ReasonBufferFull)
-			}
-			if ctx.Err() != nil {
-				return
-			}
-			if shed {
-				continue
-			}
-			r.fail(fmt.Errorf("engine: admitting a batch from %s: %w", id, err))
-			return
-		}
-
-		if batch.Len() == 0 {
-			// A positioned batch with no records: the lane advanced without producing. Legal, and
-			// the ledger has already taken the position.
-			continue
-		}
-
-		if err := r.deliver(deliverCtx, batch); err != nil {
-			r.fail(err)
-			return
 		}
 	}
 }

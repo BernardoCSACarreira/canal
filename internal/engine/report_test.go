@@ -10,6 +10,7 @@ import (
 
 	"github.com/BernardoCSACarreira/canal/internal/engine"
 	"github.com/BernardoCSACarreira/canal/internal/example/memstore"
+	"github.com/BernardoCSACarreira/canal/pkg/connector"
 	"github.com/BernardoCSACarreira/canal/pkg/record"
 	"github.com/BernardoCSACarreira/canal/pkg/registry"
 	"github.com/BernardoCSACarreira/canal/pkg/store"
@@ -158,4 +159,67 @@ func (r *refusingStatus) Aggregate(context.Context, record.TenantID, record.Pipe
 	telemetry.StatusQuery,
 ) (telemetry.PipelineStatus, error) {
 	return telemetry.PipelineStatus{}, errors.New("dial tcp 127.0.0.1:5432: connection refused")
+}
+
+// A RUN LONGER THAN ITS GRACE PERIOD KEEPS DELIVERING, and until this branch it did not.
+//
+// The delivery context was built as WithTimeout(WithoutCancel(ctx), GracePeriod) at run START, so
+// the grace period was a deadline on the whole run rather than on the drain: every delivery past it
+// failed with "context deadline exceeded", the read loop took that as a terminal read fault, and the
+// source stopped. A pipeline with a one-second grace died one second in.
+//
+// Nothing caught it because the default is thirty seconds and no test ran that long while asserting
+// the pipeline was still alive. This one runs four grace periods deep and checks records are still
+// arriving at the end — which is the property, rather than the absence of an error.
+func TestAPipelineOutlivesItsGracePeriod(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "input.txt")
+	writeLines(t, path, 2)
+	src := &leaseSource{}
+
+	st, err := wal.Open(filepath.Join(dir, "state"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	defer st.Close()
+
+	const grace = 250 * time.Millisecond
+	spec := pipelineSpec(registerCollector(t, "grace_sink", &collector{}), path)
+	spec.Graph[0].Name, spec.Graph[0].Config = registerLeaseSource(t, src), map[string]any{}
+	spec.Streams[0].Read = []connector.LaneKind{connector.LaneKindStream}
+
+	p, _, diags := engine.Build(context.Background(), registry.Default, spec,
+		engine.Deps{State: st, Worker: "single", FlushInterval: 5 * time.Millisecond,
+			GracePeriod: grace})
+	if diags.HasErrors() {
+		t.Fatalf("Build: %v", diags)
+	}
+	defer p.Close(context.Background())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- p.Run(ctx) }()
+
+	// Gated on the pipeline having lived four grace periods AND still acknowledging, so a run that
+	// quietly died at one grace period cannot pass by having committed a lot before it did.
+	time.Sleep(4 * grace)
+	before := src.committed()
+	deadline := time.Now().Add(10 * time.Second)
+	for src.committed() <= before && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	after := src.committed()
+	cancel()
+	<-done
+
+	if before == 0 {
+		t.Fatal("nothing was acknowledged at all, so this test cannot tell a live pipeline from a dead one")
+	}
+	if after <= before {
+		t.Errorf("the pipeline acknowledged %d records in its first %v and none after.\n"+
+			"  The delivery context's deadline is being measured from the start of the run rather "+
+			"than from the moment reading stops, so the grace period kills the run it was meant to "+
+			"bound the shutdown of", before, 4*grace)
+	}
 }

@@ -629,9 +629,14 @@ func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 	// while asserting the pipeline was still alive.
 	deliverCtx, cancelDeliver := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelDeliver()
-	defer context.AfterFunc(ctx, func() {
+
+	// Spelled out over `defer context.AfterFunc(...)()`, which reads as though it defers the
+	// REGISTRATION and in fact defers the unregister. One subtle context expression in this function
+	// has already cost a day.
+	stopGrace := context.AfterFunc(ctx, func() {
 		time.AfterFunc(r.deps.GracePeriod, cancelDeliver)
-	})()
+	})
+	defer stopGrace()
 
 	assigned, err := rt.lanes.Assigned(ctx)
 	if err != nil {

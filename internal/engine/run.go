@@ -609,7 +609,6 @@ const maxReadBatch = 512
 // blocking Read is unsatisfiable: an idle tail source would then never commit. The commit pump is
 // that second goroutine, shared across sources here because nothing in it is per-source.
 func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
-	src := r.p.sources[id]
 	rt := r.sourceRT(id)
 
 	// Delivery does NOT inherit the read context.
@@ -634,9 +633,39 @@ func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 		return
 	}
 
+	// ONE READER PER ASSIGNED LANE, and until now there was one reader per SOURCE NODE reading
+	// assigned[0] and nothing else.
+	//
+	// Every lane past the first was announced, planned, claimed, registered with the ledger and read
+	// by nobody. A source declaring thirty scan chunks had twenty-nine of them sit there, and
+	// spec.Parallelism — "the maximum number of lanes one worker reads concurrently" — was validated
+	// against SourceCaps.MaxLanes at build time and then never read again.
+	//
+	// A GOROUTINE PER LANE IS THE HONEST SHAPE AND NOT THE FINAL ONE. It is correct for the lane
+	// counts a source announces today and it does not scale to the 10^5 scan chunks the design's own
+	// targets name. The answer to that is connector.LaneReader, whose ReadLanes takes a SET of lanes
+	// on one goroutine for exactly this reason — the engine has never called it, and calling it is
+	// the next change rather than this one.
+	var lanes sync.WaitGroup
+	for _, lane := range assigned {
+		lanes.Add(1)
+		go func(lane connector.LaneAssignment) {
+			defer lanes.Done()
+			r.readLane(ctx, deliverCtx, id, lane)
+		}(lane)
+	}
+	lanes.Wait()
+}
+
+// readLane reads one lane until it ends, is revoked, or the run stops.
+func (r *runner) readLane(ctx, deliverCtx context.Context, id record.NodeID,
+	lane connector.LaneAssignment,
+) {
+	src := r.p.sources[id]
+	rt := r.sourceRT(id)
+
 	// One allocator per lane. It owns record identity: ids, group ids and the origin stamp are the
 	// core's to assign, never the connector's.
-	lane := assigned[0]
 	alloc := record.NewAllocator(r.p.spec.Tenant, r.p.spec.ID, id, lane.ID, lane.Spec.Stream, 1, 1)
 
 	// Resolved once. Neither can change during a run, and the shed path logs its policy on a line
@@ -652,6 +681,17 @@ func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 
 	for {
 		if ctx.Err() != nil {
+			return
+		}
+
+		// A LANE THIS WORKER NO LONGER HOLDS IS NOT READ, which is what makes laneCtl.Revoked mean
+		// something on the CORE's side. Ten places across the stress connector corpus consult it and
+		// the engine consulted it in none: a revoked lane went on being read, and every record it
+		// produced was work for a lane somebody else now owns. The fences on the acknowledgement path
+		// stopped the upstream being advanced; nothing stopped the reading.
+		if rt.lanes.Revoked(lane.ID) {
+			r.deps.Log.Warn("this worker no longer holds the lane it was reading; stopping",
+				"node", id, "lane", lane.ID)
 			return
 		}
 

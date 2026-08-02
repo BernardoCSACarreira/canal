@@ -656,7 +656,7 @@ func (s *quietingSource) ReadLanes(ctx context.Context, dst []*record.Batch) err
 // prefix tracker, and once the prefix reaches it that becomes the lane's resolved position. A source
 // that read a thousand rows and then hit one reconnect reported having got nowhere — once per retry.
 func TestAFailedReadDoesNotEraseTheLanesProgress(t *testing.T) {
-	src := &faultingSource{good: 3}
+	src := &faultingSource{good: 3, gate: make(chan struct{})}
 	dir := t.TempDir()
 	state, err := wal.Open(filepath.Join(dir, "state"))
 	if err != nil {
@@ -751,12 +751,17 @@ type faultingSource struct {
 	mu     sync.Mutex
 	sent   int
 	failed int
-	gate   chan struct{}
 	once   sync.Once
+
+	// gate is built with the fixture, not in Open. Open runs on the engine's goroutine and release
+	// on the test's, so assigning it there was a write to a field another goroutine reads — ordered
+	// in practice only by the long happens-before chain through the pipeline's own locks, which is
+	// luck rather than design and exactly the kind of thing that stops being true when a test above
+	// it changes.
+	gate chan struct{}
 }
 
 func (s *faultingSource) Open(ctx context.Context, rt connector.SourceRuntime) error {
-	s.gate = make(chan struct{})
 	as, err := rt.Lanes().Assigned(ctx)
 	if err != nil || len(as) > 0 {
 		return err

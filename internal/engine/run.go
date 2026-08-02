@@ -620,8 +620,18 @@ func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 	// 500 with the write for the five-hundredth having already succeeded at the sink.
 	//
 	// The grace period bounds it, so a wedged sink cannot make shutdown hang forever.
-	deliverCtx, cancelDeliver := context.WithTimeout(context.WithoutCancel(ctx), r.deps.GracePeriod)
+	//
+	// THE GRACE PERIOD STARTS WHEN READING STOPS, NOT WHEN IT STARTS. It was a WithTimeout from run
+	// start, which made it a deadline on the WHOLE RUN rather than on the drain: every delivery after
+	// the first GracePeriod failed with "context deadline exceeded", the read loop took that as a
+	// terminal read fault and stopped, and a pipeline configured with a one-second grace died one
+	// second in. It went unnoticed because the default is thirty seconds and no test ran that long
+	// while asserting the pipeline was still alive.
+	deliverCtx, cancelDeliver := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelDeliver()
+	defer context.AfterFunc(ctx, func() {
+		time.AfterFunc(r.deps.GracePeriod, cancelDeliver)
+	})()
 
 	assigned, err := rt.lanes.Assigned(ctx)
 	if err != nil {
@@ -633,28 +643,25 @@ func (r *runner) readLoop(ctx context.Context, id record.NodeID) {
 		return
 	}
 
-	// ONE READER PER ASSIGNED LANE, and until now there was one reader per SOURCE NODE reading
-	// assigned[0] and nothing else.
+	// ONE LANE PER SOURCE NODE, AND THAT IS THE CONTRACT RATHER THAN AN OVERSIGHT.
 	//
-	// Every lane past the first was announced, planned, claimed, registered with the ledger and read
-	// by nobody. A source declaring thirty scan chunks had twenty-nine of them sit there, and
-	// spec.Parallelism — "the maximum number of lanes one worker reads concurrently" — was validated
-	// against SourceCaps.MaxLanes at build time and then never read again.
+	// Source.Read says "Read is never called concurrently with itself", so the engine cannot simply
+	// fan out a goroutine per lane — doing that broke the promise every connector in the module is
+	// written against, and the race detector found it inside one run.
 	//
-	// A GOROUTINE PER LANE IS THE HONEST SHAPE AND NOT THE FINAL ONE. It is correct for the lane
-	// counts a source announces today and it does not scale to the 10^5 scan chunks the design's own
-	// targets name. The answer to that is connector.LaneReader, whose ReadLanes takes a SET of lanes
-	// on one goroutine for exactly this reason — the engine has never called it, and calling it is
-	// the next change rather than this one.
-	var lanes sync.WaitGroup
-	for _, lane := range assigned {
-		lanes.Add(1)
-		go func(lane connector.LaneAssignment) {
-			defer lanes.Done()
-			r.readLane(ctx, deliverCtx, id, lane)
-		}(lane)
+	// The interface for more than one lane is connector.LaneReader, whose ReadLanes takes a SET of
+	// pre-bound batches on ONE goroutine for exactly this reason. THE ENGINE HAS NEVER CALLED IT: a
+	// source declaring ReadsLanes and announcing thirty scan chunks has twenty-nine read by nobody,
+	// and spec.Parallelism is validated against SourceCaps.MaxLanes at build time and then never
+	// read again. Wiring ReadLanes is the next change; until then this says so out loud instead of
+	// silently dropping the rest.
+	if len(assigned) > 1 {
+		r.deps.Log.Warn("this build reads one lane per source node; the rest are not being read",
+			"node", id, "assigned", len(assigned), "reading", assigned[0].ID,
+			"needs", "connector.LaneReader.ReadLanes, which the engine does not call yet")
 	}
-	lanes.Wait()
+	r.readLane(ctx, deliverCtx, id, assigned[0])
+
 }
 
 // readLane reads one lane until it ends, is revoked, or the run stops.

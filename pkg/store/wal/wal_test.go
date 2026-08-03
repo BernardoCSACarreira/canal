@@ -469,13 +469,39 @@ func TestOpenRejectsAForeignFile(t *testing.T) {
 	}
 }
 
+// REFUSING AN OLDER FORMAT IS THE UNTESTED HALF, and it is the expensive one.
+//
+// Refusing a NEWER frame protects the file: a positional format gives a reader no way to skip a field
+// it cannot parse, so reinterpreting one is worse than stopping. Refusing an OLDER frame protects
+// nothing — this binary understands every version below its own by construction — and it is what makes
+// a format bump strand every log already on disk, because there is no version a new binary will read.
+//
+// Pinned so the behaviour is stated rather than incidental. If the policy is ever decided the other way,
+// this test is the thing that has to change, which is where the decision belongs.
+func TestOpenRejectsAnOlderFormat(t *testing.T) {
+	dir := t.TempDir()
+	hdr := append([]byte(magic), 0x00, 0x00) // version 0, below anything this binary writes
+	if err := os.WriteFile(filepath.Join(dir, logName), hdr, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(dir); err == nil {
+		t.Fatal("Open accepted a format version older than its own.\n" +
+			"  That may well be the better policy — but it is not the current one, and a change to it " +
+			"is a compatibility decision that needs writing down rather than discovering")
+	}
+}
+
 func TestOpenRejectsANewerFormat(t *testing.T) {
 	dir := t.TempDir()
 	hdr := append([]byte(magic), 0x00, 0xFF) // version 255
 	if err := os.WriteFile(filepath.Join(dir, logName), hdr, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// ADR 0020: an older binary must refuse a newer format rather than reinterpret it.
+	// NOT ADR 0020, which decides the opposite for the artifacts it governs: rule 3 is "NEVER reject
+	// state whose version is greater than the current one". This log is not one of those artifacts, and
+	// it refuses a newer frame because a POSITIONAL binary format offers no way to ignore a field a
+	// reader cannot parse — see the note in Open. Pinned because it is the behaviour, not because an ADR
+	// requires it.
 	if _, err := Open(dir); err == nil {
 		t.Fatal("Open accepted a format version it does not understand")
 	}

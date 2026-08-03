@@ -163,8 +163,28 @@ func (s *StateStore) replay() error {
 		return fmt.Errorf("wal: %s does not begin with the canal magic; refusing to touch it", path)
 	}
 	if v := uint16(hdr[len(magic)])<<8 | uint16(hdr[len(magic)+1]); v != formatVersion {
-		// ADR 0020: refuse rather than guess. A store written by a newer binary is not something an
-		// older one may reinterpret.
+		// THIS LOG REFUSES ANY VERSION BUT ITS OWN, in both directions, and ADR 0020 is NOT the authority
+		// for that however often this comment used to say so.
+		//
+		// 0020 governs two artifacts and names them: canal's Checkpoint envelope and every
+		// connector-authored record.Blob inside it. Not this log. And for the artifacts it does govern it
+		// decides the OPPOSITE of the line below — rule 3 is "NEVER reject state whose version is greater
+		// than the current one", and "rejecting a newer version" is listed under Alternatives rejected,
+		// because it makes every rollback a data migration.
+		//
+		// WHY THE MECHANISM DOES NOT TRANSFER, which is the real reason and was never written down. 0020's
+		// additive-only rule works because its envelope is JSON: a reader ignores a key it does not know,
+		// which is what makes an unknown field cost one cursor's progress instead of the file. A frame here
+		// is POSITIONAL — op, count, then key/value/version/epoch in order — so a reader that meets a field
+		// it cannot parse cannot skip it either, and every byte after it is garbage it would apply as a
+		// redo record. There is no "ignore and report" available at this layer.
+		//
+		// So refusing is defensible on its own merits and is not 0020's rule. UNDECIDED, and labelled
+		// rather than implied: no ADR states this policy, so nothing distinguishes a deliberate choice from
+		// an accident, and the cost is real — a format bump strands every existing log, with no migration
+		// path because refusing an OLDER version rules one out. The two ways forward are a self-describing
+		// frame that can skip what it does not know, or an ADR that says strictness is the price of a redo
+		// log and a bump is an operational migration.
 		return fmt.Errorf("wal: %s is format version %d, this binary writes %d", path, v, formatVersion)
 	}
 

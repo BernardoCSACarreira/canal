@@ -108,9 +108,11 @@ type Header struct {
 	// rejects the whole batch if any key's epoch is stale, so a worker that has lost a lane cannot
 	// land the checkpoint either.
 	//
-	// STILL TO DO: nothing reads this, and the per-lane epochs it was standing in for are not durable
-	// anywhere. LaneState is where they belong — an additive field, which the format contract allows —
-	// and that is a checkpoint-format change rather than part of wiring the fence.
+	// STILL NOTHING READS IT, and the per-lane epochs it was standing in for now live where they
+	// belong: LaneState.CursorEpoch, stamped from the number that fenced each cursor's write. This
+	// field stays because removing it from a persisted envelope loses nothing and gains nothing, and
+	// because an operator reading a checkpoint by hand is better served by "the batch default was 1"
+	// than by a gap where a field used to be.
 	Epoch  uint64 `json:"epoch"`
 	Worker string `json:"worker"`
 
@@ -137,6 +139,14 @@ type Header struct {
 type LaneState struct {
 	Spec   record.Blob     `json:"spec"`
 	Cursor record.Position `json:"cursor"`
+
+	// CursorEpoch is the lease epoch Cursor was written under. See laneRecord.CursorEpoch, which is
+	// where it is stamped; this carries the same number into the envelope so one atomic record holds a
+	// committable, the span it covers, and the lease that produced that span.
+	//
+	// It is what Header.Epoch looked like and was not. Zero means no lease was claimed for the lane,
+	// which is also what a row written before this field existed decodes to.
+	CursorEpoch uint64 `json:"cursor_epoch,omitempty"`
 
 	Group record.LaneGroup   `json:"group,omitempty"`
 	After []record.LaneGroup `json:"after,omitempty"`

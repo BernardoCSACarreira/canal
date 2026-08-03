@@ -67,6 +67,24 @@ type laneRecord struct {
 	Spec   connector.LaneSpec `json:"spec"`
 	Cursor record.Position    `json:"cursor"`
 
+	// CursorEpoch is the lease epoch under which Cursor was written, and it is the ONLY place the
+	// per-lane epochs are durable.
+	//
+	// Every durable write on a lane's behalf carries that lane's own lease epoch, and the store
+	// refuses one below the highest it has seen for the key — but nothing recorded WHICH epoch, so a
+	// restart read back a set of cursors with no way to say who produced them. Checkpoint.Header.Epoch
+	// looked like that record and was not: it is the batch's default, written and read by nobody, and
+	// standing in for a number that does not exist per lane.
+	//
+	// It is the STAGING epoch rather than whatever the worker happens to hold when a checkpoint is
+	// taken, because those differ. A flush persists cursors for the lanes that advanced; every other
+	// lane's row keeps a cursor some earlier lease wrote, and stamping all of them with the current
+	// epoch would attribute old progress to a lease that never saw it.
+	//
+	// Additive, which the format contract permits: a row written by an older build decodes with zero
+	// here, and zero already means "no lease is claimed for this" everywhere else in the module.
+	CursorEpoch uint64 `json:"cursor_epoch,omitempty"`
+
 	Finished   bool      `json:"finished,omitempty"`
 	FinishedAt time.Time `json:"finished_at,omitempty"`
 }
@@ -528,6 +546,9 @@ func (l *laneCtl) stage(batch *store.Batch, positions map[record.LaneID]record.P
 
 		next := *rec
 		next.Cursor = pos
+		// Stamped from the SAME number that fences the write below, so the row cannot disagree with
+		// the epoch the store accepted it under.
+		next.CursorEpoch = epoch
 		body, err := json.Marshal(&next)
 		if err != nil {
 			l.mu.Unlock()

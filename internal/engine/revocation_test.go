@@ -381,6 +381,25 @@ func TestRecordsSettlingAfterARevocationNeverReachTheUpstream(t *testing.T) {
 		t.Fatalf("the other worker could not take lane a: %v", claimErr)
 	}
 
+	// THE POSITIVE CONTROL IS CHECKED HERE, WHILE IT IS STILL CHEAP TO EXPLAIN.
+	//
+	// The clock is forward for the duration of one Claim, and the engine's lease goroutine reads it
+	// on every renew — so a renew landing inside that window sees both leases lapsed and this worker
+	// loses lane b as well. It is a narrow window against a ten-second renew interval, but the whole
+	// test rests on lane b surviving, and without this the symptom is "lane b was acknowledged 0
+	// times" thirty seconds later, which reads as a broken fence rather than a lost control.
+	//
+	// EXPIRY IS THE DISCRIMINATOR, NOT Worker, which store.Assignment says in its own doc and which
+	// the first version of this check got wrong: a lapsed row goes on naming whoever held it last,
+	// because that identity is what the reassignment delay reserves it for. Comparing Worker alone
+	// reports "still ours" for precisely the lane that was just lost.
+	b := f.assignmentOf(t, "b")
+	if lease := (store.Lease{Expires: b.LeaseExpires}); b.Worker != "w1" || !lease.Valid(f.clock()) {
+		t.Fatalf("lane b is not held by this worker any more (worker=%q expires=%v now=%v): the "+
+			"clock window was hit and the positive control is gone, so a green run proves nothing",
+			b.Worker, b.LeaseExpires, f.clock())
+	}
+
 	revoked := time.Now().Add(2*store.DefaultRenewInterval + 10*time.Second)
 	var seen bool
 	for time.Now().Before(revoked) && !seen {

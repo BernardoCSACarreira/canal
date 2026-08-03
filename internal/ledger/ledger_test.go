@@ -410,6 +410,14 @@ func TestARevokedLaneIsNeitherFlushedNorAcknowledged(t *testing.T) {
 	// Re-admit and re-settle, because Flushable consumed the pending position above.
 	pos2 := record.Position{Order: []byte{2}, Token: record.Blob{Version: 1, Bytes: []byte{2}}, Safe: true}
 	b2 := batchAt(t, "lane-1", pos2, 4)
+
+	// batchAt builds a FRESH allocator seeded at group 1 and record id 1, so this batch would
+	// otherwise be group 1 with records 1-4 — the same identity the first batch had. It passes
+	// either way today, because settling the first batch removed it from l.groups and its records
+	// from l.byRec before this one is admitted. That is a property of the ORDER of this test rather
+	// than of anything the ledger promises, and the engine's own allocators had exactly this
+	// collision until allocatorFor started seeding them apart. Distinct here on purpose, so a later
+	// edit that admits both at once fails on the assertion rather than on a duplicate group.
 	b2.SetGroup(record.GroupID(99))
 	if err := l.Admit(context.Background(), b2); err != nil {
 		t.Fatalf("Admit: %v", err)

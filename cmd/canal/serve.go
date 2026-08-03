@@ -138,6 +138,7 @@ func observabilityMux(reg *metrics.Registry, src *statusSource, log *slog.Logger
 //	?stream=orders   only that stream's lanes
 //	?limit=50        page size; 0 asks for none, which is what a health banner wants
 //	?cursor=<opaque> continue from a previous response's lanesCursor
+//	?config=1        include the redacted config tree, which is otherwise absent
 //
 // A BAD PARAMETER IS A 400, never a silent default. "limit=fifty" quietly becoming the default page
 // is how an operator concludes the endpoint ignores them.
@@ -145,6 +146,18 @@ func parseStatusQuery(v url.Values) (telemetry.StatusQuery, error) {
 	q := telemetry.StatusQuery{
 		Stream:     record.StreamName(v.Get("stream")),
 		LaneCursor: v.Get("cursor"),
+	}
+	// A PARAMETER THAT MEANS ONE THING. Accepting only 1 and 0 rather than every spelling of truth is
+	// the same refusal as limit's: "config=yes" quietly reading as false is how an operator concludes
+	// the endpoint ignores them, and there is no reading of the word that this endpoint should guess at.
+	if raw := v.Get("config"); raw != "" {
+		switch raw {
+		case "1":
+			q.IncludeConfig = true
+		case "0":
+		default:
+			return q, fmt.Errorf("config must be 1 or 0, got %q", raw)
+		}
 	}
 	if raw := v.Get("limit"); raw != "" {
 		n, err := strconv.Atoi(raw)

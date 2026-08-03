@@ -1,7 +1,6 @@
 package engine_test
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -151,33 +150,6 @@ func laneTag(id record.LaneID) string {
 	return s
 }
 
-// holdingSink parks in Write until it is released.
-//
-// It HOLDS EVERYTHING, and the matcher is a formality kept only because the next version of this
-// fixture will not need it either. Holding one lane selectively was the first design and cannot
-// work: the engine writes serially per sink node, so a blocked write for one lane stalls every other
-// lane behind it — which is the whole reason this test is skipped.
-type holdingSink struct {
-	hold    []byte
-	release chan struct{}
-}
-
-func (h *holdingSink) Open(context.Context, connector.SinkRuntime, connector.Opening) error {
-	return nil
-}
-func (h *holdingSink) Close(context.Context) error { return nil }
-
-func (h *holdingSink) Write(ctx context.Context, req *connector.Request) (connector.WriteResult, error) {
-	if bytes.Contains(req.Body, h.hold) {
-		select {
-		case <-h.release:
-		case <-ctx.Done():
-			return connector.WriteResult{}, ctx.Err()
-		}
-	}
-	return connector.AllWritten(req.Count), nil
-}
-
 func registerTwoLaneSource(t *testing.T, s *twoLaneSource) string {
 	t.Helper()
 	name := fmt.Sprintf("two_lane_source_%d", sinkSeq.Add(1))
@@ -206,54 +178,65 @@ func registerTwoLaneSource(t *testing.T, s *twoLaneSource) string {
 	return name
 }
 
-func registerHoldingSink(t *testing.T, h *holdingSink) string {
-	t.Helper()
-	name := fmt.Sprintf("holding_sink_%d", sinkSeq.Add(1))
-	registry.AddSink(registry.Default, registry.SinkDef[*holdingSink]{
-		Meta: registry.Meta{
-			Name: name, Version: "1.0.0", Title: "Holding sink",
-			Summary: "Parks in Write for one lane's records and accepts the rest.",
-			Support: registry.SupportCommunity,
-		},
-		Spec: config.NewSpec(),
-		Caps: connector.SinkCaps{
-			Caps:           connector.Caps{APIVersion: connector.APIVersion},
-			Modes:          []connector.DestMode{connector.DestAppend},
-			MaxConcurrency: 1,
-		},
-		New: func(context.Context, *config.Config) (*holdingSink, error) { return h, nil },
-	})
-	return name
-}
-
 // revocationFixture is a running two-lane pipeline behind a coordinator whose clock a test drives.
 type revocationFixture struct {
 	p     *engine.Pipeline
 	coord *memstore.Coordinator
 	src   *twoLaneSource
-	sink  *holdingSink
-	now   time.Time
+	sink  *flusher
 	stop  func()
+
+	// now is the coordinator's clock, and it is GUARDED because the test writes it while the
+	// engine's lease goroutine reads it through coord.Now on every renew. The plain field this
+	// replaced was a data race that only the skip was hiding — nothing ran this file under -race.
+	mu  sync.Mutex
+	now time.Time
+}
+
+// clock is what the coordinator asks the time of.
+func (f *revocationFixture) clock() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.now
+}
+
+func (f *revocationFixture) setClock(t time.Time) {
+	f.mu.Lock()
+	f.now = t
+	f.mu.Unlock()
 }
 
 func startRevocation(t *testing.T) *revocationFixture {
 	t.Helper()
 	dir := t.TempDir()
 
+	// THE SINK HOLDS BY DEFERRING DURABILITY, NOT BY BLOCKING, and that is the whole difference
+	// between this fixture and the version that could not work.
+	//
+	// The first one held records by parking inside Write. The engine writes serially per sink node,
+	// so a blocked write for lane a stalled lane b behind it: the fixture reached one record in
+	// flight on a and none on b, which is the exact state the assertion needs NOT to be in. There
+	// was nothing to fence, because nothing was ever going to be acknowledged either way.
+	//
+	// A Flusher returns from Write immediately — accepted, not durable — so neither lane stalls and
+	// both accumulate in flight. Nothing settles until Flush is allowed to cover them, and letting
+	// it cover everything at once is what puts both lanes' records on the commit pump in the same
+	// moment, with one lane lost and the other held. That moment is the only one in which these
+	// three rules are distinguishable from their absence.
 	f := &revocationFixture{
 		coord: memstore.NewCoordinator(),
 		src:   newTwoLaneSource(),
-		sink:  &holdingSink{hold: []byte("-"), release: make(chan struct{})},
+		sink:  &flusher{deferAll: true},
 		now:   time.Now(),
 	}
-	f.coord.Now = func() time.Time { return f.now }
+	f.coord.Now = f.clock
 
 	st, err := wal.Open(filepath.Join(dir, "state"))
 	if err != nil {
 		t.Fatalf("opening the state store: %v", err)
 	}
 
-	spec := pipelineSpec(registerHoldingSink(t, f.sink), filepath.Join(dir, "unused.txt"))
+	spec := pipelineSpec(registerFlusher(t, "revocation_sink", f.sink), filepath.Join(dir, "unused.txt"))
 	spec.Graph[0].Name, spec.Graph[0].Config = registerTwoLaneSource(t, f.src), map[string]any{}
 	spec.Streams[0].Read = []connector.LaneKind{connector.LaneKindStream}
 	spec.Parallelism = 2
@@ -274,7 +257,9 @@ func startRevocation(t *testing.T) *revocationFixture {
 	var once sync.Once
 	f.stop = func() {
 		once.Do(func() {
-			close(f.sink.release)
+			// Let everything become durable before shutdown, so a failed test tears down through the
+			// ordinary drain rather than through the grace period expiring on held records.
+			f.release()
 			cancel()
 			<-done
 			p.Close(context.Background())
@@ -300,6 +285,11 @@ func startRevocation(t *testing.T) *revocationFixture {
 			d.Phase, d.LaneCount, len(as), held)
 	}
 	return f
+}
+
+// release lets the next flush make every accepted record durable, settling both lanes at once.
+func (f *revocationFixture) release() {
+	f.sink.set(func(s *flusher) { s.deferAll = false })
 }
 
 // assignmentOf returns the coordinator's row for the lane whose announced name is tag.
@@ -341,20 +331,8 @@ func (f *revocationFixture) awaitAcks(t *testing.T, tag string, n int) {
 //
 // Holding only one lane was the first attempt and does not work: the engine writes serially per sink
 // node, so a blocked write for lane a stalls lane b behind it and nothing is acknowledged either way.
+// See startRevocation for how the sink holds instead.
 func TestRecordsSettlingAfterARevocationNeverReachTheUpstream(t *testing.T) {
-	t.Skip(`unfinished: the sink holds by BLOCKING Write, and the engine reads and writes serially
-per sink node — so the first held record starves the other lane and the fixture reaches
-inflight=map[a:1 b:0] instead of records in flight on both. Everything up to that point works: two
-lanes are announced, both are claimed, the run stays alive, and the revocation is noticed.
-
-The fix is to hold by DEFERRING DURABILITY rather than by blocking: a sink that declares Flusher
-returns from Write immediately, so nothing on the read path stalls, and its records settle only when
-Flush is allowed to return. Releasing the flush then settles both lanes at once, which is the shape
-this test's assertion already expects.
-
-Checked in skipped rather than dropped, because the fixture is most of the way there and the
-diagnosis is the expensive part.`)
-
 	f := startRevocation(t)
 	ctx := context.Background()
 
@@ -378,11 +356,48 @@ diagnosis is the expensive part.`)
 			"not working and this test isolates nothing", got)
 	}
 
-	// Lane a is taken away. Lane b is untouched.
+	// LANE A IS TAKEN AWAY AND LANE B IS NOT, which needs one move worth spelling out.
+	//
+	// Whether a lease has lapsed is not stored state — it is Now() compared against the row's
+	// LeaseExpires — and both lanes were claimed together, so any clock far enough forward to make
+	// lane a claimable makes lane b lapse in the same instant. The first version did exactly that
+	// and destroyed its own positive control: both leases went, nothing was acknowledged at all,
+	// and the fence had nothing left to prove.
+	//
+	// So the clock goes forward only long enough for the other worker to take lane a — a Claim
+	// MUTATES that row, giving it a new holder, a new epoch and a fresh expiry — and then goes
+	// straight back. Lane b's row is untouched by the round trip, so its stored expiry is in the
+	// future again and this worker keeps renewing it.
+	//
+	// The state left behind is the ordinary one a planner produces when it moves a single lane
+	// between workers: one row reassigned, the rest held. The clock is only how a deterministic
+	// test reaches it without waiting out a two-and-a-half-minute reassignment delay.
+	held := f.clock()
 	a := f.assignmentOf(t, "a")
-	f.now = f.now.Add(store.DefaultLeaseTTL + store.DefaultReassignmentDelay + time.Second)
-	if _, err := f.coord.Claim(ctx, a.ID, "w2", store.DefaultLeaseTTL); err != nil {
-		t.Fatalf("the other worker could not take lane a: %v", err)
+	f.setClock(held.Add(store.DefaultLeaseTTL + store.DefaultReassignmentDelay + time.Second))
+	_, claimErr := f.coord.Claim(ctx, a.ID, "w2", store.DefaultLeaseTTL)
+	f.setClock(held)
+	if claimErr != nil {
+		t.Fatalf("the other worker could not take lane a: %v", claimErr)
+	}
+
+	// THE POSITIVE CONTROL IS CHECKED HERE, WHILE IT IS STILL CHEAP TO EXPLAIN.
+	//
+	// The clock is forward for the duration of one Claim, and the engine's lease goroutine reads it
+	// on every renew — so a renew landing inside that window sees both leases lapsed and this worker
+	// loses lane b as well. It is a narrow window against a ten-second renew interval, but the whole
+	// test rests on lane b surviving, and without this the symptom is "lane b was acknowledged 0
+	// times" thirty seconds later, which reads as a broken fence rather than a lost control.
+	//
+	// EXPIRY IS THE DISCRIMINATOR, NOT Worker, which store.Assignment says in its own doc and which
+	// the first version of this check got wrong: a lapsed row goes on naming whoever held it last,
+	// because that identity is what the reassignment delay reserves it for. Comparing Worker alone
+	// reports "still ours" for precisely the lane that was just lost.
+	b := f.assignmentOf(t, "b")
+	if lease := (store.Lease{Expires: b.LeaseExpires}); b.Worker != "w1" || !lease.Valid(f.clock()) {
+		t.Fatalf("lane b is not held by this worker any more (worker=%q expires=%v now=%v): the "+
+			"clock window was hit and the positive control is gone, so a green run proves nothing",
+			b.Worker, b.LeaseExpires, f.clock())
 	}
 
 	revoked := time.Now().Add(2*store.DefaultRenewInterval + 10*time.Second)
@@ -400,7 +415,7 @@ diagnosis is the expensive part.`)
 	}
 
 	// NOW every held record settles, with lane a already lost and lane b still held.
-	close(f.sink.release)
+	f.release()
 	f.awaitAcks(t, "b", 1)
 
 	if got := f.src.acksFor("a"); got != 0 {

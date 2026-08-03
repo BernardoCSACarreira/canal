@@ -369,3 +369,92 @@ func TestSettledAndCommittedAreDifferentNumbers(t *testing.T) {
 		t.Errorf("settled changed to %d during phase three; it is a phase-two count", st.Settled)
 	}
 }
+
+// THE TWO FENCES A REVOKED LANE HAS IN THIS PACKAGE, PINNED SEPARATELY.
+//
+// The engine-level fixture in internal/engine proves the property that matters — a fenced worker
+// never advances its upstream — but it cannot pin either of these, and the reason is worth writing
+// down: the protection is REDUNDANT. Three rules each independently prevent the acknowledgement, so
+// deleting any one of them leaves the end-to-end test green. Only deleting all three moves it.
+//
+// Defence in depth is the right design for "specified data loss", and it is also how a layer rots
+// unnoticed. These two assertions are what make the ledger's share of it individually falsifiable:
+// Flushable must not offer a revoked lane, and Committed must not acknowledge one even if asked.
+func TestARevokedLaneIsNeitherFlushedNorAcknowledged(t *testing.T) {
+	l := New(Config{Tenant: "acme", Pipeline: "p", DefaultBudget: 16, GroupTTL: time.Minute})
+	defer l.Close()
+	if err := l.Lane("lane-1", connector.OrderingPrefix, 16, connector.WhenFullBlock); err != nil {
+		t.Fatalf("Lane: %v", err)
+	}
+
+	pos := record.Position{Order: []byte{1}, Token: record.Blob{Version: 1, Bytes: []byte{1}}, Safe: true}
+	b := batchAt(t, "lane-1", pos, 4)
+	if err := l.Admit(context.Background(), b); err != nil {
+		t.Fatalf("Admit: %v", err)
+	}
+
+	// The records settle BEFORE the revocation is known, which is the whole difficulty: this worker
+	// did the work, the sink took it, and only then did the lane move. The settlement is real and
+	// the acknowledgement it would produce is what must never leave.
+	outs := make([]Outcome, 0, 4)
+	for _, r := range b.Records {
+		outs = append(outs, Outcome{Record: r.Origin().ID, Node: "out", Disposition: Delivered})
+	}
+	l.Settle(outs)
+
+	if _, ok := l.Flushable()["lane-1"]; !ok {
+		t.Fatal("the lane was not flushable after every record settled, so this test would prove " +
+			"nothing about what revocation changes")
+	}
+
+	// Re-admit and re-settle, because Flushable consumed the pending position above.
+	pos2 := record.Position{Order: []byte{2}, Token: record.Blob{Version: 1, Bytes: []byte{2}}, Safe: true}
+	b2 := batchAt(t, "lane-1", pos2, 4)
+
+	// batchAt builds a FRESH allocator seeded at group 1 and record id 1, so this batch would
+	// otherwise be group 1 with records 1-4 — the same identity the first batch had. It passes
+	// either way today, because settling the first batch removed it from l.groups and its records
+	// from l.byRec before this one is admitted. That is a property of the ORDER of this test rather
+	// than of anything the ledger promises, and the engine's own allocators had exactly this
+	// collision until allocatorFor started seeding them apart. Distinct here on purpose, so a later
+	// edit that admits both at once fails on the assertion rather than on a duplicate group.
+	b2.SetGroup(record.GroupID(99))
+	if err := l.Admit(context.Background(), b2); err != nil {
+		t.Fatalf("Admit: %v", err)
+	}
+	outs = outs[:0]
+	for _, r := range b2.Records {
+		outs = append(outs, Outcome{Record: r.Origin().ID, Node: "out", Disposition: Delivered})
+	}
+
+	unsettled := l.Revoke("lane-1")
+	l.Settle(outs)
+
+	if got := l.Flushable(); len(got) != 0 {
+		t.Errorf("a revoked lane was offered for flushing: %v.\n"+
+			"  Persisting that cursor is this worker telling the store it got further than the new "+
+			"holder knows about, and no epoch takes it back", got)
+	}
+
+	// Asked directly, as the flush loop would if the fence above were ever bypassed.
+	acks := make(chan connector.Ack, 4)
+	go func() {
+		for a := range l.Acks() {
+			acks <- a
+		}
+	}()
+	l.Committed(map[record.LaneID]record.Position{"lane-1": pos2})
+
+	select {
+	case a := <-acks:
+		t.Errorf("a revoked lane was acknowledged through %v (%d records); every one of those lets "+
+			"the upstream discard records the new holder has not delivered",
+			a.Through.Order, a.Records)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	if unsettled == 0 {
+		t.Error("Revoke reported no unsettled records while four were in flight; the overlap the " +
+			"new holder has to absorb is the number this reports and an operator's only sight of it")
+	}
+}

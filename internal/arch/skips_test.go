@@ -33,14 +33,11 @@ import (
 //
 // Keyed by file rather than by line, because line numbers churn on every edit and a guard that
 // fails on unrelated churn is a guard people delete.
-var knownSkips = map[string]string{
-	"internal/engine/revocation_test.go": "the revocation fixture. Two lanes are announced, both " +
-		"are claimed, the run stays alive and the revocation is noticed — but the sink holds by " +
-		"BLOCKING Write and the engine writes serially per sink node, so the first held record " +
-		"starves the other lane. Removing this entry means holding by deferring durability through " +
-		"Flusher instead, which is what lets both lanes settle together. Until then three revocation " +
-		"rules have no test that can observe them.",
-}
+// EMPTY IS THE GOAL STATE, and it is worth saying so rather than leaving a bare map. The last entry
+// was internal/engine/revocation_test.go, whose sink held records by blocking Write — which starved
+// the other lane and left three revocation rules unobservable. It holds by deferring durability
+// through Flusher now, both lanes settle together, and the test runs.
+var knownSkips = map[string]string{}
 
 func TestEverySkippedTestIsDeclared(t *testing.T) {
 	root := repoRoot(t)
@@ -125,22 +122,25 @@ func isSkipName(n string) bool {
 	return n == "Skip" || n == "Skipf" || n == "SkipNow"
 }
 
-// The matcher has to work in both directions, for the same reason the other two do. This one is
-// cheap to pin because it can check itself: this file contains no skip and the one it names does.
+// The matcher has to work in both directions, for the same reason the other two do.
+//
+// BOTH PINS ARE FIXTURES NOW, not real files. The positive pin used to be the one entry in
+// knownSkips, which made it a pin that expired the moment that test was fixed — the guard failed
+// because the tree got BETTER, which is how a guard earns itself a deletion. testdata/skips holds
+// one of each shape and cannot go stale.
 func TestTheSkipMatcherWorksInBothDirections(t *testing.T) {
-	root := repoRoot(t)
+	data := filepath.Join(repoRoot(t), "internal/arch/testdata/skips")
 
-	declared := filepath.Join(root, "internal/engine/revocation_test.go")
-	if !skipsUnconditionally(t, declared) {
-		t.Error("the file knownSkips names does not skip unconditionally; either the entry is stale " +
-			"or the matcher is looking for the wrong thing, and both make this pass on a tree full " +
-			"of skips")
+	if !skipsUnconditionally(t, filepath.Join(data, "unconditional/sample.go")) {
+		t.Error("the matcher did not find an unconditional skip in the fixture written to contain " +
+			"one, so it would find none in the tree either and this whole check passes on a file " +
+			"full of them")
 	}
 
-	// And the negative pin: a file whose only skips are behind a condition must NOT be reported.
-	// cmd/canal skips two tests under -short, which is a test that runs in the suite that matters.
-	if skipsUnconditionally(t, filepath.Join(root, "cmd/canal/main_test.go")) {
-		t.Error("a skip guarded by testing.Short reads as unconditional; this check would then " +
-			"report every legitimate environment guard in the module")
+	// Two conditional skips, neither of which may be reported: one behind testing.Short and one
+	// behind a missing input. A check that reports these reports every legitimate environment guard
+	// in the module, and a guard that cries about everything gets muted.
+	if skipsUnconditionally(t, filepath.Join(data, "guarded/sample.go")) {
+		t.Error("a skip guarded by a condition read as unconditional")
 	}
 }

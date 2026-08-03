@@ -134,6 +134,16 @@ func (s *StateStore) Set(_ context.Context, w store.Batch) error {
 				fmt.Errorf("memstore: %s is at version %d, not %d", k, cur.Version, v.IfVersion))
 		}
 	}
+	// DELETES ARE PRECONDITIONED TOO, in the same pass-one/pass-two shape as the writes: every epoch
+	// is checked before anything is removed, so a rejected batch leaves no partial state. A delete used
+	// to be the one mutation that could not be refused at all.
+	for _, d := range w.Deletes {
+		name := d.Key.String()
+		if seen, ok := s.epochs[name]; ok && w.EpochForDelete(d) < seen {
+			return fault.ErrFenced
+		}
+	}
+
 	for k, v := range w.Writes {
 		next := s.data[k].Version + 1
 		v.Version = next
@@ -146,8 +156,14 @@ func (s *StateStore) Set(_ context.Context, w store.Batch) error {
 			s.epochs[k] = e
 		}
 	}
-	for _, k := range w.Deletes {
-		delete(s.data, k.String())
+	for _, d := range w.Deletes {
+		name := d.Key.String()
+		delete(s.data, name)
+		// THE FLOOR OUTLIVES THE KEY, so a stale worker cannot resurrect what a current one removed.
+		// Dropping the epoch with the row would let a write below the delete's epoch recreate it.
+		if e := w.EpochForDelete(d); e > s.epochs[name] {
+			s.epochs[name] = e
+		}
 	}
 	return nil
 }

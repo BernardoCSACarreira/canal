@@ -160,7 +160,23 @@ type Batch struct {
 	// construction.
 	Writes map[string]Versioned
 
-	Deletes []Key
+	// Deletes carry their own epoch for the same reason Writes do, and until they did, a delete was
+	// the ONE lane mutation nothing could refuse.
+	//
+	// StateStore.Delete takes bare keys and no epoch, so a store will do as it is told. Every other
+	// fenced operation degrades to a rejected write; that one degrades to destroying state the new
+	// holder owns and is reading — which makes the fence matter MORE there, not less. Routing a lane's
+	// delete through a batch also makes it atomic with the writes that accompany it, which retiring a
+	// lane wants anyway.
+	Deletes []Deletion
+}
+
+// Deletion is one key to remove, plus the fence that authorises removing it.
+type Deletion struct {
+	Key Key
+
+	// Epoch fences THIS key. Zero means the batch's Epoch, exactly as [Versioned.Epoch] does.
+	Epoch uint64
 }
 
 // NewBatch returns an empty batch whose default fence is the given epoch.
@@ -184,8 +200,21 @@ func (b *Batch) PutFenced(k Key, value []byte, ifVersion, epoch uint64) {
 	b.Writes[k.String()] = Versioned{Key: k, Value: value, IfVersion: ifVersion, Epoch: epoch}
 }
 
-// Del adds a delete to the batch.
-func (b *Batch) Del(k Key) { b.Deletes = append(b.Deletes, k) }
+// Del adds a delete fenced by the batch's default epoch, for a key that is not one lane's.
+func (b *Batch) Del(k Key) { b.Deletes = append(b.Deletes, Deletion{Key: k}) }
+
+// DelFenced adds a delete fenced by its OWN epoch, for a key whose lease is not the batch's.
+func (b *Batch) DelFenced(k Key, epoch uint64) {
+	b.Deletes = append(b.Deletes, Deletion{Key: k, Epoch: epoch})
+}
+
+// EpochForDelete reports the epoch that fences d within batch b: d's own when set, otherwise b's.
+func (b *Batch) EpochForDelete(d Deletion) uint64 {
+	if d.Epoch != 0 {
+		return d.Epoch
+	}
+	return b.Epoch
+}
 
 // Len reports how many mutations the batch carries.
 func (b *Batch) Len() int { return len(b.Writes) + len(b.Deletes) }

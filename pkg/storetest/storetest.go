@@ -72,6 +72,7 @@ func Run(t *testing.T, s Subject) {
 	t.Run(s.Name+"/one_lanes_epoch_does_not_raise_anothers", func(t *testing.T) { testEpochIsolation(t, s) })
 	t.Run(s.Name+"/range_is_ordered_and_scoped", func(t *testing.T) { testRange(t, s) })
 	t.Run(s.Name+"/reads_are_copies", func(t *testing.T) { testReadsAreCopies(t, s) })
+	t.Run(s.Name+"/deletes_are_fenced", func(t *testing.T) { testFencedDelete(t, s) })
 	t.Run(s.Name+"/declared_capabilities_hold", func(t *testing.T) { testDeclaredCapabilities(t, s) })
 	t.Run(s.Name+"/survives_reopen", func(t *testing.T) { testReopen(t, s) })
 }
@@ -329,6 +330,62 @@ func testReadsAreCopies(t *testing.T, sub Subject) {
 // not backed by behaviour is worse than a missing feature: the deployment is admitted and the
 // protocol it was admitted for does not hold. This runs the behaviour behind each flag and requires it
 // only when the flag is set — so a store is free to decline a capability, and not free to claim one.
+// A DELETE IS FENCED LIKE A WRITE, and it is the one mutation where that matters most.
+//
+// Every other fenced operation degrades to a rejected write. This one degrades to destroying state the
+// current holder owns and is reading, so a store that honours an epoch on Put and ignores it on Del has
+// the fence exactly where it is cheapest and not where it is dearest. It was unaskable until
+// store.Deletion carried an epoch: StateStore.Delete takes bare keys, so a store had nothing to compare.
+//
+// The batch default is HIGH on purpose, for the reason testEpochPerKey gives: below the stored epoch, a
+// store comparing the batch-wide number refuses too and the assertion passes either way.
+func testFencedDelete(t *testing.T, sub Subject) {
+	s := sub.New(t)
+	if !s.Capabilities().EpochFencing {
+		t.Skipf("%s does not declare EpochFencing", sub.Name)
+	}
+	ctx := context.Background()
+	k := laneKey("owned")
+
+	held := store.NewBatch(1)
+	held.PutFenced(k, []byte("the holder's"), 0, 12)
+	if err := s.Set(ctx, *held); err != nil {
+		t.Fatalf("seeding at epoch 12: %v", err)
+	}
+
+	stale := store.NewBatch(100)
+	stale.DelFenced(k, 4)
+	if err := s.Set(ctx, *stale); err == nil {
+		t.Error("a delete fenced at epoch 4 removed a key last written at 12.\n" +
+			"  That is a worker whose lease moved on erasing the state its successor is reading, and no " +
+			"epoch takes it back because the bytes are gone")
+	} else if !errors.Is(err, fault.ErrFenced) && fault.ClassOf(err) != fault.Fenced {
+		t.Errorf("the refusal was %v, which does not classify as fenced", err)
+	}
+	if v, ok := get(t, s, k); !ok || string(v.Value) != "the holder's" {
+		t.Errorf("the key is %q (present=%v) after a refused delete", v.Value, ok)
+	}
+
+	// The CURRENT holder may of course remove it, or the fence is just a broken feature.
+	current := store.NewBatch(1)
+	current.DelFenced(k, 12)
+	if err := s.Set(ctx, *current); err != nil {
+		t.Fatalf("the holder could not delete its own key: %v", err)
+	}
+	if _, ok := get(t, s, k); ok {
+		t.Error("the key survived a delete at its own epoch")
+	}
+
+	// AND THE FLOOR OUTLIVES THE KEY, so a stale write cannot resurrect what a current holder removed.
+	// The row is gone; the epoch it was removed at is not.
+	resurrect := store.NewBatch(100)
+	resurrect.PutFenced(k, []byte("stale worker's"), 0, 5)
+	if err := s.Set(ctx, *resurrect); err == nil {
+		t.Error("a write at epoch 5 recreated a key deleted at 12; dropping the epoch with the row " +
+			"lets any superseded worker undo the removal")
+	}
+}
+
 func testDeclaredCapabilities(t *testing.T, sub Subject) {
 	s := sub.New(t)
 	caps := s.Capabilities()

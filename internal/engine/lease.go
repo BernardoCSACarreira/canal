@@ -97,11 +97,42 @@ func (lt *leaseTable) epochFor(id record.LaneID) uint64 {
 	}
 	// A LANE THIS WORKER DOES NOT HOLD REPORTS ZERO, which store.Assignment uses for "unclaimed".
 	//
-	// This is a REPORTING value and nothing else: Assigned and Table are the only callers, and no
-	// durable write is fenced with it — runtime.go still batches at singleWorkerEpoch and says so.
-	// An earlier version of this comment reasoned about how a zero would fare against the state
-	// store's epoch check, which described a path that does not exist.
+	// THIS IS A REPORTING VALUE AND MUST NOT FENCE A WRITE. Assigned and Table are its only callers.
+	// Handing this zero to store.Batch.PutFenced would not refuse anything — Versioned.Epoch says a
+	// zero means "use the batch's" — so an unheld lane's write would quietly fall back to the batch
+	// default and land, which is the opposite of what a caller asking for an epoch wants. Durable
+	// writes use fenceFor, which reports (0, false) for the same case and is refused on.
 	return 0
+}
+
+// fenceFor returns the epoch a DURABLE WRITE on a lane's behalf must carry, and whether this worker
+// may make that write at all.
+//
+// IT IS A SEPARATE METHOD FROM epochFor BECAUSE ZERO IS A TRAP HERE. epochFor answers a REPORTING
+// question and returns 0 for a lane this worker does not hold, which is what store.Assignment uses
+// for "unclaimed". Feeding that 0 to store.Batch.PutFenced does not refuse the write — Versioned.Epoch
+// says zero means "use the batch's epoch" — so the write would silently fall back to the batch
+// default and land. The one value that means "not mine to write" in one API means "fence it with
+// whatever the batch says" in the other, and the quiet direction is the wrong one.
+//
+// So this returns (epoch, true) only when there is a live lease, and every caller refuses on false
+// rather than writing anything. That refusal is ADVISORY — the store rejecting a stale epoch is the
+// authority, exactly as store.Lease.Valid says — and it exists so a worker stops before the write
+// rather than discovering the fence in its error path.
+//
+// SINGLE-WORKER ALWAYS MAY: with no coordinator there is no lease to lose, holds() is true for
+// everything, and the constant is what keeps a standalone run's rows fenced at 1 instead of 0.
+func (lt *leaseTable) fenceFor(id record.LaneID, now time.Time) (uint64, bool) {
+	if !lt.coordinated() {
+		return singleWorkerEpoch, true
+	}
+	lt.mu.Lock()
+	defer lt.mu.Unlock()
+	l, ok := lt.held[id]
+	if !ok || !l.Valid(now) {
+		return 0, false
+	}
+	return l.Epoch, true
 }
 
 // holds reports whether this worker currently holds a live lease on a lane.

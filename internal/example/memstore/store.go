@@ -88,7 +88,16 @@ func (s *StateStore) Set(_ context.Context, w store.Batch) error {
 	defer s.mu.Unlock()
 
 	for k, v := range w.Writes {
-		if seen, ok := s.epochs[k]; ok && w.Epoch < seen {
+		// PER KEY, NOT PER BATCH, which is what EpochFencing means and what this store declares.
+		//
+		// It compared w.Epoch — the batch's DEFAULT — so a per-key epoch set through
+		// store.Batch.PutFenced was ignored in both directions: a stale write for one lane rode in
+		// on a healthy batch epoch, and a fenced worker's whole batch was judged by a number none of
+		// its keys carried. store.Versioned.Epoch exists precisely because a worker holding 32 lanes
+		// at 32 epochs has no single number to offer, and EpochFor is the accessor that resolves it.
+		// pkg/store/wal has always done this correctly; this store advertised the same capability and
+		// did not, so every coordinated test ran against a fence that was not there.
+		if seen, ok := s.epochs[k]; ok && w.EpochFor(v) < seen {
 			return fault.ErrFenced
 		}
 		cur, exists := s.data[k]
@@ -105,8 +114,10 @@ func (s *StateStore) Set(_ context.Context, w store.Batch) error {
 		next := s.data[k].Version + 1
 		v.Version = next
 		s.data[k] = v
-		if w.Epoch > s.epochs[k] {
-			s.epochs[k] = w.Epoch
+		// The high-water mark is per key too, for the same reason: recording the batch's default here
+		// would raise every key's floor to the highest epoch any ONE lane in the batch was held at.
+		if e := w.EpochFor(v); e > s.epochs[k] {
+			s.epochs[k] = e
 		}
 	}
 	for _, k := range w.Deletes {

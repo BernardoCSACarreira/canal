@@ -549,7 +549,8 @@ func (r *runner) openSources(ctx context.Context) error {
 				cfg: r.p.configs[id],
 			},
 			lanes: lc,
-			state: &stateHandle{deps: r.deps, tenant: r.p.spec.Tenant, pipeline: r.p.spec.ID, node: id},
+			state: &stateHandle{deps: r.deps, tenant: r.p.spec.Tenant, pipeline: r.p.spec.ID, node: id,
+				leases: r.leases},
 		}
 
 		// Every call into a connector goes through the sandbox, so a panic is a classified fault and

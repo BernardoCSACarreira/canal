@@ -494,6 +494,174 @@ func TestAPlainSourceReportingNothingTwiceIsAContractFault(t *testing.T) {
 	}
 }
 
+// A LANE ANNOUNCED AFTER READING STARTED IS READ.
+//
+// The assignment used to be whatever Assigned() returned once, so a lane announced later was durable,
+// planned, claimed — and read by nobody, forever, with no error and no warning. laneCtl.Changes()
+// existed and notify() fired it on every announce; nothing anywhere selected on it.
+//
+// This is the shape multi-stream-source has: it calls maybeSweep from Read, which re-reconciles its
+// stream set on a timer and announces a lane for every stream that appeared upstream since. The
+// fixture below is that, driven by the test rather than by a timer.
+func TestALaneAnnouncedAfterReadingStartedIsRead(t *testing.T) {
+	src := &latecomerSource{}
+	dir := t.TempDir()
+	state, err := wal.Open(filepath.Join(dir, "state"))
+	if err != nil {
+		t.Fatalf("opening the state store: %v", err)
+	}
+	t.Cleanup(func() { state.Close() })
+
+	name := fmt.Sprintf("latecomer_%d", sinkSeq.Add(1))
+	registry.AddSource(registry.Default, registry.SourceDef[*latecomerSource]{
+		Meta: registry.Meta{
+			Name: name, Version: "1.0.0", Title: "Latecomer source",
+			Summary: "Announces one lane at Open and a second only when the test says so.",
+			Support: registry.SupportCommunity,
+		},
+		Spec: config.NewSpec(),
+		Caps: connector.SourceCaps{
+			Caps:              connector.Caps{APIVersion: connector.APIVersion},
+			DefaultOrdering:   connector.OrderingPrefix,
+			Boundedness:       []connector.Boundedness{connector.Unbounded},
+			LaneKinds:         []connector.LaneKind{connector.LaneKindStream},
+			MaxLanes:          4,
+			ReadsLanes:        true,
+			ReadConcurrency:   1,
+			Replayable:        true,
+			UpstreamRetention: connector.RetentionUnbounded,
+		},
+		New: func(context.Context, *config.Config) (*latecomerSource, error) { return src, nil },
+	})
+
+	out := &collector{}
+	s := pipelineSpec(registerCollector(t, "latecomer_sink", out), filepath.Join(dir, "unused.txt"))
+	s.Graph[0].Name, s.Graph[0].Config = name, map[string]any{}
+	s.Streams[0].Read = []connector.LaneKind{connector.LaneKindStream}
+
+	p, _, diags := engine.Build(context.Background(), registry.Default, s, engine.Deps{
+		State: state, Worker: "w1", FlushInterval: 5 * time.Millisecond, GracePeriod: time.Second,
+	})
+	if diags.HasErrors() {
+		t.Fatalf("Build: %v", diags)
+	}
+	t.Cleanup(func() { p.Close(context.Background()) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	done := make(chan error, 1)
+	go func() { done <- p.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	// The first lane is producing before the second exists, so the read set was built without it.
+	waitFor(t, "the early lane to deliver", func() bool { return perLane(out.got())["early"] >= 2 })
+	if got := perLane(out.got())["late"]; got != 0 {
+		t.Fatalf("%d records arrived for a lane that has not been announced yet", got)
+	}
+	before := perLane(out.got())["early"]
+
+	src.announceLate()
+	waitFor(t, "the late lane to be announced", func() bool { return src.lateAnnounced() })
+
+	// THE ASSERTION: records from a lane the read set did not contain when it was built.
+	waitFor(t, "the late lane to deliver", func() bool { return perLane(out.got())["late"] >= 2 })
+
+	select {
+	case err := <-done:
+		t.Fatalf("the run ended early: %v", err)
+	default:
+	}
+	// And the lane that was already being read did not lose its reader to the rebuild.
+	waitFor(t, "the early lane to keep delivering", func() bool {
+		return perLane(out.got())["early"] > before
+	})
+}
+
+// latecomerSource announces one unbounded lane at Open and a second only when told.
+type latecomerSource struct {
+	mu       sync.Mutex
+	rt       connector.SourceRuntime
+	sent     map[record.LaneID]int
+	late     bool
+	wantLate bool
+}
+
+func (s *latecomerSource) Open(ctx context.Context, rt connector.SourceRuntime) error {
+	s.mu.Lock()
+	s.rt, s.sent = rt, map[record.LaneID]int{}
+	s.mu.Unlock()
+
+	as, err := rt.Lanes().Assigned(ctx)
+	if err != nil || len(as) > 0 {
+		return err
+	}
+	_, err = rt.Lanes().AnnounceMany(ctx, []connector.LaneSpec{{
+		Name: "early", Stream: "lines", Kind: connector.LaneKindStream,
+		Ordering: connector.OrderingPrefix, Boundedness: connector.Unbounded,
+	}})
+	return err
+}
+
+func (s *latecomerSource) Close(context.Context) error                 { return nil }
+func (s *latecomerSource) Commit(context.Context, connector.Ack) error { return nil }
+func (s *latecomerSource) Read(context.Context, *record.Batch) error {
+	return fault.Internal(fault.OpRead, errors.New("this source declares ReadsLanes"))
+}
+
+func (s *latecomerSource) announceLate() {
+	s.mu.Lock()
+	s.wantLate = true
+	s.mu.Unlock()
+}
+
+func (s *latecomerSource) lateAnnounced() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.late
+}
+
+// ReadLanes produces on every lane it is handed, and announces the late lane from the READ goroutine
+// once the test asks — which is where multi-stream-source announces from too.
+func (s *latecomerSource) ReadLanes(ctx context.Context, dst []*record.Batch) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(time.Millisecond):
+	}
+
+	s.mu.Lock()
+	due, rt := s.wantLate && !s.late, s.rt
+	s.mu.Unlock()
+	if due {
+		if _, err := rt.Lanes().Announce(ctx, connector.LaneSpec{
+			Name: "late", Stream: "lines", Kind: connector.LaneKindStream,
+			Ordering: connector.OrderingPrefix, Boundedness: connector.Unbounded,
+		}); err != nil {
+			return err
+		}
+		s.mu.Lock()
+		s.late = true
+		s.mu.Unlock()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, b := range dst {
+		tag := laneTag(b.Lane)
+		s.sent[b.Lane]++
+		n := s.sent[b.Lane]
+		if r := b.Add(); r != nil {
+			r.Payload = record.BytesPayload([]byte(fmt.Sprintf("%s-%03d", tag, n)))
+		}
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], uint64(n))
+		b.Position = record.Position{
+			Token: record.Blob{Version: 1, Bytes: buf[:]}, Order: buf[:], Safe: true,
+			At: time.Now(), Label: fmt.Sprintf("%s row %d", tag, n),
+		}
+	}
+	return nil
+}
+
 // A LANE A ReadLanes CALL LEFT UNTOUCHED KEEPS ITS PROGRESS.
 //
 // This is the same rule as the one below and the common case rather than the edge: a source

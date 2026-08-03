@@ -17,9 +17,20 @@ import (
 type StateStore interface {
 	// Get reads several keys. A key that is absent is simply missing from the result map, which is
 	// distinguishable from a key whose value is empty.
+	//
+	// WHAT IT RETURNS IS THE CALLER'S TO KEEP AND TO MUTATE: an implementation must not hand back
+	// memory it still refers to, for the Value or for Key.Parts.
+	//
+	// This was unstated, and the two implementations in the module disagreed about it — pkg/store/wal
+	// copied and had a test saying so, the in-memory example returned its own slices, and the
+	// conformance suite is what surfaced the divergence. Stated in this direction rather than as
+	// "callers must not mutate" because a caller cannot know which store it has, so the alternative is
+	// every caller copying defensively; and because these bytes go through json.Unmarshal and on to a
+	// connector, so the code that would have to be trusted is third-party.
 	Get(ctx context.Context, keys []Key) (map[string]Versioned, error)
 
-	// Range iterates every key under a prefix, in key order.
+	// Range iterates every key under a prefix, in key order. What it yields is the caller's, on the
+	// same terms as Get.
 	Range(ctx context.Context, prefix Key) (iter.Seq2[Key, Versioned], error)
 
 	// Set MUST be atomic across the whole batch, with per-key compare-and-set AND per-key epoch

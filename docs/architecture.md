@@ -371,9 +371,12 @@ github.com/BernardoCSACarreira/canal
 │   │   └── wal/         the durable StateStore: CRC32C-framed append log, fsync before Set returns,
 │   │                    per-key CAS and epoch fencing, torn tail truncated. DurabilityNode.
 │   │                    imports: connector, fault, record, store
-│   └── connectortest/   Base, and inert embeddable stubs for the three runtimes, LaneCtl and StateHandle,
-│                        so adding a runtime method does not break every connector's tests
-│                        imports: config, connector, fault, record, schema
+│   ├── connectortest/   Base, and inert embeddable stubs for the three runtimes, LaneCtl and StateHandle,
+│   │                    so adding a runtime method does not break every connector's tests
+│   │                    imports: config, connector, fault, record, schema
+│   └── storetest/       the conformance suite for StateStore: Subject, Run. Every implementation runs
+│                        it, because a contract two stores each prove separately gets proved wrong twice
+│                        imports: connector, fault, record, store
 └── internal/            not importable from any other module (Go's internal rule)
     ├── ledger/          Tracker[P], Ticket, Ledger, Disposition, Outcome, LaneStats, Leak, the leak reaper
     │                    imports: connector, fault, record
@@ -414,6 +417,7 @@ flowchart TB
 
   subgraph TESTKIT["test files only"]
     CT["pkg/connectortest<br/>inert SourceRuntime, LaneCtl, StateHandle stubs"]
+    ST["pkg/storetest<br/>StateStore conformance suite"]
   end
 
   subgraph CORESIDE["also under pkg/ — core-facing, imported by zero connectors"]

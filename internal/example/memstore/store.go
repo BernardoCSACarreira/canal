@@ -39,6 +39,30 @@ func New() *StateStore {
 	return &StateStore{data: map[string]store.Versioned{}, epochs: map[string]uint64{}}
 }
 
+// clone deep-copies a row so no slice crosses the boundary in either direction.
+//
+// NEITHER STORE HAD BOTH HALVES OF THIS, which is what the conformance suite was written to find and
+// found on its first run. This store returned its own slices from Get, so a reader corrupted state it
+// did not own. pkg/store/wal cloned on the way out and filed the CALLER'S slice into its index on the
+// way in, so a caller reusing its buffer rewrote a row after the fsync that was meant to finalise it.
+// One defect, mirrored, and each store's own tests covered only the half it happened to get right.
+//
+// A file-backed store does not get this for free either — I assumed it did, and wal's index is where
+// that assumption broke.
+//
+// The engine hands these bytes to json.Unmarshal and then to a CONNECTOR, so the code that would
+// otherwise have to be trusted not to touch them is third-party. See store.StateStore.Get.
+func clone(v store.Versioned) store.Versioned {
+	out := v
+	if v.Value != nil {
+		out.Value = append([]byte(nil), v.Value...)
+	}
+	if v.Key.Parts != nil {
+		out.Key.Parts = append([]string(nil), v.Key.Parts...)
+	}
+	return out
+}
+
 // Get reads several keys. An absent key is simply missing from the result.
 func (s *StateStore) Get(_ context.Context, keys []store.Key) (map[string]store.Versioned, error) {
 	s.mu.Lock()
@@ -46,7 +70,7 @@ func (s *StateStore) Get(_ context.Context, keys []store.Key) (map[string]store.
 	out := make(map[string]store.Versioned, len(keys))
 	for _, k := range keys {
 		if v, ok := s.data[k.String()]; ok {
-			out[k.String()] = v
+			out[k.String()] = clone(v)
 		}
 	}
 	return out, nil
@@ -64,7 +88,7 @@ func (s *StateStore) Range(_ context.Context, prefix store.Key) (iter.Seq2[store
 	snapshot := make([]store.Versioned, 0, len(keys))
 	sort.Strings(keys)
 	for _, k := range keys {
-		snapshot = append(snapshot, s.data[k])
+		snapshot = append(snapshot, clone(s.data[k]))
 	}
 	s.mu.Unlock()
 
@@ -113,7 +137,9 @@ func (s *StateStore) Set(_ context.Context, w store.Batch) error {
 	for k, v := range w.Writes {
 		next := s.data[k].Version + 1
 		v.Version = next
-		s.data[k] = v
+		// Copied on the way IN too, so a caller reusing its buffer after Set cannot rewrite what
+		// landed. wal cannot have this bug; a store of live Go values has to decline it explicitly.
+		s.data[k] = clone(v)
 		// The high-water mark is per key too, for the same reason: recording the batch's default here
 		// would raise every key's floor to the highest epoch any ONE lane in the batch was held at.
 		if e := w.EpochFor(v); e > s.epochs[k] {

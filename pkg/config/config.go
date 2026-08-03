@@ -216,8 +216,17 @@ func (c *Config) Secret(path ...string) (string, error) {
 }
 
 // Redacted returns a JSON-serialisable tree with every declared secret replaced by
-// [RedactedMarker]. The read model, every log line and every API response use this and
-// nothing else.
+// [RedactedMarker]. Wherever a config tree is serialised, this is what is serialised.
+//
+// TODAY THAT IS ONE PLACE: telemetry.PipelineStatus.Config, which the engine's status builder fills
+// from here and which /status returns. Nothing else emits a config tree at all — /metrics carries a
+// closed label set, no log line includes one, and the only other caller of [Config.Raw] is a connector
+// reading its own field. So the rule holds because there is one path rather than because many paths
+// remember, which is the difference between a structural guarantee and a convention.
+//
+// It said "the read model, every log line and every API response use this and nothing else" while
+// having no caller outside its own tests, and PipelineStatus.Config had no writer. A redactor and a
+// field, each documented as connected to the other, connected to nothing.
 //
 // It returns values, not pointers into state (design rule R13): mutating the result
 // cannot reach the live config.

@@ -91,7 +91,17 @@ type PipelineStatus struct {
 	RecentEvents []Event    `json:"recentEvents,omitempty"`
 	LastFault    *FaultInfo `json:"lastFault"`
 
-	// Config is the REDACTED config tree. It is the only form that ever leaves the process.
+	// Config is the REDACTED config tree, keyed by node id, present only when
+	// [StatusQuery.IncludeConfig] asked for it. It is the only form that ever leaves the process.
+	//
+	// KEYED BY NODE because that is where a config lives: pkg/config.Config is per node, and a node's
+	// declared secrets are the only thing in a pipeline that needs redacting. One flat tree for a graph
+	// would have to invent a merge, and a merge of two nodes' fields is not any node's config.
+	//
+	// Every value comes from config.Config.Redacted, whose own doc says "the read model, every log line
+	// and every API response use this and nothing else" — a claim that was true of nothing until this
+	// field had a producer. Both were declared and inert: a redactor with no callers outside its tests,
+	// and a field with no writer.
 	Config map[string]any `json:"config,omitempty"`
 }
 
@@ -111,6 +121,20 @@ type StatusQuery struct {
 	// LaneCursor continues from a previous page's [PipelineStatus.LanesCursor]. Opaque; a caller
 	// echoes it back and never constructs one.
 	LaneCursor string `json:"laneCursor,omitempty"`
+
+	// IncludeConfig asks for [PipelineStatus.Config], the redacted config tree, which is otherwise
+	// absent.
+	//
+	// OFF BY DEFAULT, for LaneLimit's reason one field down: the zero query is what a scrape and a
+	// health banner ask for, and neither renders configuration. It is also the same tree on every
+	// worker in a cluster, so a status report that carried it would duplicate one pipeline's config
+	// once per worker on every interval — see the engine's own reporting loop, which asks for no lanes
+	// for exactly that reason.
+	//
+	// A bool rather than a pointer, because absent and false are the same request here. LaneLimit needs
+	// the distinction because 0 is a meaningful answer; "no config" and "config not asked for" are not
+	// two things.
+	IncludeConfig bool `json:"includeConfig,omitempty"`
 
 	// LaneLimit is how many lanes to return. Nil is the producer's default; 0 asks for NONE, which is
 	// what a health banner wants — it needs the phase, the conditions and the rollup, and downloading

@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/BernardoCSACarreira/canal/pkg/config"
 	"github.com/BernardoCSACarreira/canal/pkg/connector"
 	"github.com/BernardoCSACarreira/canal/pkg/fault"
 	"github.com/BernardoCSACarreira/canal/pkg/record"
@@ -92,6 +93,28 @@ type nodeTally struct {
 // It is safe to call at any time, including before Run and after it returns — a completed bounded
 // pipeline still has to be able to say what it did, and a pipeline that has never started reports
 // [telemetry.PhasePending] rather than an empty document.
+// redactedConfigs builds the read model's config tree, or nil when it was not asked for.
+//
+// EVERY VALUE GOES THROUGH config.Config.Redacted, which replaces each DECLARED secret with
+// config.RedactedMarker. Structural rather than a per-call-site discipline, which is what
+// config.Redacted's own doc says the point of it is — a field marked secret in its spec is redacted
+// because of the marking, not because whoever wrote this remembered.
+//
+// Nil rather than an empty map when unasked, so the omitempty on the field means what it says: absent
+// because nobody wanted it, distinguishable from a pipeline whose nodes have no config at all.
+func redactedConfigs(q telemetry.StatusQuery, configs map[record.NodeID]*config.Config) map[string]any {
+	if !q.IncludeConfig || len(configs) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(configs))
+	for id, c := range configs {
+		// A nil config is a node that declared no fields. Redacted answers an empty tree for it, which
+		// is the honest rendering: the node is present and it configured nothing.
+		out[string(id)] = c.Redacted()
+	}
+	return out
+}
+
 func (p *Pipeline) Status(q telemetry.StatusQuery) telemetry.PipelineStatus {
 	now := time.Now()
 
@@ -121,6 +144,11 @@ func (p *Pipeline) Status(q telemetry.StatusQuery) telemetry.PipelineStatus {
 		Complete: true,
 
 		Negotiated: p.negotiated,
+
+		// ASKED FOR, never volunteered. See StatusQuery.IncludeConfig: a scrape and a health banner do
+		// not render configuration, and a per-worker status report would otherwise carry one pipeline's
+		// config once per worker on every interval.
+		Config: redactedConfigs(q, p.configs),
 	}
 
 	// A SINGLE WORKER REPORTING ON ITSELF HAS NO STALENESS THRESHOLD, and nil says so rather than

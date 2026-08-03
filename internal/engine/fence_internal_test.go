@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/BernardoCSACarreira/canal/internal/example/memstore"
+	"github.com/BernardoCSACarreira/canal/internal/ledger"
 	"github.com/BernardoCSACarreira/canal/pkg/connector"
 	"github.com/BernardoCSACarreira/canal/pkg/fault"
 	"github.com/BernardoCSACarreira/canal/pkg/record"
@@ -226,6 +227,70 @@ func TestRetiringALaneThisWorkerLostIsRefused(t *testing.T) {
 	}
 	if len(f.store.batches) != 0 {
 		t.Errorf("%d batches reached the store for a refused write", len(f.store.batches))
+	}
+}
+
+// DELETE IS THE ONE LANE MUTATION THE STORE CANNOT REFUSE, so this side has to.
+//
+// StateStore.Delete takes bare keys and no epoch, so there is no number for a store to compare and it
+// will do as it is told. Every other fenced operation degrades to a rejected write; this one degrades
+// to destroying connector state the NEW holder owns and is reading. The advisory check is therefore
+// worth more here than anywhere else it appears, which is the opposite of how it looks.
+func TestDeletingALaneThisWorkerLostIsRefused(t *testing.T) {
+	f := newFenceFixture(t, []record.LaneID{"a", "b"}, map[record.LaneID]uint64{"a": 5})
+	deleted := &countingDeleter{StateStore: memstore.New()}
+	sh := &stateHandle{deps: Deps{State: deleted, Log: f.ctl.deps.Log},
+		tenant: "acme", pipeline: "p1", node: "in", leases: f.leases}
+	ctx := context.Background()
+
+	if err := sh.Delete(ctx, "b"); err == nil {
+		t.Error("deleting the state of a lane this worker no longer holds succeeded")
+	} else if got := fault.ClassOf(err); got != fault.Fenced {
+		t.Errorf("the refusal classified as %s, want fenced: %v", got, err)
+	}
+	if deleted.calls != 0 {
+		t.Errorf("%d deletes reached the store; it cannot refuse them, which is why this must", deleted.calls)
+	}
+
+	// The lane this worker DOES hold is still deletable, or the check is just a broken feature.
+	if err := sh.Delete(ctx, "a"); err != nil {
+		t.Errorf("deleting a held lane's state was refused: %v", err)
+	}
+	if deleted.calls != 1 {
+		t.Errorf("%d deletes reached the store for a held lane, want 1", deleted.calls)
+	}
+}
+
+// countingDeleter counts the deletes that get past the engine.
+type countingDeleter struct {
+	store.StateStore
+	calls int
+}
+
+func (c *countingDeleter) Delete(_ context.Context, _ []store.Key) error {
+	c.calls++
+	return nil
+}
+
+// A FENCED FINISH COSTS THE LANE AND NOT THE PIPELINE.
+//
+// Making Finish refusable gave this call site a way to kill the whole run: finishLane escalated every
+// error from it to r.fail, so a lane reclaimed in the window between the read loop's revocation check
+// and its retirement would have taken every other lane down with it. store.Lease's doc draws the line
+// this asserts — "the loser's lane — not its whole process — is revoked" — and a change that tightens
+// a write must not widen a blast radius on the way.
+func TestAFencedFinishDoesNotFailTheRun(t *testing.T) {
+	f := newFenceFixture(t, []record.LaneID{"a"}, nil) // held by nobody: Finish will be refused
+	r := &runner{p: &Pipeline{ledger: ledger.New(ledger.Config{Tenant: "acme", Pipeline: "p1"})},
+		deps: f.ctl.deps}
+	defer r.p.ledger.Close()
+
+	r.finishLane(context.Background(), &sourceRuntime{lanes: f.ctl}, "a")
+
+	if err := r.firstError(); err != nil {
+		t.Errorf("a lane this worker had lost failed the whole run: %v\n"+
+			"  Every other lane this worker holds stops with it, which is the blast radius the "+
+			"per-lane lease exists to avoid", err)
 	}
 }
 

@@ -326,6 +326,19 @@ func (r *runner) retireFinished(ctx context.Context, rt *sourceRuntime, live []l
 // before the scan it waits behind is fully settled. The ErrEndOfInput path has always done this.
 func (r *runner) finishLane(ctx context.Context, rt *sourceRuntime, lane record.LaneID) {
 	if err := rt.lanes.Finish(context.WithoutCancel(ctx), lane); err != nil {
+		// A FENCED FINISH LOSES THE LANE, NOT THE PIPELINE, which is the blast radius store.Lease's
+		// own doc fixes: "the loser's lane — not its whole process — is revoked".
+		//
+		// Finish became refusable when it started carrying the lane's lease epoch, and this call site
+		// escalated every error to r.fail — so a lane reclaimed in the window between the read loop's
+		// revocation check and its retirement would have taken the whole run down with it. Nothing
+		// is lost by stopping here: the new holder reads the lane and retires it itself, and a
+		// revoked lane is acknowledged by nobody, so the ledger's flag would have no ack to ride on.
+		if fault.ClassOf(err) == fault.Fenced {
+			r.deps.Log.Warn("not retiring a lane this worker no longer holds; its new holder will",
+				"lane", lane, "error", err)
+			return
+		}
 		r.fail(err)
 	}
 	r.p.ledger.FinishLane(lane)

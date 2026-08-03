@@ -785,7 +785,20 @@ func (s *stateHandle) SetMany(ctx context.Context, w connector.StateWrite) error
 	return s.deps.State.Set(ctx, *batch)
 }
 
+// Delete removes one lane's connector state.
+//
+// IT IS THE ONE LANE MUTATION THE STORE CANNOT FENCE, because StateStore.Delete takes bare keys and
+// no epoch — so there is no number to be refused on and the store will do as it is told. That makes
+// the advisory check MORE important here rather than less: every other fenced operation degrades to
+// a rejected write, and this one degrades to destroying state the new holder owns and is reading.
+//
+// So it refuses locally, which is all this side can do, and the gap is named rather than implied. A
+// per-key epoch on Delete is a StateStore signature change.
 func (s *stateHandle) Delete(ctx context.Context, lane record.LaneID) error {
+	if _, mine := s.leases.fenceFor(lane, time.Now()); !mine {
+		return fault.New(fault.Fenced, fault.OpPersist,
+			fmt.Errorf("engine: lane %s is no longer held by this worker", lane))
+	}
 	return s.deps.State.Delete(ctx, []store.Key{s.key(lane)})
 }
 

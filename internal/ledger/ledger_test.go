@@ -458,3 +458,133 @@ func TestARevokedLaneIsNeitherFlushedNorAcknowledged(t *testing.T) {
 			"new holder has to absorb is the number this reports and an operator's only sight of it")
 	}
 }
+
+// A REVOCATION IS SURVIVABLE, AND THE WORK IT FENCED STAYS FENCED.
+//
+// The fence used to be a per-lane flag nothing could clear, so losing a lease cost the lane for the
+// rest of the process: a re-claimed lane would have been read normally and acknowledged never, pinning
+// the upstream's retention with nothing to say why, so the engine refused the re-claim outright. A
+// lease lost to a GC pause was a lane lost until a restart.
+//
+// A watermark can be outlived. This walks the whole sequence — hold at one epoch, lose it with records
+// still in flight, let those settle, be granted a higher epoch, and produce again — and pins the two
+// halves that have to be true at once: the new epoch works, and the old epoch's records are not in its
+// acknowledgement.
+func TestALaneRevokedAtOneEpochWorksAgainAtTheNext(t *testing.T) {
+	l := New(Config{Tenant: "acme", Pipeline: "p", DefaultBudget: 16, GroupTTL: time.Minute})
+	defer l.Close()
+	if err := l.Lane("lane-1", connector.OrderingPrefix, 16, connector.WhenFullBlock); err != nil {
+		t.Fatalf("Lane: %v", err)
+	}
+	acks := make(chan connector.Ack, 8)
+	go func() {
+		for a := range l.Acks() {
+			acks <- a
+		}
+	}()
+	drain := func() []connector.Ack {
+		var out []connector.Ack
+		for {
+			select {
+			case a := <-acks:
+				out = append(out, a)
+			case <-time.After(150 * time.Millisecond):
+				return out
+			}
+		}
+	}
+	settle := func(b *record.Batch) {
+		outs := make([]Outcome, 0, b.Len())
+		for _, r := range b.Records {
+			outs = append(outs, Outcome{Record: r.Origin().ID, Node: "out", Disposition: Delivered})
+		}
+		l.Settle(outs)
+	}
+	at := func(n byte) record.Position {
+		return record.Position{Order: []byte{n}, Token: record.Blob{Version: 1, Bytes: []byte{n}}, Safe: true}
+	}
+
+	// --- held at epoch 5 ---
+	l.SetEpoch("lane-1", 5)
+
+	// One batch that RESOLVES before the lease goes, and is never flushed. Its position sits in
+	// pendingFlush at revocation time, which is the half of the hazard the advance filter cannot reach:
+	// the advance was published while this worker legitimately held the lane, so only Revoke itself can
+	// drop it. Left behind, the re-claimed lane commits it under an epoch the store now accepts — and if
+	// another worker held the lane in between, that moves the durable cursor BACKWARDS.
+	early := batchAt(t, "lane-1", at(1), 2)
+	early.SetGroup(record.GroupID(1))
+	if err := l.Admit(context.Background(), early); err != nil {
+		t.Fatalf("admitting the early batch at epoch 5: %v", err)
+	}
+	settle(early)
+
+	// And one still in flight when it goes.
+	lost := batchAt(t, "lane-1", at(2), 4)
+	lost.SetGroup(record.GroupID(2))
+	if err := l.Admit(context.Background(), lost); err != nil {
+		t.Fatalf("admitting at epoch 5: %v", err)
+	}
+
+	// --- the lease goes while they are outstanding ---
+	if unsettled := l.Revoke("lane-1"); unsettled != 4 {
+		t.Errorf("Revoke reported %d unsettled records, want 4; that number is the duplicate window "+
+			"an operator is told to expect", unsettled)
+	}
+
+	// NO Committed PROBE HERE, deliberately. Asking a fenced lane for an acknowledgement directly is
+	// worth pinning and is pinned next door, in TestARevokedLaneIsNeitherFlushedNorAcknowledged. Doing
+	// it here set this lane's committed cursor TO the position the fenced work had reached, so
+	// Flushable's never-move-backwards invariant filtered the stale position instead of Revoke — and
+	// the check below passed whether or not Revoke discarded anything.
+	//
+	// They settle anyway, which Revoke's own doc requires: the ticket must be discharged or the lane's
+	// budget never frees. What they must not do is turn into an acknowledgement.
+	settle(lost)
+	if got := l.Flushable(); len(got) != 0 {
+		t.Errorf("a fenced lane was offered for flushing: %v", got)
+	}
+
+	// --- re-claimed at a higher epoch ---
+	l.SetEpoch("lane-1", 6)
+
+	// NOTHING IS FLUSHABLE THE INSTANT THE FENCE LIFTS, checked before any new work exists so a stale
+	// position cannot be masked by a fresh one. The fenced records settled, which advanced the tracker's
+	// prefix and left a pendingFlush behind; kept, that position would be committed under the new epoch
+	// — through a store fence that now accepts it — telling the upstream to discard through a cursor
+	// this worker produced while holding nothing. Revoke drops it, so the lane resumes from the last
+	// DURABLE position, which is what the new holder is promised.
+	if got := l.Flushable(); len(got) != 0 {
+		t.Errorf("a re-claimed lane offered %v for flushing before it had read anything; that is the "+
+			"fenced epoch's position surviving into the epoch that replaced it", got)
+	}
+
+	kept := batchAt(t, "lane-1", at(3), 3)
+	kept.SetGroup(record.GroupID(99)) // batchAt seeds every allocator alike; see the note in the test above
+	if err := l.Admit(context.Background(), kept); err != nil {
+		t.Fatalf("admitting at epoch 6 after a revocation at 5: %v\n"+
+			"  This is the whole point of a watermark: the lane is this worker's again", err)
+	}
+	settle(kept)
+
+	if _, ok := l.Flushable()["lane-1"]; !ok {
+		t.Fatal("a re-claimed lane never became flushable again, so its cursor can never advance " +
+			"and the upstream pins its retention forever — which is the outcome the engine used to " +
+			"avoid by refusing the re-claim")
+	}
+	l.Committed(map[record.LaneID]record.Position{"lane-1": at(3)})
+
+	got := drain()
+	if len(got) != 1 {
+		t.Fatalf("%d acknowledgements after the re-claim, want exactly 1: %+v", len(got), got)
+	}
+	if got[0].Epoch != 6 {
+		t.Errorf("the acknowledgement carries epoch %d, want 6", got[0].Epoch)
+	}
+	if got[0].Records != 3 {
+		t.Errorf("the acknowledgement covers %d records, want 3.\n"+
+			"  Seven means the four fenced records were counted into the epoch that replaced them, "+
+			"which tells the upstream to discard work this worker delivered while holding nothing",
+			got[0].Records)
+	}
+}

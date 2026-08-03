@@ -30,6 +30,14 @@ type group struct {
 	lane record.LaneID
 	node record.NodeID
 
+	// epoch is the lease epoch this group was ADMITTED under, and it is what makes a revocation
+	// survivable rather than terminal for the run. Suppressing acknowledgements with a per-lane
+	// boolean meant the flag could never be cleared: a lane revoked and then re-claimed would be
+	// read normally and acknowledged never, so the engine had to refuse the re-claim outright and a
+	// lease lost to a hiccup cost the lane for the rest of the process. Per group, the question has
+	// an answer that expires — this group belongs to a lost lease, that one does not.
+	epoch uint64
+
 	ticket  Ticket
 	refs    uint32
 	records int
@@ -119,8 +127,14 @@ type laneState struct {
 	// and a source that closed its cursor on the first one was called back twice.
 	finishAcked bool
 
-	revoked bool
-	epoch   uint64
+	// fencedThrough is the highest epoch whose work must never be acknowledged for this lane.
+	//
+	// A WATERMARK RATHER THAN A FLAG, so the fence can be outlived. Everything admitted at or below
+	// it belongs to a lease this worker lost; anything above it belongs to one it holds now. Zero
+	// means nothing has ever been revoked, which is why lease epochs start at one.
+	fencedThrough uint64
+
+	epoch uint64
 
 	blockedSince time.Time
 	blocked      bool
@@ -141,6 +155,24 @@ type laneState struct {
 	// two, and canal_records_abandoned_total's reason label is what tells an operator which kind of
 	// loss they are looking at.
 	shed uint64
+}
+
+// fenced reports whether the epoch this lane is currently held under is one a revocation covered.
+//
+// THE ZERO GUARD IS LOAD-BEARING. A lane whose epoch has never been set sits at zero, and so does a
+// lane that has never been revoked — so a bare "epoch <= fencedThrough" reads a pristine lane as
+// fenced and refuses its first admission. That is not hypothetical: it broke every ledger test that
+// builds a lane without calling SetEpoch, which is most of them, the moment the flag became a
+// watermark. Revoke never records a watermark below one, so a non-zero value means a revocation really
+// happened.
+func (st *laneState) fenced() bool { return st.fencedThrough > 0 && st.epoch <= st.fencedThrough }
+
+// fencedGroup reports whether work admitted at this epoch belongs to a lease that was revoked.
+//
+// Asked per GROUP rather than per lane, because a re-claimed lane holds both kinds at once: the
+// records it had in flight when the lease lapsed, and the ones it has produced since.
+func (st *laneState) fencedGroup(epoch uint64) bool {
+	return st.fencedThrough > 0 && epoch <= st.fencedThrough
 }
 
 // Ledger is the per-pipeline settlement graph. One Ledger holds one [Tracker] per prefix-ordered lane
@@ -257,7 +289,10 @@ func (l *Ledger) Admit(ctx context.Context, b *record.Batch) error {
 		l.mu.Unlock()
 		return fault.Contract(fault.OpBuffer, fmt.Errorf("ledger: lane %q is not registered", b.Lane))
 	}
-	if st.revoked {
+	// FENCED AT THE LANE'S CURRENT EPOCH, not forever. Admission is refused while the epoch this
+	// lane is held under is one the fence covers; a re-claim raises the epoch above the watermark and
+	// admission resumes, which is what makes a lapsed lease recoverable inside one run.
+	if st.fenced() {
 		l.mu.Unlock()
 		return fault.ErrFenced
 	}
@@ -315,6 +350,7 @@ func (l *Ledger) Admit(ctx context.Context, b *record.Batch) error {
 	pos := b.Position
 	g := &group{
 		lane:    b.Lane,
+		epoch:   st.epoch,
 		refs:    refs,
 		records: b.Len(),
 		handles: handles,
@@ -502,12 +538,31 @@ func (l *Ledger) Settle(outs []Outcome) {
 			// A discrete lane's tracker exists for the budget alone. Its prefix is meaningless —
 			// deliveries are acknowledged individually by handle — so the advance is discharged and
 			// discarded rather than published as a resolved position nothing should read.
-			if moved && st.ordering != connector.OrderingDiscrete {
+			// A FENCED GROUP'S POSITION IS NEVER PUBLISHED, and clearing it in Revoke instead was not
+			// enough. The records in flight when a lease lapses settle AFTERWARDS — that is what
+			// in-flight means — so a Revoke that only wiped the position already pending was overwritten
+			// by the next settlement, and the re-claimed lane offered the lost lease's cursor for
+			// flushing before it had read a single record. Found by injecting the missing half and
+			// watching the test fail without the injection too.
+			//
+			// The ticket is still discharged above, because the budget has to free either way.
+			if moved && st.ordering != connector.OrderingDiscrete && !st.fencedGroup(g.epoch) {
 				advances = append(advances, advance{lane: g.lane, pos: pos})
 			}
 		}
 
 		if g.settled >= g.refs {
+			// A GROUP FROM A FENCED EPOCH SETTLES AND IS NOT ACCOUNTED. It has to settle: the ticket
+			// must be discharged or the lane's budget never frees and admission blocks forever, which
+			// is what Revoke's doc means by "in-flight records still settle so that buffers drain".
+			// What it must not do is add itself to the counters the NEXT epoch's acknowledgement is
+			// built from — the per-lane flag this replaced could not tell the two epochs apart, so the
+			// only safe answer it had was to suppress the lane's acknowledgements for good.
+			if st.fencedGroup(g.epoch) {
+				delete(l.groups, gid)
+				st.pending--
+				continue
+			}
 			st.ackRecords += uint64(g.records)
 			st.ackAbandoned += g.abandoned
 			if o.Disposition == Abandoned {
@@ -558,7 +613,7 @@ func (l *Ledger) Flushable() map[record.LaneID]record.Position {
 	defer l.mu.Unlock()
 	var out map[record.LaneID]record.Position
 	for id, st := range l.lanes {
-		if !st.pendingFlushOK || st.revoked {
+		if !st.pendingFlushOK || st.fenced() {
 			continue
 		}
 		if st.committedOK {
@@ -605,10 +660,10 @@ func (l *Ledger) Committed(m map[record.LaneID]record.Position) {
 			st.ackRecords, st.ackAbandoned, st.ackAbandonedBy = 0, 0, nil
 			continue
 		}
-		if st.revoked {
+		if st.fenced() {
 			// The fence: in-flight records settled for accounting, but NO acknowledgement is ever
-			// delivered for a revoked lane. Letting a fenced worker tell an upstream to advance is
-			// specified data loss.
+			// delivered while the lane's epoch is one the fence covers. Letting a fenced worker tell an
+			// upstream to advance is specified data loss.
 			st.ackRecords, st.ackAbandoned, st.ackAbandonedBy = 0, 0, nil
 			continue
 		}
@@ -673,7 +728,7 @@ func (l *Ledger) emitDiscrete() {
 			st.ackRecords, st.ackAbandoned, st.ackAbandonedBy = 0, 0, nil
 			continue
 		}
-		if st.revoked {
+		if st.fenced() {
 			st.settledHandles, st.abandonedHandles = nil, nil
 			st.ackRecords, st.ackAbandoned, st.ackAbandonedBy = 0, 0, nil
 			continue
@@ -733,12 +788,24 @@ func (l *Ledger) send(a connector.Ack) {
 // bug created a deadlock in one surveyed system six days later.
 func (l *Ledger) Acks() <-chan connector.Ack { return l.acks }
 
-// Revoke stops emitting acknowledgements for a lane.
+// Revoke stops emitting acknowledgements for the lease a lane is currently held under.
 //
 // In-flight records still settle so that buffers drain and metrics are correct, but NO acknowledgement
-// for the lane is ever delivered after Revoke. That is the fence. The new holder resumes from the last
-// durable cursor and re-delivers whatever was in flight; the cost is up to one in-flight window of
-// duplicates per reassignment, and it is counted and disclosed rather than hidden.
+// for that work is ever delivered. That is the fence. The new holder resumes from the last durable
+// cursor and re-delivers whatever was in flight; the cost is up to one in-flight window of duplicates
+// per reassignment, and it is counted and disclosed rather than hidden.
+//
+// IT FENCES AN EPOCH, NOT A LANE FOREVER. This used to set a flag nothing could clear, which made a
+// revocation terminal for the rest of the process: a lane revoked and then re-claimed would be read
+// normally and acknowledged never, so the engine refused the re-claim outright and a lease lost to a
+// GC pause cost the lane until a restart. The watermark is what a later claim can rise above.
+//
+// THE RESOLVED PREFIX IS DISCARDED, and that half is not optional. A fenced group still settles, which
+// still advances the tracker's prefix and still leaves a pendingFlush behind. Kept, that position would
+// be committed by the NEXT epoch — through a store fence that now accepts it, because the epoch really
+// is current — and the upstream would be told to discard through a cursor this worker produced while it
+// held nothing. Dropping it means the re-claimed lane resumes from the last DURABLE position, which is
+// what the paragraph above promises the new holder does.
 func (l *Ledger) Revoke(lane record.LaneID) uint64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -746,7 +813,20 @@ func (l *Ledger) Revoke(lane record.LaneID) uint64 {
 	if !ok {
 		return 0
 	}
-	st.revoked = true
+	// Never below one, so the watermark itself is the record that a revocation happened. A lane
+	// revoked before any SetEpoch sits at epoch zero and must still be fenced.
+	at := st.epoch
+	if at < 1 {
+		at = 1
+	}
+	if at > st.fencedThrough {
+		st.fencedThrough = at
+	}
+	st.resolved, st.resolvedOK = record.Position{}, false
+	st.pendingFlush, st.pendingFlushOK = record.Position{}, false
+	st.ackRecords, st.ackAbandoned, st.ackAbandonedBy = 0, 0, nil
+	st.settledHandles, st.abandonedHandles = nil, nil
+
 	var unsettled uint64
 	for _, g := range l.groups {
 		if g.lane == lane {

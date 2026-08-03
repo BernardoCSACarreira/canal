@@ -30,6 +30,13 @@ import (
 // telling it about a lane somebody else now owns discards data the new holder has not delivered. So
 // commitPump asks before it acknowledges, and the check is on the path rather than in a comment.
 //
+// A REVOCATION IS NO LONGER TERMINAL FOR THE RUN, which is the newest thing here. This table used to
+// keep a `fenced` set of every lane it had ever lost and refuse to claim any of them again, because
+// Ledger.Revoke set a per-lane flag nothing could clear — so a re-claimed lane would have been read
+// normally and acknowledged never, and not holding it was the lesser harm. The ledger fences an EPOCH
+// now, so a claim above the watermark is clean and a lease lost to a GC pause costs one reassignment
+// delay instead of the rest of the process.
+//
 // A WORKER WITH NO COORDINATOR IS UNCHANGED. Every function here returns the single-worker answer
 // when deps.Coordinator is nil: lanes are held from Announce, the epoch is singleWorkerEpoch, and
 // nothing is ever revoked. That is not a fallback — it is the standalone deployment the architecture
@@ -46,21 +53,6 @@ type leaseTable struct {
 	mu   sync.Mutex
 	held map[record.LaneID]store.Lease
 
-	// fenced is every lane this process has been revoked off, and it is never emptied.
-	//
-	// ONCE FENCED, THIS RUN DOES NOT TAKE THE LANE BACK. Ledger.Revoke sets a flag the ledger never
-	// clears, so a lane that was revoked and then re-claimed would be read normally and acknowledged
-	// NEVER — the upstream would pin its retention forever with nothing to say why. That is worse
-	// than not holding the lane at all.
-	//
-	// The cost is real and bounded: a lease that lapses on a hiccup this process recovers from leaves
-	// its lane unread until another worker takes it, one reassignment delay later — and the delay
-	// exists precisely to make reclaiming your own lane the expected path. A restart clears it,
-	// because a fresh process has a fresh ledger. Clearing it in-process instead needs the ledger to
-	// support un-revoking a lane, which it does not, and which is a change to the fence rather than
-	// to this table.
-	fenced map[record.LaneID]bool
-
 	coord store.Coordinator
 	gen   uint64
 
@@ -71,9 +63,8 @@ type leaseTable struct {
 
 func newLeaseTable(d Deps, s specRefFields, gen uint64) *leaseTable {
 	return &leaseTable{
-		held:   map[record.LaneID]store.Lease{},
-		fenced: map[record.LaneID]bool{},
-		coord:  d.Coordinator, gen: gen,
+		held:  map[record.LaneID]store.Lease{},
+		coord: d.Coordinator, gen: gen,
 		tenant: s.tenant, pipeline: s.pipeline, worker: d.Worker,
 	}
 }
@@ -182,11 +173,17 @@ func (lt *leaseTable) claim(ctx context.Context, log *slog.Logger, rows []store.
 	for _, row := range rows {
 		lt.mu.Lock()
 		l, ok := lt.held[row.ID]
-		gone := lt.fenced[row.ID]
 		lt.mu.Unlock()
-		if (ok && l.Valid(now)) || gone {
+		if ok && l.Valid(now) {
 			continue
 		}
+
+		// A LANE THIS RUN WAS REVOKED OFF IS CLAIMED AGAIN, which it was not before. The refusal here
+		// existed because the ledger's fence was a per-lane flag nothing could clear: a re-claimed lane
+		// would be read normally and acknowledged never, pinning the upstream's retention with nothing
+		// to say why, so not holding the lane was the lesser harm. The fence is a per-epoch watermark
+		// now — Ledger.Revoke fences the epoch it was holding, and a claim arrives above it — so
+		// reclaiming is once again what DefaultReassignmentDelay exists to make the expected path.
 
 		got, err := lt.coord.Claim(ctx, store.AssignmentIDFor(lt.tenant, lt.pipeline, lt.gen, row.ID),
 			lt.worker, store.DefaultLeaseTTL)
@@ -239,7 +236,6 @@ func (lt *leaseTable) renew(ctx context.Context, log *slog.Logger) []record.Lane
 			"lane", lane, "epoch", l.Epoch, "error", err)
 		lt.mu.Lock()
 		delete(lt.held, lane)
-		lt.fenced[lane] = true
 		lt.mu.Unlock()
 		lost = append(lost, lane)
 	}

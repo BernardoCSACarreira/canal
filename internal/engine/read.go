@@ -147,9 +147,19 @@ func (r *runner) readLanes(ctx, deliverCtx context.Context, id record.NodeID,
 			"node", id, "lanes", len(live), "concurrent_reads", len(groups),
 			"declared", src.Caps.ReadConcurrency, "parallelism", r.p.spec.Parallelism)
 
-		// The groups get a context this loop can cancel WITHOUT touching deliverCtx: rebuilding stops
-		// reading, and cancelling a read means DRAIN, so whatever a source had already produced comes
-		// back from the interrupted call and is still admitted. See readLaneGroup.
+		// The groups get a context this loop can cancel WITHOUT touching deliverCtx, so rebuilding
+		// stops reading and never abandons a batch already on its way to a sink.
+		//
+		// WHAT HAPPENS TO THE INTERRUPTED READ DEPENDS ON THE SOURCE, and both outcomes are safe. A
+		// source that returns promptly on cancellation has DRAINED — its records come back with
+		// ctx.Err() and are admitted, because the read loop admits before it handles the error. One
+		// that does not return in time is ABANDONED, and then its batches are untouchable while its
+		// goroutine is still writing to them, so they are dropped unread.
+		//
+		// Nothing is lost either way, and for the same reason: an abandoned batch was never admitted,
+		// so no cursor advanced past its records and they are read again. Saying only the first half —
+		// which an earlier version of this comment did — claims a guarantee the abandoned path does
+		// not give.
 		gctx, stopGroups := context.WithCancel(ctx)
 		done := make(chan struct{})
 		var wg sync.WaitGroup
@@ -162,7 +172,7 @@ func (r *runner) readLanes(ctx, deliverCtx context.Context, id record.NodeID,
 		}
 		go func() { wg.Wait(); close(done) }()
 
-		next, rebuild := r.awaitLaneChange(ctx, rt, id, done, laneIDsOf(live))
+		next, rebuild := r.awaitLaneChange(ctx, rt.lanes, id, done, laneIDsOf(live))
 		stopGroups()
 		wg.Wait()
 		if !rebuild {
@@ -170,6 +180,18 @@ func (r *runner) readLanes(ctx, deliverCtx context.Context, id record.NodeID,
 		}
 		assigned = next
 	}
+}
+
+// laneWatcher is the two methods awaitLaneChange needs from a lane table.
+//
+// NARROWED FOR A SEAM, and the seam is the point. The ORDER in which the two are called is the whole
+// correctness of the loop below, and laneCtl is a concrete type — so with *sourceRuntime as the
+// parameter there was no way to interleave an announce between the calls, and the ordering was held
+// in place by an argument and nothing else. An interface lets a test supply an Assigned that
+// announces as a side effect, which is exactly the window.
+type laneWatcher interface {
+	Changes() <-chan struct{}
+	Assigned(context.Context) ([]connector.LaneAssignment, error)
 }
 
 // awaitLaneChange blocks until the read set needs rebuilding, the readers finish, or the run stops.
@@ -180,35 +202,57 @@ func (r *runner) readLanes(ctx, deliverCtx context.Context, id record.NodeID,
 // Rebuilding on a removal would cancel every other lane's in-flight read to learn something the
 // reader had already acted on — for a bounded source finishing thirty chunks one at a time, thirty
 // pointless restarts.
-func (r *runner) awaitLaneChange(ctx context.Context, rt *sourceRuntime, id record.NodeID,
+func (r *runner) awaitLaneChange(ctx context.Context, lanes laneWatcher, id record.NodeID,
 	done <-chan struct{}, owned map[record.LaneID]bool,
 ) ([]connector.LaneAssignment, bool) {
+	var readersDone bool
 	for {
-		changed := rt.lanes.Changes()
+		// THE CHANNEL IS TAKEN BEFORE THE TABLE IS READ, and that ordering is this loop's whole
+		// correctness. notify() CLOSES the channel it holds and installs a fresh one, so a channel
+		// taken here is a promise to be woken for anything that happens after this line.
+		//
+		// Waiting first and reading after loses an announce permanently. The window is between the
+		// Assigned() call and the next time round: a notify landing there closes a channel nobody is
+		// holding any more, and the fresh channel this loop then waits on is not closed again until
+		// the NEXT announce — which for a source that announces once is never. Taking it first turns
+		// that window into an already-closed channel and one extra, harmless lap.
+		//
+		// PINNED, and it took a seam to pin. No fixture driving a real connector can aim at a window two
+		// adjacent statements wide: reversing these lines leaves
+		// TestALaneAnnouncedAfterReadingStartedIsRead green — measured, three runs — because that
+		// source announces from inside ReadLanes, so the next read produces another notify and the lost
+		// wake-up is recovered by it. That is why the parameter is [laneWatcher] rather than the
+		// concrete table. A fake whose Assigned ANNOUNCES AS A SIDE EFFECT puts the notify exactly
+		// here, whichever order the two calls are in, and reversing them then hangs the loop for good.
+		// See TestAnAnnounceBetweenTakingTheChannelAndReadingTheTableIsNotLost.
+		changed := lanes.Changes()
+
+		next, err := lanes.Assigned(ctx)
+		if err != nil {
+			r.fail(err)
+			return nil, false
+		}
+		if gained := added(next, owned); len(gained) > 0 {
+			r.deps.Log.Info("picking up lanes announced since this source started reading",
+				"node", id, "gained", len(gained), "reading", len(next))
+			return next, true
+		}
+		// Nothing gained and nobody reading: every lane this source held is finished or revoked, and
+		// the check above has just confirmed no late arrival is waiting. This is the ordinary end of a
+		// bounded source.
+		if readersDone {
+			return nil, false
+		}
+
 		select {
 		case <-ctx.Done():
 			return nil, false
 		case <-done:
-			// Every reader returned: the lanes it held are finished or revoked. A lane announced in
-			// the same moment is still worth picking up, so this asks once more before giving up.
-			next, err := rt.lanes.Assigned(ctx)
-			if err != nil || len(added(next, owned)) == 0 {
-				return nil, false
-			}
-			return next, true
+			// One more lap rather than an immediate return, so a lane announced in the same moment the
+			// last reader finished is still picked up — with the channel already taken above, that
+			// check cannot race the announce either.
+			readersDone = true
 		case <-changed:
-			next, err := rt.lanes.Assigned(ctx)
-			if err != nil {
-				r.fail(err)
-				return nil, false
-			}
-			gained := added(next, owned)
-			if len(gained) == 0 {
-				continue
-			}
-			r.deps.Log.Info("picking up lanes announced since this source started reading",
-				"node", id, "gained", len(gained), "reading", len(next))
-			return next, true
 		}
 	}
 }

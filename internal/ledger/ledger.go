@@ -102,6 +102,23 @@ type laneState struct {
 	ackAbandoned uint64
 	laneFinished bool
 
+	// pending counts this lane's groups that are open in l.groups: admitted and not yet resolved.
+	//
+	// It exists so LaneFinished can mean what Ack says it means — "the FINAL ack for a finished lane;
+	// after it, Commit is not called for the lane again" — rather than "an ack that happened to be
+	// emitted after the engine set a flag". Without it the flag rode whichever ack came next, which
+	// on a prefix lane is an ack for the resolved prefix and can be an ack for records with more
+	// still in flight behind them. Stats computes the same number by scanning l.groups; this is the
+	// one the ack path reads, because it is on the settlement path and that scan is not.
+	pending int
+
+	// finishAcked records that the lane's final acknowledgement has gone out, after which nothing
+	// more is ever sent for it. "LaneFinished is true on the FINAL ack; after it, Commit is not
+	// called for the lane again" is a promise with two halves, and the second half needs this: the
+	// flag is sticky, so without it every subsequent flush acknowledged the lane as finished again
+	// and a source that closed its cursor on the first one was called back twice.
+	finishAcked bool
+
 	revoked bool
 	epoch   uint64
 
@@ -382,6 +399,7 @@ func (l *Ledger) Admit(ctx context.Context, b *record.Batch) error {
 
 	g.ticket = ticket
 	l.groups[b.Group()] = g
+	st.pending++
 	for _, r := range b.Records {
 		l.byRec[r.Origin().ID] = b.Group()
 	}
@@ -506,6 +524,7 @@ func (l *Ledger) Settle(outs []Outcome) {
 				st.abandonedHandles = append(st.abandonedHandles, g.abandonedHandles...)
 			}
 			delete(l.groups, gid)
+			st.pending--
 		}
 	}
 
@@ -580,6 +599,12 @@ func (l *Ledger) Committed(m map[record.LaneID]record.Position) {
 		st.recordsCommitted += st.ackRecords
 		st.admittedSinceSafe = 0
 
+		if st.finishAcked {
+			// The lane has already had its final acknowledgement. The cursor still moves — the
+			// numbers above are the read model's — but the source is not told again.
+			st.ackRecords, st.ackAbandoned, st.ackAbandonedBy = 0, 0, nil
+			continue
+		}
 		if st.revoked {
 			// The fence: in-flight records settled for accounting, but NO acknowledgement is ever
 			// delivered for a revoked lane. Letting a fenced worker tell an upstream to advance is
@@ -591,14 +616,20 @@ func (l *Ledger) Committed(m map[record.LaneID]record.Position) {
 			continue
 		}
 		out = append(out, connector.Ack{
-			Lane:         id,
-			Epoch:        st.epoch,
-			Through:      pos,
-			Records:      st.ackRecords,
-			Abandoned:    st.ackAbandoned,
-			AbandonedBy:  st.ackAbandonedBy,
-			LaneFinished: st.laneFinished,
+			Lane:        id,
+			Epoch:       st.epoch,
+			Through:     pos,
+			Records:     st.ackRecords,
+			Abandoned:   st.ackAbandoned,
+			AbandonedBy: st.ackAbandonedBy,
+			// ONLY ONCE EVERYTHING ADMITTED FOR THE LANE HAS SETTLED, which is what this method's
+			// own doc has always said and what Ack.LaneFinished promises the source: after it,
+			// Commit is not called for the lane again. A prefix lane's ack reports the RESOLVED
+			// prefix, so an ungated flag rode an ack for position 40 while 41 and 42 were still in
+			// flight — telling the source the lane was done and then committing past it twice.
+			LaneFinished: st.laneFinished && st.pending == 0,
 		})
+		st.finishAcked = st.laneFinished && st.pending == 0
 		st.ackRecords, st.ackAbandoned, st.ackAbandonedBy = 0, 0, nil
 	}
 	l.mu.Unlock()
@@ -608,8 +639,15 @@ func (l *Ledger) Committed(m map[record.LaneID]record.Position) {
 	}
 }
 
-// FinishLane marks a bounded lane's finish, which the engine does only once every group admitted for it
-// has settled AND that fact is durable. The next acknowledgement for the lane carries LaneFinished.
+// FinishLane marks a lane as retiring. The engine calls it when the source says so — ErrEndOfInput,
+// or record.Batch.EndOfLane on the batch itself — and the lane's final acknowledgement, the first
+// one emitted after everything admitted for it has settled, carries LaneFinished.
+//
+// THE ENGINE MARKS BEFORE IT ADMITS THE FINAL BATCH, and the wait is enforced HERE rather than
+// there. Asking the caller to wait was the old arrangement and it lost a race it could not see: the
+// engine set the flag after the last batch was delivered, by which time the flush loop had often
+// already acknowledged that batch's position, so the acknowledgement carrying LaneFinished was
+// never emitted at all. Two lanes in eight learned they had finished.
 func (l *Ledger) FinishLane(lane record.LaneID) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -629,6 +667,12 @@ func (l *Ledger) emitDiscrete() {
 		if len(st.settledHandles) == 0 && len(st.abandonedHandles) == 0 {
 			continue
 		}
+		if st.finishAcked {
+			// Already told, once. See laneState.finishAcked.
+			st.settledHandles, st.abandonedHandles = nil, nil
+			st.ackRecords, st.ackAbandoned, st.ackAbandonedBy = 0, 0, nil
+			continue
+		}
 		if st.revoked {
 			st.settledHandles, st.abandonedHandles = nil, nil
 			st.ackRecords, st.ackAbandoned, st.ackAbandonedBy = 0, 0, nil
@@ -642,8 +686,9 @@ func (l *Ledger) emitDiscrete() {
 			Records:          st.ackRecords,
 			Abandoned:        st.ackAbandoned,
 			AbandonedBy:      st.ackAbandonedBy,
-			LaneFinished:     st.laneFinished,
+			LaneFinished:     st.laneFinished && st.pending == 0,
 		})
+		st.finishAcked = st.laneFinished && st.pending == 0
 		st.settledHandles, st.abandonedHandles = nil, nil
 		st.recordsCommitted += st.ackRecords
 		st.ackRecords, st.ackAbandoned, st.ackAbandonedBy = 0, 0, nil

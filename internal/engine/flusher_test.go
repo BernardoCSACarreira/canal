@@ -40,6 +40,14 @@ type flusher struct {
 	flushErr error
 	deferAll bool
 
+	// durableUpTo caps how many accepted records one flush makes durable; zero means all of them.
+	//
+	// It buys a PARTIAL settlement — some of a lane's groups resolved while the rest are still in
+	// flight — which is the state a real sink reaches whenever its own durability boundary falls
+	// mid-batch, and the only state in which several of the ledger's rules are distinguishable from
+	// their absence.
+	durableUpTo int
+
 	// pending is what Write has taken since the last successful Flush, so the fixture can answer
 	// Deferred with real record ids.
 	pending []record.RecordID
@@ -76,9 +84,22 @@ func (f *flusher) Flush(_ context.Context, reason connector.FlushReason) (connec
 		out := connector.WriteResult{Deferred: append([]record.RecordID(nil), f.pending...)}
 		return out, nil
 	}
-	f.durable = append(f.durable, f.accepted[len(f.durable):]...)
-	f.pending = nil
-	return connector.WriteResult{}, nil
+	// One record per accepted line, so the two slices index alike.
+	newly := f.accepted[len(f.durable):]
+	n := len(newly)
+	if f.durableUpTo > 0 && f.durableUpTo < n {
+		n = f.durableUpTo
+	}
+	f.durable = append(f.durable, newly[:n]...)
+
+	// What this flush did not cover stays pending and is reported as Deferred: accepted, not
+	// durable, do not resend.
+	deferred := append([]record.RecordID(nil), f.pending[min(n, len(f.pending)):]...)
+	f.pending = deferred
+	if len(deferred) == 0 {
+		return connector.WriteResult{}, nil
+	}
+	return connector.WriteResult{Deferred: deferred}, nil
 }
 
 func (f *flusher) snapshot() (accepted, durable []string, reasons []connector.FlushReason) {

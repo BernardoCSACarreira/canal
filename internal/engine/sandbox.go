@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime/debug"
 	"sync"
@@ -81,6 +82,15 @@ func (i *inflight) settle(ctx context.Context, node record.NodeID) bool {
 	}
 }
 
+// errAbandoned marks a call the sandbox gave up waiting for.
+//
+// IT IS THE ONE ERROR AFTER WHICH THE REQUEST IS NOT THE CALLER'S TO TOUCH. Every other error means
+// the component returned and handed its argument back; this one means the component's goroutine is
+// still running and still writing to whatever it was given. A caller that reads a batch after it —
+// even to ask how many records are in it — races the source's next Add, which is what the race
+// detector found the first time the read loop tried to admit a batch before inspecting the error.
+var errAbandoned = errors.New("the call was abandoned")
+
 // sandbox runs one plugin call in a goroutine with recover, and selects on ctx.
 //
 // A panic becomes fault.PermanentInternal naming the component; a hang lets the host ABANDON the call and
@@ -158,6 +168,6 @@ func sandbox[Req, Res any](ctx context.Context, p *Pipeline, node record.NodeID,
 		p.obs.abandonedCall(node)
 		var zero Res
 		return zero, fault.Internal(fault.OpUnknown,
-			fmt.Errorf("component %q did not return before its deadline; the call was abandoned: %w", name, ctx.Err()))
+			fmt.Errorf("component %q did not return before its deadline; %w: %w", name, errAbandoned, ctx.Err()))
 	}
 }

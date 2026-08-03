@@ -8,6 +8,7 @@ import (
 	"github.com/BernardoCSACarreira/canal/internal/example/memstore"
 	"github.com/BernardoCSACarreira/canal/pkg/fault"
 	"github.com/BernardoCSACarreira/canal/pkg/store"
+	"github.com/BernardoCSACarreira/canal/pkg/storetest"
 )
 
 // THIS STORE DECLARED EpochFencing AND DID NOT IMPLEMENT IT, for as long as it had existed.
@@ -130,4 +131,21 @@ func TestThisStoreStillClaimsToFence(t *testing.T) {
 		t.Fatal("this store no longer declares EpochFencing; either implement it or delete the " +
 			"tests above, because they assert a promise nothing makes")
 	}
+}
+
+// THE CONTRACT'S OWN SUITE, and this store is the reason it exists.
+//
+// It declared StoreCaps.EpochFencing and compared the batch's default epoch where the rule is per key.
+// Every coordinated engine test runs against this store, so the fence those tests were written to
+// exercise was not there — and the test above, copied from pkg/store/wal, could not fail either
+// because its batch default sat below every stored epoch.
+//
+// Reopen is nil, and that is an answer rather than a gap: this store keeps everything in RAM, which
+// StoreCaps.Durability already reports as DurabilityNone. FlushIsDurable is still true and still
+// honest — the bytes are durable by the time Set returns, in the only domain this store has.
+func TestConformance(t *testing.T) {
+	storetest.Run(t, storetest.Subject{
+		Name: "memstore",
+		New:  func(*testing.T) store.StateStore { return memstore.New() },
+	})
 }

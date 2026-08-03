@@ -46,6 +46,10 @@ var declared = map[string][]string{
 	"pkg/store":         {"pkg/connector", "pkg/record", "pkg/spec", "pkg/telemetry"},
 	"pkg/store/wal":     {"pkg/connector", "pkg/fault", "pkg/record", "pkg/store"},
 	"pkg/connectortest": {"pkg/config", "pkg/connector", "pkg/fault", "pkg/record", "pkg/schema"},
+	// pkg/storetest is the conformance suite for store.StateStore, and it sits beside
+	// pkg/connectortest for the same reason: a contract is only real if something INDEPENDENT of
+	// the implementation can check it. Its imports are the contract's own surface and nothing else.
+	"pkg/storetest": {"pkg/fault", "pkg/record", "pkg/store"},
 
 	// internal/ — engine machinery. Nothing under pkg/ may import any of it.
 	"internal/ledger": {"pkg/connector", "pkg/fault", "pkg/record"},

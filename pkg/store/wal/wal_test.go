@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/BernardoCSACarreira/canal/pkg/connector"
 	"github.com/BernardoCSACarreira/canal/pkg/fault"
 	"github.com/BernardoCSACarreira/canal/pkg/store"
+	"github.com/BernardoCSACarreira/canal/pkg/storetest"
 )
 
 func open(t *testing.T, dir string) *StateStore {
@@ -495,4 +497,52 @@ func TestCapabilitiesNeedNoOpenStore(t *testing.T) {
 	if got, want := s.Capabilities(), Caps(); got != want {
 		t.Errorf("an opened store reports %+v but Caps reports %+v", got, want)
 	}
+}
+
+// THE CONTRACT IS CHECKED BY THE CONTRACT'S OWN SUITE, not only by tests that live next to this
+// implementation.
+//
+// Everything above stays because it is about this store's FILE FORMAT — torn tails, a corrupt byte at
+// every offset, compaction, a second open, a foreign file. Those are wal's properties and belong here.
+// What the suite takes over is what every StateStore owes its callers, and TestPerKeyEpochIsHonoured
+// above is the reason: it could not fail until the batch default was raised, and a sibling store
+// inherited that hole when the test was copied. A shared suite is the only version of this check that
+// cannot be copied wrong twice.
+func TestConformance(t *testing.T) {
+	// The directory is remembered HERE rather than exposed as an accessor on the store. Reopen needs to
+	// know where the bytes are, and adding an exported Dir() to production code so that a test can call
+	// it is the wrong direction — nothing else wants it.
+	var mu sync.Mutex
+	dirs := map[*StateStore]string{}
+
+	storetest.Run(t, storetest.Subject{
+		Name: "wal",
+		New: func(t *testing.T) store.StateStore {
+			dir := t.TempDir()
+			s := open(t, dir)
+			mu.Lock()
+			dirs[s] = dir
+			mu.Unlock()
+			t.Cleanup(func() { s.Close() })
+			return s
+		},
+		// A reopen over the SAME directory, which is what makes "the bytes were durable when Set
+		// returned" an assertable claim rather than a declared one.
+		Reopen: func(t *testing.T, s store.StateStore) store.StateStore {
+			w, ok := s.(*StateStore)
+			if !ok {
+				t.Fatalf("the subject is %T, not this package's store", s)
+			}
+			mu.Lock()
+			dir, known := dirs[w]
+			mu.Unlock()
+			if !known {
+				t.Fatal("this store was not created by the New above, so its directory is unknown")
+			}
+			if err := w.Close(); err != nil {
+				t.Fatalf("closing before reopen: %v", err)
+			}
+			return open(t, dir)
+		},
+	})
 }

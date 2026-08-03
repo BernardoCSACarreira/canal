@@ -203,11 +203,21 @@ func (s *StateStore) replay() error {
 	return nil
 }
 
-// apply folds one decoded entry into the index. Used by replay only; the write path updates the
-// index directly so it can reuse the values it already holds.
+// apply folds one decoded entry into the index, for both replay and the write path.
+//
+// IT COPIES, and the reuse it used to do was a real defect rather than an optimisation. On the write
+// path w.value is the CALLER'S slice, straight off store.Batch, so the index held memory the caller
+// still owned: a caller reusing its buffer after Set rewrote what had landed, silently and after the
+// fsync that was supposed to have made it final. Get and Range have always cloned on the way out —
+// this is the same rule in the direction nobody had checked, and the store's conformance suite is what
+// found it.
+//
+// On replay the values come fresh from the decoder, so the copy there is redundant. It happens once per
+// key at open, and paying it buys an invariant that holds without a caller having to know which path
+// put a row in the index.
 func (s *StateStore) apply(e entry) {
 	for _, w := range e.writes {
-		s.data[w.key.String()] = store.Versioned{Key: w.key, Value: w.value, Version: w.version}
+		s.data[w.key.String()] = clone(store.Versioned{Key: w.key, Value: w.value, Version: w.version})
 		if w.epochSeen > s.epochs[w.key.String()] {
 			s.epochs[w.key.String()] = w.epochSeen
 		}

@@ -164,7 +164,16 @@ func TestPerKeyEpochIsHonoured(t *testing.T) {
 	}
 
 	// lane-a is still held at 10; lane-b's lease moved on and this worker is behind on it.
-	b = store.NewBatch(1)
+	//
+	// THE BATCH DEFAULT IS 100 SO THAT THIS TEST CAN FAIL. It was 1, which is below every stored
+	// epoch — so a store comparing the BATCH's number rather than each key's refused the write too,
+	// and this test passed either way. Measured: replacing EpochFor(v) with w.Epoch in Set left the
+	// whole package green. A sibling store made exactly that mistake and shipped it, because its
+	// equivalent test was copied from this one along with the hole.
+	//
+	// At 100 the batch-level comparison accepts and only the per-key one refuses, which is the
+	// difference the test's own name claims to be about.
+	b = store.NewBatch(100)
 	b.PutFenced(key("p", "lane-a"), []byte("a2"), 1, 10)
 	b.PutFenced(key("p", "lane-b"), []byte("b2"), 1, 15) // stale: lane-b is at 20
 	if err := s.Set(context.Background(), *b); !errors.Is(err, fault.ErrFenced) {

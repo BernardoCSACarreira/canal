@@ -96,8 +96,21 @@ type Header struct {
 	// one surveyed status API structurally cannot.
 	Generation uint64 `json:"generation"`
 
-	// Epoch is the writing worker's lease token. The store REJECTS a write whose epoch is stale for any
-	// lane it touches.
+	// Epoch is the DEFAULT fence the checkpoint's batch was written under, and it is recorded rather
+	// than enforced. It used to say it was "the writing worker's lease token" and that the store
+	// rejects a stale one — which described the BATCH's behaviour, not this field's, and assumed one
+	// epoch per worker.
+	//
+	// There is no such number. A worker holds each lane under its own lease at its own epoch, so the
+	// cursors in this checkpoint are fenced individually through store.Batch.PutFenced and this value
+	// fences only the envelope key. The checkpoint is still protected against a fenced writer, and
+	// transitively rather than by this field: its lane cursors share the one atomic batch, the store
+	// rejects the whole batch if any key's epoch is stale, so a worker that has lost a lane cannot
+	// land the checkpoint either.
+	//
+	// STILL TO DO: nothing reads this, and the per-lane epochs it was standing in for are not durable
+	// anywhere. LaneState is where they belong — an additive field, which the format contract allows —
+	// and that is a checkpoint-format change rather than part of wiring the fence.
 	Epoch  uint64 `json:"epoch"`
 	Worker string `json:"worker"`
 

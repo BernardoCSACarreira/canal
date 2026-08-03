@@ -27,15 +27,30 @@ import (
 // change are marked. Nothing here PRETENDS to be coordinated: laneCtl.Revoked always answers false
 // because in a single process it truthfully never happens, rather than because the check is missing.
 
-// STILL TO DO, AND LABELLED RATHER THAN IMPLIED: every durable write here carries singleWorkerEpoch,
-// including a lane's cursor. The engine now holds real per-lane leases and refuses to advance an
-// upstream for a lane it has lost (lease.go), which is the fence that protects an upstream — but the
-// STATE STORE's own per-key epoch check is not yet fed the lane's lease epoch, so two workers racing
-// on one lane are separated by the coordinator rather than by the store. store.Batch.PutFenced
-// exists for exactly that write and is the next change; it is a per-call-site edit because the
-// batches here span several lanes and one of them is not lane-scoped at all.
+// A LANE'S DURABLE WRITES CARRY THAT LANE'S OWN LEASE EPOCH, which is what makes the state store —
+// and not merely the coordinator — the thing that separates two workers racing on one lane.
+//
+// This used to be a STILL-TO-DO here: every write went out at singleWorkerEpoch, so a worker whose
+// lease had moved on was stopped by the engine's own checks and by nothing underneath them. The store
+// has enforced per-key epochs the whole time (wal rejects a write below the highest epoch seen for a
+// key, and declares EpochFencing) and was simply never fed the number.
+//
+// It is per-call-site rather than one batch epoch, because a batch here spans every lane whose prefix
+// advanced this tick and each is held under its own lease. Where each site landed, and why:
+//
+//   - stage, the CURSOR — PutFenced per lane, and a lane this worker has lost is DROPPED from the
+//     batch rather than failing it. This is the write the whole fencing story is about.
+//   - mutate, the LANE ROW — PutFenced, and refuses. Single-lane, so there is nothing to drop.
+//   - stateHandle.Set and SetMany — PutFenced per lane. Set refuses; SetMany refuses for the whole
+//     call, because a connector asked for one atomic write and a subset breaks that promise.
+//   - announceMany — the batch default, because the lane does not exist yet so nobody holds a lease
+//     over it. Idempotent on a derived id, so there is no race to lose.
+//   - stateHandle.SetShared — the batch default. Node state belongs to no lane.
+//
+// STILL TO DO: Delete is unfenceable through StateStore.Delete, which takes bare keys and no epoch.
 
-// singleWorkerEpoch is the fencing token every durable write carries while canal is single-process.
+// singleWorkerEpoch is the epoch a lane is held under when there is no coordinator, and the DEFAULT
+// fence on every batch — the value that applies to keys which are not a single lane's.
 //
 // It is 1 rather than 0 because store.Versioned treats a zero epoch as "use the batch's", and
 // because a real coordinator will hand out increasing epochs from 1 — so the first coordinated
@@ -219,6 +234,17 @@ func (l *laneCtl) announceMany(ctx context.Context, specs []connector.LaneSpec) 
 	defer l.writeMu.Unlock()
 
 	l.mu.Lock()
+
+	// ANNOUNCE IS THE ONE LANE WRITE THAT CANNOT BE FENCED BY A LANE'S LEASE, because the lane does
+	// not exist yet and therefore nobody holds one. A planner assigns from the durable lane table, so
+	// the row has to be there before there is anything to grant a lease over; fencing this write on a
+	// lease would be waiting for a token that only its own completion can produce.
+	//
+	// Safe, and not merely unavoidable. The id is DERIVED from tenant, pipeline, node and the
+	// connector's own lane name, so two workers announcing the same lane compute the same id and the
+	// write is idempotent on it — there is no race for one of them to lose. What a lease protects is
+	// the CURSOR and the retirement, which are writes about a lane's progress rather than its
+	// existence, and both of those are fenced. See stage and mutate.
 	batch := store.NewBatch(singleWorkerEpoch)
 	ids := make([]record.LaneID, 0, len(specs))
 	fresh := make([]*laneRecord, 0, len(specs))
@@ -469,6 +495,7 @@ func (l *laneCtl) commit(ctx context.Context, positions map[record.LaneID]record
 func (l *laneCtl) stage(batch *store.Batch, positions map[record.LaneID]record.Position) (func(bool), error) {
 	l.writeMu.Lock()
 
+	now := time.Now()
 	l.mu.Lock()
 	staged := make(map[record.LaneID]record.Position, len(positions))
 	for id, pos := range positions {
@@ -476,6 +503,29 @@ func (l *laneCtl) stage(batch *store.Batch, positions map[record.LaneID]record.P
 		if !ok {
 			continue
 		}
+
+		// THE CURSOR IS THE WRITE THE WHOLE FENCING STORY IS ABOUT, so it carries the lane's OWN
+		// lease epoch rather than the batch's default. A batch here spans every lane whose prefix
+		// advanced this tick, each held under its own lease at its own epoch, and one number for all
+		// of them is unfenceable in both directions: high enough for the lanes still held is high
+		// enough for the ones already lost.
+		//
+		// A LANE THIS WORKER NO LONGER HOLDS IS DROPPED FROM THE BATCH, not written with a number
+		// that would land. Dropping rather than failing, because the batch is atomic and the other
+		// lanes' cursors are this worker's to commit — failing the write would let one reclaimed lane
+		// stall every other lane's progress, which is the blast radius store.Lease's doc rules out:
+		// "the loser's lane — not its whole process — is revoked".
+		//
+		// Reaching this at all means an earlier fence let it through. Ledger.Flushable does not offer
+		// a revoked lane, so a position for one should never arrive here — which is why it is logged
+		// rather than passed over in silence.
+		epoch, mine := l.leases.fenceFor(id, now)
+		if !mine {
+			l.deps.Log.Warn("not persisting a cursor for a lane this worker no longer holds",
+				"node", l.node, "lane", id)
+			continue
+		}
+
 		next := *rec
 		next.Cursor = pos
 		body, err := json.Marshal(&next)
@@ -484,7 +534,7 @@ func (l *laneCtl) stage(batch *store.Batch, positions map[record.LaneID]record.P
 			l.writeMu.Unlock()
 			return func(bool) {}, fmt.Errorf("engine: encoding lane %s: %w", id, err)
 		}
-		batch.Put(store.LaneKey(l.fields.tenant, l.fields.pipeline, id), body, l.versions[id])
+		batch.PutFenced(store.LaneKey(l.fields.tenant, l.fields.pipeline, id), body, l.versions[id], epoch)
 		staged[id] = pos
 	}
 	l.mu.Unlock()
@@ -525,8 +575,18 @@ func (l *laneCtl) mutate(ctx context.Context, id record.LaneID, f func(*laneReco
 		return fmt.Errorf("engine: encoding lane %s: %w", id, err)
 	}
 
+	// Fenced by the lane's own lease, like the cursor: retiring a lane and gating another on it are
+	// writes on that lane's behalf, and a worker that has lost it has no business making either.
+	// Unlike the cursor this is a SINGLE-lane write, so there is nothing to drop — refusing is the
+	// whole answer, and fault.ErrFenced is what the state store itself would have returned.
+	epoch, mine := l.leases.fenceFor(id, time.Now())
+	if !mine {
+		return fault.New(fault.Fenced, fault.OpPersist,
+			fmt.Errorf("engine: lane %s is no longer held by this worker", id))
+	}
+
 	batch := store.NewBatch(singleWorkerEpoch)
-	batch.Put(store.LaneKey(l.fields.tenant, l.fields.pipeline, id), body, l.versionOf(id))
+	batch.PutFenced(store.LaneKey(l.fields.tenant, l.fields.pipeline, id), body, l.versionOf(id), epoch)
 	if err := l.deps.State.Set(ctx, *batch); err != nil {
 		return err
 	}
@@ -598,6 +658,11 @@ type stateHandle struct {
 	tenant   record.TenantID
 	pipeline record.PipelineID
 	node     record.NodeID
+
+	// leases fences the LANE-scoped writes. A connector's per-lane state is written on a lane's
+	// behalf exactly as its cursor is, so it earns the same epoch and the same refusal; the
+	// node-shared value is not a lane's and gets neither. See set and SetShared.
+	leases *leaseTable
 }
 
 func (s *stateHandle) key(lane record.LaneID) store.Key {
@@ -629,44 +694,111 @@ func (s *stateHandle) get(ctx context.Context, k store.Key) (record.Blob, uint64
 	return b, v.Version, nil
 }
 
+// Set writes ONE lane's connector state, fenced by that lane's lease.
 func (s *stateHandle) Set(ctx context.Context, lane record.LaneID, b record.Blob, ifVersion uint64) (uint64, error) {
-	return s.set(ctx, s.key(lane), b, ifVersion)
+	epoch, mine := s.leases.fenceFor(lane, time.Now())
+	if !mine {
+		return 0, fault.New(fault.Fenced, fault.OpPersist,
+			fmt.Errorf("engine: lane %s is no longer held by this worker", lane))
+	}
+	return s.set(ctx, s.key(lane), b, ifVersion, epoch)
 }
 
+// SetShared writes the node's own state, which belongs to NO lane and is therefore fenced by none.
+//
+// A connector keeps a schema registry handle, a connection token, a discovered-topology snapshot
+// here — state about the source rather than about a partition of it. There is no lease over it to
+// fence with, and inventing one would refuse a write for a node whose lanes had all moved away while
+// the node itself is still perfectly this worker's. The batch's default epoch is the honest answer,
+// and it is why this is a separate method rather than Set with an empty lane.
 func (s *stateHandle) SetShared(ctx context.Context, b record.Blob, ifVersion uint64) (uint64, error) {
-	return s.set(ctx, store.ConnectorNodeKey(s.tenant, s.pipeline, s.node), b, ifVersion)
+	return s.set(ctx, store.ConnectorNodeKey(s.tenant, s.pipeline, s.node), b, ifVersion, 0)
 }
 
-func (s *stateHandle) set(ctx context.Context, k store.Key, b record.Blob, ifVersion uint64) (uint64, error) {
+// set writes one key. A zero epoch means the batch's default, which is store.Versioned's own rule.
+func (s *stateHandle) set(ctx context.Context, k store.Key, b record.Blob, ifVersion, epoch uint64) (uint64, error) {
 	body, err := json.Marshal(b)
 	if err != nil {
 		return 0, fmt.Errorf("engine: encoding connector state: %w", err)
 	}
 	batch := store.NewBatch(singleWorkerEpoch)
-	batch.Put(k, body, ifVersion)
+	batch.PutFenced(k, body, ifVersion, epoch)
 	if err := s.deps.State.Set(ctx, *batch); err != nil {
 		return 0, err
 	}
 	return ifVersion + 1, nil
 }
 
-// SetMany writes several lanes' state in ONE atomic write.
+// SetMany writes several lanes' state in ONE atomic write, each fenced by its own lane's lease.
+//
+// IT REFUSES RATHER THAN DROPPING, which is the opposite of what laneCtl.stage does with a lost lane,
+// and the difference is who asked for the write. stage batches cursors the ENGINE decided to persist
+// for whichever lanes advanced, so dropping one leaves the rest correct. This is a connector calling
+// an interface whose entire purpose is that the whole set lands or none of it does — writing a subset
+// would break the promise the method exists to make, and a connector that wanted per-lane granularity
+// would have called Set per lane.
 func (s *stateHandle) SetMany(ctx context.Context, w connector.StateWrite) error {
+	now := time.Now()
 	batch := store.NewBatch(singleWorkerEpoch)
 	for lane, e := range w.Lanes {
+		epoch, mine := s.leases.fenceFor(lane, now)
+		if !mine {
+			return fault.New(fault.Fenced, fault.OpPersist, fmt.Errorf(
+				"engine: lane %s is no longer held by this worker, and this write is atomic over %d lanes",
+				lane, len(w.Lanes)))
+		}
+		// THE CONNECTOR'S OWN EPOCH WINS WHEN IT SUPPLIES ONE, which is what connector.Write.Epoch
+		// says: zero means the epoch the core records for the lane. Whether this worker may write at
+		// all is still the core's answer above — a connector cannot name its way past a lease it
+		// does not hold — but which epoch a held lane's entry carries is the caller's to state.
+		if e.Epoch != 0 {
+			epoch = e.Epoch
+		}
 		body, err := json.Marshal(e.Blob)
 		if err != nil {
 			return fmt.Errorf("engine: encoding connector state for lane %s: %w", lane, err)
 		}
-		batch.Put(s.key(lane), body, e.IfVersion)
+		batch.PutFenced(s.key(lane), body, e.IfVersion, epoch)
 	}
+
+	// THE SHARED SLOT TRAVELS IN THE SAME TRANSACTION, and until now it did not travel at all.
+	//
+	// StateWrite.Shared was read by nothing: a connector that set it got its lane entries written and
+	// its node entry silently dropped. That is the exact failure SetMany's own doc gives as the reason
+	// atomicity matters here — "a stream-to-lane index in the node slot and the lane cursors it
+	// indexes must move together or a restart reads one stream's progress under another stream's
+	// name" — so the one scenario the method was justified by was the one it did not serve.
+	//
+	// Fenced by the batch's default, like SetShared: the node slot belongs to no lane.
+	if w.Shared != nil {
+		body, err := json.Marshal(w.Shared.Blob)
+		if err != nil {
+			return fmt.Errorf("engine: encoding shared connector state: %w", err)
+		}
+		batch.PutFenced(store.ConnectorNodeKey(s.tenant, s.pipeline, s.node), body,
+			w.Shared.IfVersion, w.Shared.Epoch)
+	}
+
 	if batch.Len() == 0 {
 		return nil
 	}
 	return s.deps.State.Set(ctx, *batch)
 }
 
+// Delete removes one lane's connector state.
+//
+// IT IS THE ONE LANE MUTATION THE STORE CANNOT FENCE, because StateStore.Delete takes bare keys and
+// no epoch — so there is no number to be refused on and the store will do as it is told. That makes
+// the advisory check MORE important here rather than less: every other fenced operation degrades to
+// a rejected write, and this one degrades to destroying state the new holder owns and is reading.
+//
+// So it refuses locally, which is all this side can do, and the gap is named rather than implied. A
+// per-key epoch on Delete is a StateStore signature change.
 func (s *stateHandle) Delete(ctx context.Context, lane record.LaneID) error {
+	if _, mine := s.leases.fenceFor(lane, time.Now()); !mine {
+		return fault.New(fault.Fenced, fault.OpPersist,
+			fmt.Errorf("engine: lane %s is no longer held by this worker", lane))
+	}
 	return s.deps.State.Delete(ctx, []store.Key{s.key(lane)})
 }
 

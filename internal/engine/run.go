@@ -1049,16 +1049,17 @@ func (r *runner) fillLaneStates(cp *Checkpoint, positions map[record.LaneID]reco
 				cursor = pos
 			}
 			cp.Lanes[id] = LaneState{
-				Cursor:     cursor,
-				Group:      rec.Spec.Group,
-				After:      rec.Spec.StartAfter,
-				Kind:       rec.Spec.Kind,
-				Ordering:   rec.Spec.Ordering,
-				Bounded:    rec.Spec.Boundedness == connector.Bounded,
-				Finished:   rec.Finished,
-				FinishedAt: rec.FinishedAt,
-				Label:      rec.Spec.Label,
-				Version:    lc.versions[id],
+				Cursor:      cursor,
+				CursorEpoch: rec.CursorEpoch,
+				Group:       rec.Spec.Group,
+				After:       rec.Spec.StartAfter,
+				Kind:        rec.Spec.Kind,
+				Ordering:    rec.Spec.Ordering,
+				Bounded:     rec.Spec.Boundedness == connector.Bounded,
+				Finished:    rec.Finished,
+				FinishedAt:  rec.FinishedAt,
+				Label:       rec.Spec.Label,
+				Version:     lc.versions[id],
 			}
 		}
 		lc.mu.Unlock()

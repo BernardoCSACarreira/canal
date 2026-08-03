@@ -466,3 +466,50 @@ func TestTheStoreRefusesAWriteFromASupersededEpoch(t *testing.T) {
 		t.Errorf("the stored cursor is %q; the superseded worker overwrote the holder's", body["cursor"])
 	}
 }
+
+// THE EPOCH THAT FENCED THE WRITE IS THE EPOCH THE ROW RECORDS.
+//
+// Two numbers that could disagree and must not: the one handed to store.Batch.PutFenced, which the store
+// compares, and the one written into the lane row, which is the only durable record of who produced the
+// cursor. Stamping the row from anything else — the batch default, or whatever the worker happens to hold
+// when a checkpoint is taken — attributes a cursor to a lease that never saw it, and a restart then reads
+// back progress under the wrong owner with nothing to contradict it.
+//
+// Asserted against the ENCODED row rather than the in-memory struct, because the row is what survives.
+func TestTheRowRecordsTheEpochThatFencedItsWrite(t *testing.T) {
+	f := newFenceFixture(t, []record.LaneID{"a", "b"}, map[record.LaneID]uint64{"a": 3, "b": 9})
+
+	batch := store.NewBatch(singleWorkerEpoch)
+	done, err := f.ctl.stage(batch, map[record.LaneID]record.Position{
+		"a": {Token: record.Blob{Version: 1, Bytes: []byte{1}}, Safe: true},
+		"b": {Token: record.Blob{Version: 1, Bytes: []byte{2}}, Safe: true},
+	})
+	if err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	done(true)
+
+	for lane, want := range map[record.LaneID]uint64{"a": 3, "b": 9} {
+		k := f.laneKey(lane)
+		fencedAt, ok := epochOf(*batch, k)
+		if !ok {
+			t.Errorf("lane %s is not in the batch at all", lane)
+			continue
+		}
+		v := batch.Writes[k.String()]
+		var row laneRecord
+		if err := json.Unmarshal(v.Value, &row); err != nil {
+			t.Errorf("lane %s's row does not decode: %v", lane, err)
+			continue
+		}
+		if fencedAt != want {
+			t.Errorf("lane %s's write is fenced at %d, want %d", lane, fencedAt, want)
+		}
+		if row.CursorEpoch != want {
+			t.Errorf("lane %s's row records epoch %d while its write is fenced at %d (want %d).\n"+
+				"  The row is the only durable record of which lease produced this cursor, so a "+
+				"disagreement here is a restart reading progress under the wrong owner",
+				lane, row.CursorEpoch, fencedAt, want)
+		}
+	}
+}

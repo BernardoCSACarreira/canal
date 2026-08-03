@@ -376,7 +376,7 @@ github.com/BernardoCSACarreira/canal
 │   │                    imports: config, connector, fault, record, schema
 │   └── storetest/       the conformance suite for StateStore: Subject, Run. Every implementation runs
 │                        it, because a contract two stores each prove separately gets proved wrong twice
-│                        imports: connector, fault, record, store
+│                        imports: fault, record, store
 └── internal/            not importable from any other module (Go's internal rule)
     ├── ledger/          Tracker[P], Ticket, Ledger, Disposition, Outcome, LaneStats, Leak, the leak reaper
     │                    imports: connector, fault, record

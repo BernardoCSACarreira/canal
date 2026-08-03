@@ -29,7 +29,6 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/BernardoCSACarreira/canal/pkg/connector"
 	"github.com/BernardoCSACarreira/canal/pkg/fault"
 	"github.com/BernardoCSACarreira/canal/pkg/record"
 	"github.com/BernardoCSACarreira/canal/pkg/store"
@@ -379,19 +378,14 @@ func testDeclaredCapabilities(t *testing.T, sub Subject) {
 		}
 	}
 
-	// Supports() must agree with the flags rather than contradict them.
-	for _, g := range []connector.Guarantee{
-		connector.AtMostOnce, connector.AtLeastOnce, connector.EffectivelyOnce,
-	} {
-		ok, why := caps.Supports(g)
-		if !ok && why == "" {
-			t.Errorf("Supports(%v) refused with no reason; the reason becomes a submit-time "+
-				"diagnostic and an empty one tells an operator nothing", g)
-		}
-		if ok && why != "" {
-			t.Errorf("Supports(%v) accepted and also gave a reason %q", g, why)
-		}
-	}
+	// NO Supports() LOOP HERE, DELIBERATELY. An earlier version walked every guarantee tier and
+	// checked that a refusal carried a reason — which reads like conformance and is not. Supports is
+	// shared code in pkg/store with its own tests, including a volatile-caps case, so running it once
+	// per subject re-tests the same function N times and cannot fail for anything an IMPLEMENTATION
+	// does. What belongs here is only what differs between implementations, which is everything above.
+	//
+	// The flags are still checked against reality, which is the whole point: caps.Supports reads them,
+	// so a flag that lies makes every answer it gives wrong no matter how coherently it is phrased.
 }
 
 func testReopen(t *testing.T, sub Subject) {

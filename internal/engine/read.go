@@ -99,38 +99,182 @@ type laneRead struct {
 	alloc *record.Allocator
 }
 
-// readLanes reads every lane assigned to a source that implements connector.LaneReader.
+// readLanes reads every lane assigned to a source that implements connector.LaneReader, INCLUDING
+// the ones it announces later.
 //
-// It partitions them into at most ReadConcurrency disjoint groups and reads each group on its own
-// goroutine, which is what makes ReadConcurrency 1 the multiplexed shape and ReadConcurrency N the
-// independent-connections shape without the source implementing two things.
+// It partitions the assignment into at most ReadConcurrency disjoint groups and reads each on its own
+// goroutine — which is what makes ReadConcurrency 1 the multiplexed shape and N the
+// independent-connections shape without the source implementing two things — and then supervises
+// them, rebuilding the set when the lane table gains a lane.
+//
+// A LANE ANNOUNCED MID-RUN USED TO BE READ BY NOBODY. laneCtl.Changes() existed, notify() fired it on
+// every announce and finish, and nothing anywhere selected on it, so the assignment was whatever
+// Assigned() happened to return once. That is not a hypothetical shape: multi-stream-source calls
+// maybeSweep from Read, which re-reconciles its stream set on a timer and announces a lane for every
+// stream that has appeared upstream since. Those lanes were durable, planned, claimed — and never
+// read.
 func (r *runner) readLanes(ctx, deliverCtx context.Context, id record.NodeID,
 	assigned []connector.LaneAssignment,
 ) {
 	src := r.p.sources[id]
+	rt := r.sourceRT(id)
+	concurrency := src.ReadConcurrency(r.p.spec.Parallelism)
 
-	// THE ASSIGNMENT IS READ ONCE AND NOT REVISITED, which is the next gap along and not this one.
-	//
-	// laneCtl.Changes() exists, notify() fires it on every announce and finish, and nothing anywhere
-	// selects on it — so a lane announced after this line is never picked up, whichever interface
-	// the source implements. A lane LOST is handled, because the read loop rechecks Revoked every
-	// pass; a lane GAINED needs the read set to be rebuilt, which needs the groups below to be
-	// rebuilt with it.
-	groups := partitionLanes(assigned, src.ReadConcurrency(r.p.spec.Parallelism))
+	// ONE ALLOCATOR PER LANE FOR THE WHOLE RUN, held here rather than inside a group, because groups
+	// are now rebuilt and allocators must not be. A fresh allocator for a lane already being read
+	// would restart its record ids inside a range the ledger may still hold — and allocatorFor draws
+	// a new ordinal each time, so rebuilding on every announce would also spend the run's id space at
+	// the rate the source discovers streams.
+	allocs := map[record.LaneID]*record.Allocator{}
 
-	r.deps.Log.Info("reading lanes",
-		"node", id, "lanes", len(assigned), "concurrent_reads", len(groups),
-		"declared", src.Caps.ReadConcurrency, "parallelism", r.p.spec.Parallelism)
+	for {
+		live := make([]laneRead, 0, len(assigned))
+		for _, lane := range assigned {
+			alloc, ok := allocs[lane.ID]
+			if !ok {
+				var err error
+				if alloc, err = r.allocatorFor(id, lane); err != nil {
+					r.fail(err)
+					return
+				}
+				allocs[lane.ID] = alloc
+			}
+			live = append(live, laneRead{lane: lane, alloc: alloc})
+		}
 
-	var wg sync.WaitGroup
-	for _, group := range groups {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			r.readLaneGroup(ctx, deliverCtx, id, group)
-		}()
+		groups := partitionLanes(live, concurrency)
+		r.deps.Log.Info("reading lanes",
+			"node", id, "lanes", len(live), "concurrent_reads", len(groups),
+			"declared", src.Caps.ReadConcurrency, "parallelism", r.p.spec.Parallelism)
+
+		// The groups get a context this loop can cancel WITHOUT touching deliverCtx, so rebuilding
+		// stops reading and never abandons a batch already on its way to a sink.
+		//
+		// WHAT HAPPENS TO THE INTERRUPTED READ DEPENDS ON THE SOURCE, and both outcomes are safe. A
+		// source that returns promptly on cancellation has DRAINED — its records come back with
+		// ctx.Err() and are admitted, because the read loop admits before it handles the error. One
+		// that does not return in time is ABANDONED, and then its batches are untouchable while its
+		// goroutine is still writing to them, so they are dropped unread.
+		//
+		// Nothing is lost either way, and for the same reason: an abandoned batch was never admitted,
+		// so no cursor advanced past its records and they are read again. Saying only the first half —
+		// which an earlier version of this comment did — claims a guarantee the abandoned path does
+		// not give.
+		gctx, stopGroups := context.WithCancel(ctx)
+		done := make(chan struct{})
+		var wg sync.WaitGroup
+		for _, group := range groups {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				r.readLaneGroup(gctx, deliverCtx, id, group)
+			}()
+		}
+		go func() { wg.Wait(); close(done) }()
+
+		next, rebuild := r.awaitLaneChange(ctx, rt.lanes, id, done, laneIDsOf(live))
+		stopGroups()
+		wg.Wait()
+		if !rebuild {
+			return
+		}
+		assigned = next
 	}
-	wg.Wait()
+}
+
+// laneWatcher is the two methods awaitLaneChange needs from a lane table.
+//
+// NARROWED FOR A SEAM, and the seam is the point. The ORDER in which the two are called is the whole
+// correctness of the loop below, and laneCtl is a concrete type — so with *sourceRuntime as the
+// parameter there was no way to interleave an announce between the calls, and the ordering was held
+// in place by an argument and nothing else. An interface lets a test supply an Assigned that
+// announces as a side effect, which is exactly the window.
+type laneWatcher interface {
+	Changes() <-chan struct{}
+	Assigned(context.Context) ([]connector.LaneAssignment, error)
+}
+
+// awaitLaneChange blocks until the read set needs rebuilding, the readers finish, or the run stops.
+//
+// IT REBUILDS ONLY FOR LANES NOBODY IS READING, which is what keeps this from thrashing. notify()
+// fires on every announce AND every finish, and a finish is already handled inside the group that
+// owned the lane: the batch carrying EndOfLane retires it and it leaves that group's read set.
+// Rebuilding on a removal would cancel every other lane's in-flight read to learn something the
+// reader had already acted on — for a bounded source finishing thirty chunks one at a time, thirty
+// pointless restarts.
+func (r *runner) awaitLaneChange(ctx context.Context, lanes laneWatcher, id record.NodeID,
+	done <-chan struct{}, owned map[record.LaneID]bool,
+) ([]connector.LaneAssignment, bool) {
+	var readersDone bool
+	for {
+		// THE CHANNEL IS TAKEN BEFORE THE TABLE IS READ, and that ordering is this loop's whole
+		// correctness. notify() CLOSES the channel it holds and installs a fresh one, so a channel
+		// taken here is a promise to be woken for anything that happens after this line.
+		//
+		// Waiting first and reading after loses an announce permanently. The window is between the
+		// Assigned() call and the next time round: a notify landing there closes a channel nobody is
+		// holding any more, and the fresh channel this loop then waits on is not closed again until
+		// the NEXT announce — which for a source that announces once is never. Taking it first turns
+		// that window into an already-closed channel and one extra, harmless lap.
+		//
+		// PINNED, and it took a seam to pin. No fixture driving a real connector can aim at a window two
+		// adjacent statements wide: reversing these lines leaves
+		// TestALaneAnnouncedAfterReadingStartedIsRead green — measured, three runs — because that
+		// source announces from inside ReadLanes, so the next read produces another notify and the lost
+		// wake-up is recovered by it. That is why the parameter is [laneWatcher] rather than the
+		// concrete table. A fake whose Assigned ANNOUNCES AS A SIDE EFFECT puts the notify exactly
+		// here, whichever order the two calls are in, and reversing them then hangs the loop for good.
+		// See TestAnAnnounceBetweenTakingTheChannelAndReadingTheTableIsNotLost.
+		changed := lanes.Changes()
+
+		next, err := lanes.Assigned(ctx)
+		if err != nil {
+			r.fail(err)
+			return nil, false
+		}
+		if gained := added(next, owned); len(gained) > 0 {
+			r.deps.Log.Info("picking up lanes announced since this source started reading",
+				"node", id, "gained", len(gained), "reading", len(next))
+			return next, true
+		}
+		// Nothing gained and nobody reading: every lane this source held is finished or revoked, and
+		// the check above has just confirmed no late arrival is waiting. This is the ordinary end of a
+		// bounded source.
+		if readersDone {
+			return nil, false
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, false
+		case <-done:
+			// One more lap rather than an immediate return, so a lane announced in the same moment the
+			// last reader finished is still picked up — with the channel already taken above, that
+			// check cannot race the announce either.
+			readersDone = true
+		case <-changed:
+		}
+	}
+}
+
+// added reports which of next's lanes nobody is reading yet.
+func added(next []connector.LaneAssignment, owned map[record.LaneID]bool) []record.LaneID {
+	var out []record.LaneID
+	for _, a := range next {
+		if !owned[a.ID] {
+			out = append(out, a.ID)
+		}
+	}
+	return out
+}
+
+// laneIDsOf indexes a read set by lane, for comparing against a fresh assignment.
+func laneIDsOf(live []laneRead) map[record.LaneID]bool {
+	out := make(map[record.LaneID]bool, len(live))
+	for _, lr := range live {
+		out[lr.lane.ID] = true
+	}
+	return out
 }
 
 // partitionLanes splits lanes into at most n groups.
@@ -143,14 +287,14 @@ func (r *runner) readLanes(ctx, deliverCtx context.Context, id record.NodeID,
 // Contiguous rather than round-robin, because Assigned returns lanes in announce order — a source
 // that announced one lane per key range gets adjacent ranges in one call, which is the sequential
 // scan it was expecting. Group sizes differ by at most one.
-func partitionLanes(lanes []connector.LaneAssignment, n int) [][]connector.LaneAssignment {
+func partitionLanes(lanes []laneRead, n int) [][]laneRead {
 	if n < 1 {
 		n = 1
 	}
 	if n > len(lanes) {
 		n = len(lanes)
 	}
-	out := make([][]connector.LaneAssignment, 0, n)
+	out := make([][]laneRead, 0, n)
 	for i := range n {
 		out = append(out, lanes[i*len(lanes)/n:(i+1)*len(lanes)/n])
 	}
@@ -160,7 +304,7 @@ func partitionLanes(lanes []connector.LaneAssignment, n int) [][]connector.LaneA
 // readLaneGroup reads one disjoint group of lanes until every lane in it is finished or revoked, or
 // the run stops.
 func (r *runner) readLaneGroup(ctx, deliverCtx context.Context, id record.NodeID,
-	group []connector.LaneAssignment,
+	group []laneRead,
 ) {
 	src := r.p.sources[id]
 	rt := r.sourceRT(id)
@@ -169,15 +313,14 @@ func (r *runner) readLaneGroup(ctx, deliverCtx context.Context, id record.NodeID
 	policy := r.whenFullFor(id)
 	clock := r.clockFor(id)
 
-	live := make([]laneRead, 0, len(group))
-	for _, lane := range group {
-		alloc, err := r.allocatorFor(id, lane)
-		if err != nil {
-			r.fail(err)
-			return
-		}
-		live = append(live, laneRead{lane: lane, alloc: alloc})
-	}
+	// COPIED, because the loop below filters in place through live[:0] and the caller's slice is a
+	// window into an array the supervisor owns.
+	//
+	// The windows partitionLanes hands out do not overlap, so filtering within one cannot reach
+	// another group's lanes — but that safety is a property of how the partition happens to be cut,
+	// and a group would have to know it to be sure. Copying costs one small allocation per rebuild
+	// and removes the need to know.
+	live := append(make([]laneRead, 0, len(group)), group...)
 
 	var readAttempt attempt
 	var idle spinner

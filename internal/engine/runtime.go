@@ -47,7 +47,17 @@ import (
 //     over it. Idempotent on a derived id, so there is no race to lose.
 //   - stateHandle.SetShared — the batch default. Node state belongs to no lane.
 //
-// STILL TO DO: Delete is unfenceable through StateStore.Delete, which takes bare keys and no epoch.
+//   - stateHandle.Delete and laneCtl.Forget — DelFenced through a batch, and both refuse. Removing a
+//     lane's row or its connector state is a write on that lane's behalf. They went through
+//     StateStore.Delete, which takes bare keys and no epoch, so the store had nothing to compare and
+//     an advisory refusal here was the only thing in the way — for the one mutation whose failure mode
+//     is destroying state the new holder is reading rather than merely writing a stale row.
+//
+// STILL TO DO: a delete's epoch is not PERSISTED by pkg/store/wal, whose frame carries the key alone.
+// The refusal is real in-process and survives a restart for any key that was ever written, because the
+// floor comes from those writes. What does not survive is a delete that raised the floor above every
+// prior write for its key. Fixing it needs a new frame shape, and Open refuses any version but its
+// own — so this format has no forward-migration path and a bump would strand every existing log.
 
 // singleWorkerEpoch is the epoch a lane is held under when there is no coordinator, and the DEFAULT
 // fence on every batch — the value that applies to keys which are not a single lane's.
@@ -457,9 +467,16 @@ func (l *laneCtl) Forget(ctx context.Context, id record.LaneID) error {
 	}
 	l.mu.Unlock()
 
-	if err := l.deps.State.Delete(ctx, []store.Key{
-		store.LaneKey(l.fields.tenant, l.fields.pipeline, id),
-	}); err != nil {
+	// Fenced by the lane's own lease, like its cursor and its retirement: removing a lane's row is a
+	// write on that lane's behalf, and a worker that has lost it has no business making one.
+	epoch, mine := l.leases.fenceFor(id, time.Now())
+	if !mine {
+		return fault.New(fault.Fenced, fault.OpPersist,
+			fmt.Errorf("engine: lane %s is no longer held by this worker", id))
+	}
+	batch := store.NewBatch(singleWorkerEpoch)
+	batch.DelFenced(store.LaneKey(l.fields.tenant, l.fields.pipeline, id), epoch)
+	if err := l.deps.State.Set(ctx, *batch); err != nil {
 		return err
 	}
 
@@ -816,11 +833,17 @@ func (s *stateHandle) SetMany(ctx context.Context, w connector.StateWrite) error
 // So it refuses locally, which is all this side can do, and the gap is named rather than implied. A
 // per-key epoch on Delete is a StateStore signature change.
 func (s *stateHandle) Delete(ctx context.Context, lane record.LaneID) error {
-	if _, mine := s.leases.fenceFor(lane, time.Now()); !mine {
+	epoch, mine := s.leases.fenceFor(lane, time.Now())
+	if !mine {
 		return fault.New(fault.Fenced, fault.OpPersist,
 			fmt.Errorf("engine: lane %s is no longer held by this worker", lane))
 	}
-	return s.deps.State.Delete(ctx, []store.Key{s.key(lane)})
+	// THROUGH A BATCH, so the store can refuse it. StateStore.Delete takes bare keys and no epoch, so
+	// the advisory check above was the only thing standing between a fenced worker and state the new
+	// holder owns; a fenced deletion is refused by the store itself.
+	batch := store.NewBatch(singleWorkerEpoch)
+	batch.DelFenced(s.key(lane), epoch)
+	return s.deps.State.Set(ctx, *batch)
 }
 
 // --- runtimes -------------------------------------------------------------------

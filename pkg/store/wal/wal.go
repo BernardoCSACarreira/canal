@@ -307,6 +307,16 @@ func (s *StateStore) Set(_ context.Context, w store.Batch) error {
 		}
 	}
 
+	// A DELETE IS PRECONDITIONED LIKE A WRITE, in the same pass, so a rejected batch leaves the log
+	// untouched. Until Batch carried an epoch on a deletion this was unreachable: StateStore.Delete
+	// takes bare keys, so a store had nothing to compare and no grounds to refuse.
+	for _, d := range w.Deletes {
+		name := d.Key.String()
+		if seen, ok := s.epochs[name]; ok && w.EpochForDelete(d) < seen {
+			return fault.ErrFenced
+		}
+	}
+
 	// Pass two: build the entry that records what WILL be true, in a deterministic key order so two
 	// runs of the same batch produce byte-identical frames.
 	names := make([]string, 0, len(w.Writes))
@@ -315,7 +325,21 @@ func (s *StateStore) Set(_ context.Context, w store.Batch) error {
 	}
 	sort.Strings(names)
 
-	e := entry{writes: make([]appliedWrite, 0, len(names)), deletes: w.Deletes}
+	// THE FRAME CARRIES THE KEY AND NOT THE EPOCH, and that is a labelled residual rather than an
+	// oversight. Persisting a delete's epoch means a new frame shape, and Open refuses any version but
+	// its own — for a NEWER file with ADR 0020's reasoning, and for an older one with no reasoning at
+	// all, which together mean this format has no forward-migration path. Bumping it would strand every
+	// existing log.
+	//
+	// What survives is the floor established by the WRITES to that key, which is what makes a stale
+	// write refused after a restart. What does not survive is a delete that RAISED the floor above every
+	// prior write for its key — a delete at a reclaimed epoch with no write in between — after which a
+	// worker holding an epoch between the two could recreate the row. See the note in storetest.
+	dels := make([]store.Key, 0, len(w.Deletes))
+	for _, d := range w.Deletes {
+		dels = append(dels, d.Key)
+	}
+	e := entry{writes: make([]appliedWrite, 0, len(names)), deletes: dels}
 	for _, name := range names {
 		v := w.Writes[name]
 		epoch := w.EpochFor(v)
@@ -336,6 +360,13 @@ func (s *StateStore) Set(_ context.Context, w store.Batch) error {
 	}
 
 	s.apply(e)
+	// Raised HERE rather than in apply, because apply also runs on replay where the frame has no epoch
+	// to offer. In this process the floor outlives the key, so a stale write cannot resurrect it.
+	for _, d := range w.Deletes {
+		if name, e := d.Key.String(), w.EpochForDelete(d); e > s.epochs[name] {
+			s.epochs[name] = e
+		}
+	}
 	s.bytes += n
 	s.live = s.liveBytes()
 	return s.maybeCompact()

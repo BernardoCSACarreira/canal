@@ -238,8 +238,8 @@ func TestRetiringALaneThisWorkerLostIsRefused(t *testing.T) {
 // worth more here than anywhere else it appears, which is the opposite of how it looks.
 func TestDeletingALaneThisWorkerLostIsRefused(t *testing.T) {
 	f := newFenceFixture(t, []record.LaneID{"a", "b"}, map[record.LaneID]uint64{"a": 5})
-	deleted := &countingDeleter{StateStore: memstore.New()}
-	sh := &stateHandle{deps: Deps{State: deleted, Log: f.ctl.deps.Log},
+	rs := &recordingStore{StateStore: memstore.New()}
+	sh := &stateHandle{deps: Deps{State: rs, Log: f.ctl.deps.Log},
 		tenant: "acme", pipeline: "p1", node: "in", leases: f.leases}
 	ctx := context.Background()
 
@@ -248,28 +248,34 @@ func TestDeletingALaneThisWorkerLostIsRefused(t *testing.T) {
 	} else if got := fault.ClassOf(err); got != fault.Fenced {
 		t.Errorf("the refusal classified as %s, want fenced: %v", got, err)
 	}
-	if deleted.calls != 0 {
-		t.Errorf("%d deletes reached the store; it cannot refuse them, which is why this must", deleted.calls)
+	if len(rs.batches) != 0 {
+		t.Errorf("%d batches reached the store for a refused delete", len(rs.batches))
 	}
 
 	// The lane this worker DOES hold is still deletable, or the check is just a broken feature.
 	if err := sh.Delete(ctx, "a"); err != nil {
 		t.Errorf("deleting a held lane's state was refused: %v", err)
 	}
-	if deleted.calls != 1 {
-		t.Errorf("%d deletes reached the store for a held lane, want 1", deleted.calls)
+	if len(rs.batches) != 1 {
+		t.Fatalf("%d batches reached the store for a held lane, want 1", len(rs.batches))
 	}
-}
 
-// countingDeleter counts the deletes that get past the engine.
-type countingDeleter struct {
-	store.StateStore
-	calls int
-}
-
-func (c *countingDeleter) Delete(_ context.Context, _ []store.Key) error {
-	c.calls++
-	return nil
+	// AND IT GOES AS A FENCED DELETION IN A BATCH, which is what lets the store refuse it. The advisory
+	// check above is the only thing that ever stood in the way while deletes went through
+	// StateStore.Delete, which takes bare keys and no epoch — so asserting the refusal alone would leave
+	// the store-side half unpinned.
+	b := rs.last()
+	if len(b.Deletes) != 1 {
+		t.Fatalf("the batch carries %d deletions, want 1: %+v", len(b.Deletes), b)
+	}
+	d := b.Deletes[0]
+	if want := store.ConnectorKey("acme", "p1", "in", "a"); d.Key.String() != want.String() {
+		t.Errorf("the deletion names %s, want %s", d.Key, want)
+	}
+	if got := b.EpochForDelete(d); got != 5 {
+		t.Errorf("the deletion is fenced at epoch %d, want 5 (the lane's own lease, not the batch "+
+			"default of %d)", got, singleWorkerEpoch)
+	}
 }
 
 // A FENCED FINISH COSTS THE LANE AND NOT THE PIPELINE.

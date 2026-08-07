@@ -14,32 +14,34 @@ difference is deliberate and the reason is in the defect ledger (§24) or an ADR
 
 ```mermaid
 flowchart TB
-    subgraph BUILT["BUILT — 106 files compile, go vet and gofmt clean"]
+    subgraph BUILT["BUILT — 143 files; go vet, gofmt and go test -race clean"]
         direction TB
         P1["pkg/connector — Source, Sink, Transform, Buffer,<br/>Encoder / Framer / Compressor, LaneCtl, every *Caps"]
-        P2["pkg/record, pkg/schema, pkg/fault, pkg/config,<br/>pkg/spec, pkg/registry, pkg/telemetry"]
-        P3["pkg/store — the four store INTERFACES, nothing else"]
-        P4["internal/ledger — Ledger and Tracker, a real algorithm.<br/>No test file of its own: exercised only by<br/>internal/stress/parallel-snapshot/proof_test.go"]
-        BLD["internal/engine.Build + negotiate<br/>pure function of config, no I/O"]
-        P5["internal/stress — 8 hostile connectors, 8 passing test packages<br/>internal/example — linefile, stdoutsink, memstore"]
+        P2["pkg/record, pkg/schema, pkg/fault, pkg/config,<br/>pkg/spec, pkg/registry, pkg/telemetry, pkg/codec"]
+        P3["pkg/store — the four store interfaces;<br/>pkg/store/wal — the durable log, epoch-fenced per key;<br/>pkg/storetest — the contract's own conformance suite"]
+        P4["internal/ledger — Ledger, Tracker and the revocation<br/>fence, with its own tests plus<br/>internal/stress/parallel-snapshot/proof_test.go"]
+        BLD["internal/engine — Build + negotiate, pure, no I/O;<br/>Run — read (one lane or many), admit, write, settle,<br/>flush, commit; leases, fenced writes, revocation"]
+        P5["internal/stress — 8 hostile connectors; internal/example —<br/>linefile, filesink, stdoutsink, memstore; cmd/canal —<br/>run, check, version — killed mid-run to prove the cursor"]
     end
 
-    subgraph MISSING["NOT BUILT — the breadth beyond the one running path"]
+    subgraph MISSING["NOT BUILT — what the labels still hold open"]
         direction TB
-        RUN["multi-worker coordination<br/>store.Coordinator has no implementation;<br/>the engine is labelled single-worker"]
+        RUN["no durable store.Coordinator — memstore's in-memory<br/>one drives the lease and fencing machinery in tests;<br/>the shipped binary runs exactly one worker"]
         DUR["no Buffer or Transform implementation<br/>exists anywhere in the module"]
-        BIN["no frontend and no control API<br/>the read model is declared, nothing serves it"]
+        BIN["no frontend; the HTTP surface is read-only —<br/>/metrics and /status; StatusStore.Aggregate refuses:<br/>nothing merges two workers' documents yet"]
         IMPL["engine/remote: the out-of-process<br/>connector seam is a fixed shape, not code"]
     end
 
-    BLD -->|"returns a *Pipeline holding only sources, sinks<br/>and a ledger that is never given a lane"| RUN
+    BLD -->|"a worker with no Coordinator holds every lane it announces,<br/>forever, at a constant epoch — truthfully, not by omission"| RUN
 ```
 
-**Read this before anything else in the document.** The interface set is the deliverable of this
-stage: everything below the fold describes a runtime that does not exist yet — `Pipeline.Run` is
-`return fmt.Errorf(...)` at `internal/engine/build.go:322`, and `Build` in the same file constructs
-only source and sink components, validating buffer, transform and codec config without instantiating
-anything.
+**Read this before anything else in the document.** The single-source-to-single-sink path runs, and
+`cmd/canal/main_test.go` kills the real binary three times mid-run to prove no record is lost. The
+engine-side multi-worker machinery — leases whose epochs fence every durable write, a revocation
+fence in the ledger, a read path that follows the lane assignment as it changes — is built and
+exercised by tests against in-memory scaffolding; no deployable coordinator exists yet. The
+`NOT BUILT` boxes and dotted edges below still mean exactly what they say: no transforms or
+buffers, no durable coordinator, no frontend, no out-of-process seam.
 
 ---
 
@@ -292,15 +294,19 @@ flowchart TB
   end
 
   subgraph INTERNAL["internal/ — engine machinery, no exported API"]
-    ENG["internal/engine<br/>Build, Pipeline, Run<br/>single worker, no transforms or buffers"]
+    ENG["internal/engine<br/>Build, Pipeline, Run<br/>one process; no transforms or buffers"]
     LED["internal/ledger<br/>Tracker, Ticket, Ledger"]
+    MET["internal/metrics<br/>the connector.Metrics implementation"]
   end
 
   ENG --> LED
+  ENG --> MET
   ENG ==>|"imports every package in this box"| PKGS
   LED --> CONN
   LED --> FLT
   LED --> REC
+  MET --> CONN
+  MET --> TEL
 
   STORE --> SPEC
   STORE --> TEL
@@ -335,9 +341,11 @@ flowchart TB
 
 Every arrow is a direct import verified with `go list ./pkg/... ./internal/...`: `pkg/schema` is the
 only leaf, nothing under `pkg/` imports anything under `internal/`, and `internal/engine` imports all
-nine packages in the box plus `internal/ledger` — its `Pipeline.Run` is still a stub that returns an
-error (`internal/engine/build.go:321`), so none of these edges have yet carried a record. `pkg/connectortest`
-is the tenth `pkg/` package and is omitted here; it appears in the connector-boundary diagram below.
+nine packages in the box plus `internal/ledger` and `internal/metrics` — edges that all carry
+records at runtime now. `pkg/codec`, `pkg/store/wal`, `pkg/connectortest` and `pkg/storetest` are
+omitted here; the first two appear in the tree below, the two test kits in the connector-boundary
+diagram after it. The whole graph is enforced by `TestDependencyDirection` in `internal/arch`,
+which fails in both directions.
 
 ```
 github.com/BernardoCSACarreira/canal
@@ -380,25 +388,34 @@ github.com/BernardoCSACarreira/canal
 └── internal/            not importable from any other module (Go's internal rule)
     ├── ledger/          Tracker[P], Ticket, Ledger, Disposition, Outcome, LaneStats, Leak, the leak reaper
     │                    imports: connector, fault, record
-    ├── engine/          Build, Deps, Pipeline, Run, codec resolution, Checkpoint, Header, LaneState.
-    │                    Run drives read, admit, write, settle, flush and commit for one worker.
-    │                    Checkpoint and Header are written on every flush; see §16 and commit.go.
-    │                    imports: internal/ledger, and every pkg/ package except connectortest
-    ├── example/         linefile (a source), stdoutsink (a sink), memstore (an in-memory store.StateStore)
+    ├── engine/          Build, Deps, Pipeline, Run, codec resolution, Checkpoint, Header, LaneState,
+    │                    leases and epoch fencing. Run drives read — one lane or many per source,
+    │                    following the assignment as it changes — admit, write, settle, flush and
+    │                    commit. Checkpoint and Header are written on every flush; see §16.
+    │                    imports: internal/ledger, internal/metrics, and every pkg/ package except
+    │                    codec, connectortest, storetest and store/wal
+    ├── metrics/         the connector.Metrics implementation; enforces pkg/telemetry's closed name
+    │                    and label sets. imports: connector, telemetry
+    ├── arch/            architecture tests only, no non-test code: dependency direction, inert
+    │                    fields, unreachable functions, undeclared skips, doc links
+    ├── example/         linefile (a source), filesink and stdoutsink (sinks), memstore (all four
+    │                    store interfaces in memory, including the Coordinator the engine's
+    │                    multi-worker tests lease from)
     └── stress/          eight deliberately hostile connectors kept as a regression suite:
                          enterprise-scale, fanout-pipeline, multi-stream-source, no-cursor-source,
                          parallel-snapshot, push-source, schema-drift, txn-sink
 ```
 
-Plus `cmd/canal`: `run` and `check`, and nothing else — the composition root holds wiring, never
-policy. It imports `internal/engine`, `internal/metrics`, the example connectors and `pkg/codec` for
-their registrations, and `pkg/{codec,config,record,registry,spec,store,store/wal,telemetry,fault}`;
-`pkg/record` is there because parsing wire input into domain types is a composition-root job —
-`/status?stream=orders` becomes a `record.StreamName` inside a `telemetry.StatusQuery`. The table is
-enforced by `TestDependencyDirection` in `internal/arch`, which fails in both directions. There is no `api/`, no `ui/`, and no `buffers/`, `transforms/` or `connectors/` directory: the
-HTTP surface and those two stage libraries are unwritten, and `store/` has no bbolt or Postgres
-implementation for the coordinated shape. Everything above compiles, `go vet` is clean, and eighteen
-test packages pass including a `kill -9` test that runs the real binary.
+Plus `cmd/canal`: `run`, `check` and `version`, and nothing else — the composition root holds
+wiring, never policy. It imports `internal/engine`, `internal/metrics`, the example connectors and
+`pkg/codec` for their registrations, and
+`pkg/{codec,config,record,registry,spec,store,store/wal,telemetry,fault}`; `pkg/record` is there
+because parsing wire input into domain types is a composition-root job — `/status?stream=orders`
+becomes a `record.StreamName` inside a `telemetry.StatusQuery`. There is no `api/`, no `ui/`, and
+no `buffers/`, `transforms/` or `connectors/` directory: the two stage libraries are unwritten, the
+HTTP surface is `cmd/canal`'s read-only `/metrics` and `/status`, and `store/` has no bbolt or
+Postgres implementation for the coordinated shape. Everything above compiles, `go vet` is clean,
+and twenty-eight test packages pass including a `kill -9` test that runs the real binary.
 
 ### The one statement that matters
 
@@ -1992,10 +2009,12 @@ stateDiagram-v2
 
 Every path out of `Exhausted` is terminal because `TerminalInvalid` is the zero value that `Validate`
 rejects — that is the mechanism, in `pkg/fault/retry.go:47-58`, that makes "retry forever"
-inexpressible rather than merely discouraged. Only the arithmetic on the transitions is real code
-(`RetryPolicy.Next`, `RetryPolicy.Validate`, `fault.RetryAfterOf`); the loop that would drive these
-transitions does not exist yet, and neither does the forced reconnect before the final attempt that
-`Backoff`'s doc comment promises.
+inexpressible rather than merely discouraged. The arithmetic (`RetryPolicy.Next`,
+`RetryPolicy.Validate`, `fault.RetryAfterOf`) and the loop that drives it are both real — the
+engine spends attempts and counts the waiting into `canal_backoff_seconds_total`. What still does
+not exist is the forced reconnect before the final attempt that `Backoff`'s doc comment promises:
+`internal/engine/run.go` says plainly that nothing reopens a component, so a `NotConnected` fault
+retries until `MaxElapsed` without the reconnect.
 
 ```go
 // RecordFault is one record's outcome, classified by the connector at the point
@@ -2099,10 +2118,13 @@ stateDiagram-v2
     end note
 
     note left of Planned
-      PARTLY BUILT. Announce, Assigned, Finish and the cursor
-      are driven by internal/engine/run.go today. Leasing,
-      revocation and planning are not: store.Coordinator has
-      no implementation, so Revoked is truthfully always false.
+      BUILT, one honest gap. Announce, Assigned, Finish and
+      the cursor are driven by internal/engine/run.go. Leasing,
+      revocation and reassignment run wherever a
+      store.Coordinator is wired — engine/lease.go claims,
+      renews and drops — which today means the tests: the only
+      implementation is memstore's in-memory one, so the
+      shipped binary holds every lane it announces.
     end note
 
     note left of Revoked
@@ -2112,7 +2134,7 @@ stateDiagram-v2
     end note
 ```
 
-A lane's whole life, from a durable announcement to either a kept `Finished` row or a `Forget`: the states are `LaneAssignment` field combinations defined in `pkg/connector/lane.go`, the transitions are the methods in `pkg/connector/lanectl.go`, and the lease and epoch are `store.Lease` in `pkg/store/coordinator.go`. Read the `PARTLY BUILT` note literally. The announce-to-finish path runs today: `internal/engine/runtime.go` writes the durable lane row, `Finish` sets `FinishedAt`, and the cursor advances through `flushOnce`. Everything involving a LEASE does not: `store.Coordinator` has no implementation, so no lane has ever been claimed, revoked, planned or reassigned, and `Revoked` returns false because it is truthfully always false with one worker.
+A lane's whole life, from a durable announcement to either a kept `Finished` row or a `Forget`: the states are `LaneAssignment` field combinations defined in `pkg/connector/lane.go`, the transitions are the methods in `pkg/connector/lanectl.go`, and the lease and epoch are `store.Lease` in `pkg/store/coordinator.go`. Read the note literally. The announce-to-finish path runs in the shipped binary: `internal/engine/runtime.go` writes the durable lane row, `Finish` sets `FinishedAt`, and the cursor advances through `flushOnce`. Everything involving a LEASE runs wherever a `store.Coordinator` is wired: `internal/engine/lease.go` claims and renews, `laneCtl.Revoked` answers from the lease table rather than returning a constant, a revoked lane is dropped from the read set and fenced in the ledger, and the next `Claim` gets the next epoch. The only `Coordinator` implementation is `internal/example/memstore`'s in-memory one, so today that machinery is exercised by the engine's tests and by nothing an operator can deploy.
 
 ```go
 // Package connector defines every interface a connector author implements and
@@ -2839,10 +2861,10 @@ flowchart TB
 
     P -.-> N1["ReadConcurrency 1 IS the multiplexed shape.<br/>ReadConcurrency equal to the lane count IS the<br/>per-lane shape. No lane is in two live calls."]
     R1 -.-> N2["A source declaring ReadsLanes still implements Read,<br/>because the required interface is required. The core<br/>never calls it — fault.PermanentInternal is the body."]
-    H -.-> NB["NOT BUILT. registry.ResolvedSource.ReadConcurrency and<br/>Ledger.Admit's lane check are real and tested. The engine<br/>that owns the per-lane Allocators and calls ReadLanes is not."]
+    H --> NB["BUILT. internal/engine/read.go owns the per-lane Allocators,<br/>partitions the assignment into ReadConcurrency groups, and<br/>drives ReadLanes — one goroutine per group, a lane never in two."]
 ```
 
-One lane per `Source.Read` versus many per `LaneReader.ReadLanes`, defined in `pkg/connector/source.go` and `pkg/connector/source_optional.go`; the concurrency bound is computed by `(*ResolvedSource).ReadConcurrency(parallelism)` in `pkg/registry/resolve.go:44`, which clamps to `spec.Spec.Parallelism` so the operator's number always wins downward. The one piece that is genuinely implemented is the guard at the bottom — `internal/ledger/ledger.go:216-223` rejects a batch whose records were stamped for a different lane than `Batch.Lane`, which is what turns ADR 0026's silent mislabelling into a loud contract fault.
+One lane per `Source.Read` versus many per `LaneReader.ReadLanes`, defined in `pkg/connector/source.go` and `pkg/connector/source_optional.go`; the concurrency bound is computed by `(*ResolvedSource).ReadConcurrency(parallelism)` in `pkg/registry/resolve.go:44`, which clamps to `spec.Spec.Parallelism` so the operator's number always wins downward. All of it is implemented: `internal/engine/read.go` seeds one `Allocator` per lane, partitions the assignment into `ReadConcurrency` groups, and hands each `ReadLanes` call a set of pre-bound batches on one goroutine. The guard at the bottom came first — `internal/ledger/ledger.go` rejects a batch whose records were stamped for a different lane than `Batch.Lane`, which is what turns ADR 0026's silent mislabelling into a loud contract fault — and the engine that feeds it followed.
 
 ```go
 // LaneReader upgrades a source from "one lane per Read" to "MANY LANES PER CALL".
@@ -3333,7 +3355,7 @@ func AllWritten(n int) WriteResult // convenience for the happy path
 ```mermaid
 sequenceDiagram
     autonumber
-    participant E as checkpoint pump — NOT BUILT: the flush loop writes lane cursors, not Checkpoints
+    participant E as checkpoint pump — the flush loop, internal/engine/commit.go
     participant K as Sink — Committer plus WriterState
     participant ST as store.StateStore
 
@@ -3920,10 +3942,10 @@ flowchart LR
     PRB -->|"Probes"| SUBMIT
     CHO -->|"Choices"| SUBMIT
     DIS -->|"Discoverable"| SUBMIT
-    LRD -.->|"ReadsLanes"| RUN
-    HBT -.->|"Heartbeats"| RUN
-    BKL -.->|"ReportsBacklog"| RUN
-    NCK -.->|"Nackable"| RUN
+    LRD -->|"ReadsLanes"| RUN
+    HBT -->|"Heartbeats"| RUN
+    BKL -->|"ReportsBacklog"| RUN
+    NCK -->|"Nackable"| RUN
     ADP -.->|"AdoptsState"| RECOV
 
     SUBMIT["submit time and the control API<br/>reached today through registry.ResolvedSource"]
@@ -3931,7 +3953,7 @@ flowchart LR
     RECOV["restart and connector migration<br/>restart is real over pkg/store/wal;<br/>connector migration is not"]
 ```
 
-Each edge label is the `SourceCaps` field that must also be set — the interface alone does nothing. `Source`, `LaneCtl` and `Commit` are driven by `internal/engine/run.go` today; the dotted edges above them lead to optional tiers the single-worker engine never reaches — nothing calls `Nack`, `AdoptsState`, `ReadLanes` or a `Prober`. Interfaces in `pkg/connector/source_optional.go` and `shared_optional.go`, flags in `pkg/connector/caps.go`, the "unlocks" wording in `pkg/registry/add.go`.
+Each edge label is the `SourceCaps` field that must also be set — the interface alone does nothing. `Source`, `LaneCtl` and `Commit` are driven by `internal/engine/run.go`; `ReadLanes` by the read supervisor in `read.go`; `Heartbeat`, `Backlog` and `Nack` by the source's control goroutine in `control.go`. The submit-time four are reachable through `registry.ResolvedSource` and wait on a frontend to call them, and the one dotted runtime edge left is honest: nothing calls `AdoptsStateOf`, because connector migration is not built. Interfaces in `pkg/connector/source_optional.go` and `shared_optional.go`, flags in `pkg/connector/caps.go`, the "unlocks" wording in `pkg/registry/add.go`.
 
 Data crosses a process boundary; a type assertion does not. A flag with no methods behind it is
 worthless. So both exist, and registration cross-checks them.
@@ -5252,7 +5274,7 @@ sequenceDiagram
     participant St as store.StateStore
     participant Up as the source's own upstream
 
-    Note over Eng: internal/engine/run.go implements every Eng step below.<br/>The epoch on the phase-three Ack has only one worker to fence.
+    Note over Eng: internal/engine/run.go implements every Eng step below.<br/>The epoch on the phase-three Ack is the lane's lease epoch;<br/>Ledger.Revoke discards a fenced lane's acks before they reach Src.
 
     Eng->>Src: Read(ctx, b)
     Eng->>Led: Admit(ctx, b)
@@ -6104,18 +6126,19 @@ flowchart LR
     S --> C2["2 · defaulting<br/>Field.Default resolved by Config.defaultFor<br/>read through config.Get / config.Must"]
     S --> C3["3 · UI form model<br/>registry.Descriptor.Config, serialised verbatim<br/>Field.ShowIf, Field.RequiredIf, Field.Choices"]
     S --> C4["4 · JSON Schema export<br/>Spec.JSONSchema → Descriptor.JSONSchema<br/>generated at registration, never hand-written"]
-    S --> C5["5 · reference docs<br/>Spec.Docs → Markdown"]
-    S -.-> C6["CLI — not built<br/>no main package exists"]
+    S -.-> C5["5 · reference docs<br/>Spec.Docs → Markdown — rendered by nothing yet"]
+    S --> C6["6 · the CLI<br/>cmd/canal check: a refused spec exits 3<br/>carrying the Diagnostics"]
 
     S --> R["Field.Secret drives Config.Redacted<br/>the only config form that leaves the process"]
-    R --> T["telemetry.PipelineStatus.Config"]
+    R --> T["telemetry.PipelineStatus.Config<br/>filled only when StatusQuery.IncludeConfig asks —<br/>GET /status?config=1 — and never the raw tree"]
 ```
 
-One `config.Spec` per component, built at init and never mutated, is the single artefact all five
-consumers read — which is why a specialised connector UI needs no core change. Solid edges are code that
-exists (`pkg/config/validate.go`, `config.go`, `render.go`, and `pkg/registry/add.go`, which calls
-`Spec.JSONSchema` at registration); the dotted edge is not built, and `Spec.Docs` currently has no caller
-in the module.
+One `config.Spec` per component, built at init and never mutated, is the single artefact all these
+consumers read — which is why a specialised connector UI needs no core change. Solid edges are code
+that exists (`pkg/config/validate.go`, `config.go`, `render.go`, `pkg/registry/add.go`, which calls
+`Spec.JSONSchema` at registration, and `internal/engine/status.go`, which builds the redacted tree a
+`?config=1` status read carries); the one dotted edge is `Spec.Docs`, the Markdown renderer, which
+still has no caller in the module.
 
 The frontend goal is satisfied *only* if capabilities and config are declarative data. If any capability
 is a Go callback the UI must instantiate a connector to learn about it; if any config metadata lives in
@@ -6674,20 +6697,25 @@ serves it at `GET /status` alongside `/metrics`. The two are one observation in 
 `refreshGauges` and the document are built from the same pass over the lanes, so a scrape and a status
 read cannot disagree about the pipeline at a given moment.
 
-The declared producers `store.StatusStore.Report` and `.Aggregate` still have no implementation, which
-is what a second worker would need; a single worker reports on itself and sets `Complete: true` because
-it has heard from every worker there is.
+`store.StatusStore.Report` is implemented by `internal/example/memstore`, so a worker has somewhere
+real to publish; `.Aggregate` — what a second worker would need — refuses with a named fault,
+because merging N workers' documents is a per-field decision that has not been made and half an
+answer would be worse than none. A single worker reports on itself and sets `Complete: true`
+because it has heard from every worker there is.
 
 **What the engine cannot fill, and why** — the omissions are load-bearing, because the document's rule
 is that every unknown is a nil pointer and never a zero:
 
 | Absent | Because |
 | --- | --- |
-| `PipelineStatus.Config` | The redacted tree needs each component's declared `config.Spec`, and `Build` does not keep the redaction it computes. It is the one field that can carry a secret, so absent is the safe direction |
 | `LaneStatus.Progress` | `record.Fraction` needs a lane's scalar bounds, and a lane declares only its current `Scalar` |
 | `NodeStatus.Utilization`, `.BlockedForSeconds` | Not measured anywhere in the engine |
 | `Buffers` | There is no buffer node type |
-| `WorkerStatus.LeaseExpires` | There are no leases until `store.Coordinator` exists |
+| `WorkerStatus.LeaseExpires` | Nil in the shipped standalone shape, where no `store.Coordinator` is wired; with one it carries the soonest of this worker's leases |
+
+`PipelineStatus.Config` has come off this table: `?config=1` fills it with each node's
+`Config.Redacted()`, keyed by node and never the raw tree. It stays absent by default — it is the
+one field that could carry a secret, so absent remains the direction that requires no trust.
 
 `LaneStatus.Position` and `.Resolved` are **present**: `record.Position.Label` is connector-authored
 and rendered verbatim, which is how the UI shows a meaningful position for an arbitrary connector with
@@ -6835,7 +6863,7 @@ remains: the renderer does not exist.
 `LanesTruncated` used to announce a cut list that no API could page through. It is followable now.
 `telemetry.StatusQuery` selects `{Stream, LaneCursor, LaneLimit}`, `PipelineStatus.LanesCursor`
 continues the list, `store.StatusStore.Aggregate` takes the query, and `GET /status` honours
-`?stream=`, `?limit=` and `?cursor=` against the one worker it has. The cursor is **keyset, not
+`?stream=`, `?limit=`, `?cursor=` and `?config=1` against the one worker it has. The cursor is **keyset, not
 offset** — the id of the last lane on the page — so a scan chunk finishing between two reads shifts
 nothing, where an offset would skip a row every time the list shrank behind the reader.
 
@@ -7255,7 +7283,7 @@ sequenceDiagram
   participant W as worker holding the lane
   participant SS as store.StateStore
 
-  Note over LD,SS: NOT BUILT. No Coordinator implementation exists in the repo.<br/>The types below are declared in pkg/store and called by nothing.
+  Note over LD,SS: BUILT IN MINIATURE. internal/example/memstore implements the<br/>Coordinator in memory and internal/engine/lease.go drives every call below<br/>in tests. No durable implementation exists, so no deployable binary runs this.
 
   LD->>CO: Campaign(ctx) returns Leadership
   LD->>CO: Plan(ctx, tenant, pipeline, gen, []LaneRow)
@@ -7474,11 +7502,11 @@ unconfigurable.**
 ```mermaid
 flowchart TD
   PUT["Buffer.Put(ctx, b) offers a batch"] --> ACC["Accepted{Records int, Refused []record.RecordID}<br/>partial refusal is representable, so success-for-records-not-taken is not"]
-  ACC --> POL{"the remainder meets connector.WhenFull<br/>from spec.Spec.WhenFull.<br/>NO code in internal/engine reads it: NOT BUILT"}
+  ACC --> POL{"the remainder meets connector.WhenFull —<br/>the node's own when_full, else spec.Spec.WhenFull;<br/>read by whenFullFor in internal/engine/run.go"}
   POL -- "WhenFullBlock: zero value and default" --> BLK["backpressure upstream: the source parks in Ledger.Admit"]
   POL -- "WhenFullDropNewest" --> DROP["discard the INCOMING records and count them<br/>canal_buffer_refused_total with reason drop_newest"]
   POL -- "WhenFullReject" --> REJ["settle the affected group Abandoned"]
-  POL -- "WhenFullOverflow" --> OVF["spill to the chained buffer<br/>BufferCaps.Chains has zero readers in internal/engine"]
+  POL -- "WhenFullOverflow" --> OVF["refused at Build: there is no buffer<br/>to overflow into, and negotiation says so"]
   REJ --> ACK["Source.Commit sees a non-zero Ack.Abandoned<br/>plus Ack.AbandonedBy naming the node, and decides for itself"]
   DEP["Buffer.Depth() reports Records, Bytes, Capacity and OldestAge:<br/>soft pressure, a different diagnosis from hard blocking"] -.-> POL
 ```
@@ -7917,10 +7945,10 @@ flowchart LR
     R3 --> Y
     R4 --> Y
     Y --> Z["Six independent rows, so a cluster may claim each on a<br/>DIFFERENT worker. Lost work is at most one lane Budget<br/>of in-flight records, which are re-read, never skipped."]
-    Z -.-> NB["PARTLY BUILT. The lane row and its cursor are written to<br/>pkg/store/wal and survive a real kill -9 — cmd/canal proves it.<br/>Claiming one lane per worker is not built: no Coordinator exists."]
+    Z -.-> NB["PARTLY BUILT. The lane row and its cursor are written to<br/>pkg/store/wal and survive a real kill -9 — cmd/canal proves it.<br/>Claiming works against memstore's in-memory Coordinator in tests;<br/>no durable Coordinator exists for a real cluster to use."]
 ```
 
-Why a crash at 40% neither rescans nor loses: finished chunks are excluded from `Assigned` by `Finished`, the gated tail is excluded by `GatedOn`, and the six survivors each carry their own `Cursor` next to their own write-once `Spec` — the two differently-lifetimed halves that `pkg/connector/lane.go:174-211` keeps as separate fields, which is exactly what lets the resume re-parallelise onto more workers than it started with. The `Assigned` filter is implemented in `internal/engine/runtime.go` over `pkg/store/wal`, so the lane rows and their cursors genuinely survive a crash — `cmd/canal/main_test.go` kills the binary three times to prove it. What is still missing is the part this diagram is really about: no `store.Coordinator` exists, so the six survivors cannot be claimed by six different workers.
+Why a crash at 40% neither rescans nor loses: finished chunks are excluded from `Assigned` by `Finished`, the gated tail is excluded by `GatedOn`, and the six survivors each carry their own `Cursor` next to their own write-once `Spec` — the two differently-lifetimed halves that `pkg/connector/lane.go:174-211` keeps as separate fields, which is exactly what lets the resume re-parallelise onto more workers than it started with. The `Assigned` filter is implemented in `internal/engine/runtime.go` over `pkg/store/wal`, so the lane rows and their cursors genuinely survive a crash — `cmd/canal/main_test.go` kills the binary three times to prove it. What is still missing is the deployable half of what this diagram is really about: the claim-renew-revoke machinery runs in `internal/engine/lease.go` and is exercised against `memstore`'s in-memory `Coordinator`, but no durable implementation exists, so six real workers on six machines still cannot divide the survivors.
 
 8. `Open` → `Assigned` returns **six** assignments: `scan/2` at `key > 'acme-991'`, `scan/3` at
    `key > 'zeta-2'`, and `scan/4..7` at their range starts. Lanes 0 and 1 are absent because they finished.
@@ -8667,9 +8695,11 @@ sequenceDiagram
 `Close` are called in exactly this order by `internal/engine/run.go`, and the concurrency claim —
 `Commit` running while `Read` is blocked — is what the separate commit pump exists to make true.
 `Heartbeat`, `Backlog` and `Nack` are called by the source's control goroutine
-(`internal/engine/control.go`). The **assignment refresh** is the one part of this diagram still
-specification: assignments come from `store.Coordinator`, which has no implementation, so the set of
-lanes a worker holds cannot change after `Open` and there is nothing to refresh. The interfaces are in
+(`internal/engine/control.go`). The **assignment refresh** runs too: the read supervisor in
+`internal/engine/read.go` takes the change signal *before* re-reading the assignment table — in
+that order, so a change between the two is never missed — then drops lanes this worker lost and
+starts readers for lanes it gained. Without a `store.Coordinator` wired the set never changes after
+`Open` and the supervisor just waits, which is the shipped standalone shape. The interfaces are in
 `pkg/connector/source.go:15-98` and the enforcement is in `internal/ledger`.
 
 The two consequences that catch every first-time author:
@@ -8754,9 +8784,12 @@ flowchart LR
 
 The right-hand column is not marketing: those strings are the literal `unlocks` values the registry
 attaches to each capability at `pkg/registry/add.go:60-85`, and they are what an operator sees next
-to an *absent* capability, so "no scan progress" comes with the reason and the fix. **The consequences
-themselves are engine behaviour and the engine is not built**; today the capability is recorded,
-cross-checked and reported, and nothing consumes it at runtime yet.
+to an *absent* capability, so "no scan progress" comes with the reason and the fix. Three of the
+consequences are engine behaviour that runs today — the control goroutine drives `Heartbeat`,
+`Backlog` and `Nack` (`internal/engine/control.go`). The submit-time four — `Validator`, `Prober`,
+`ChoiceProvider`, `Discoverer` — are recorded, cross-checked and reachable through
+`registry.ResolvedSource`, and wait on a frontend to call them; `StateAdopter` waits on connector
+migration, which is not built.
 
 Three of them, added to a source that started as §22.1:
 
@@ -9010,9 +9043,9 @@ stamps, and retargeting it is refused by the ledger.
 12. **Declare exactly the capabilities you implement.** Over-declaring panics at `init`;
     under-declaring is recorded as a `Descriptor` warning and reported as `CapUndeclared`, and the
     capability stays off.
-13. **Test with `pkg/connectortest`**, embedding its runtimes rather than hand-writing fakes. There is
-    no conformance kit; several code comments in `pkg/` still refer to one in the present tense and
-    they are wrong.
+13. **Test with `pkg/connectortest`**, embedding its runtimes rather than hand-writing fakes. There
+    is no CONNECTOR conformance kit yet — the store contract has one, `pkg/storetest` — and several
+    code comments in `pkg/` still refer to a connector kit in the present tense; they are wrong.
 
 ### 22.15 What a connector gets, and what it does not get yet
 
@@ -9028,22 +9061,25 @@ Designed and specified, but **not built** — do not plan around them landing on
 
 - the generic renderer. Nothing consumes the read model yet; `GET /status` serves the document and
   there is no UI on the other end of it.
-- the **assignment refresh**, the fourth thing a source's control goroutine is specified to do. It
-  needs `store.Coordinator`, so in this runtime a worker's lane set cannot change after `Open`.
+- a **durable `store.Coordinator`**. The assignment refresh, the leases and the fences are engine
+  code now, and the in-memory example drives them in tests; what does not exist is an
+  implementation a cluster can point at, so a deployed worker's lane set still cannot change.
 
-  Position rendering, scan progress and the read model itself have come off this list.
+  The assignment refresh itself, position rendering, scan progress and the read model have come
+  off this list.
   `engine.Pipeline.Status` constructs a `telemetry.PipelineStatus`, `cmd/canal` serves it at
   `GET /status`, cursor labels are rendered from `record.Position.Label`, and scan progress is
   computed from lane weights for any source with no connector code. What the document still cannot
   answer is tabulated in §16 rather than guessed at.
-- seven of the twenty-six metric names. `internal/metrics` exports nineteen; the seven that remain
+- six of the twenty-seven metric names. `internal/metrics` produces twenty-one; the six that remain
   measure things that do not exist yet — `canal_buffer_depth_records`, `canal_buffer_refused_total`,
-  `canal_records_deduped_total`, `canal_lane_revoked_unsettled_records`,
-  `canal_restore_phase_seconds`, `canal_node_utilization_ratio` and `canal_node_blocked_seconds_total`.
+  `canal_records_deduped_total`, `canal_restore_phase_seconds`, `canal_node_utilization_ratio` and
+  `canal_node_blocked_seconds_total`.
   They are declared and unemitted, which under omit-don't-zero means simply absent from a scrape.
 
-  `canal_condition`, `canal_reconcile_delta_records` and `canal_oldest_pending_age_seconds` have come
-  off this list with the read model, because the conditions are metrics as well as document fields —
+  `canal_lane_revoked_unsettled_records` came off this list with the revocation fence, and
+  `canal_condition`, `canal_reconcile_delta_records` and `canal_oldest_pending_age_seconds` before
+  it with the read model, because the conditions are metrics as well as document fields —
   which is what turns "my config change silently did not apply" into an alert rather than a mystery.
 - TokenSink, the strongest tier, where the destination stores canal's token transactionally with
   the data. It is resolved by the registry, reported by the negotiation and called by nothing, so

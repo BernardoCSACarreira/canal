@@ -18,22 +18,24 @@ go run ./cmd/canal check --spec your-pipeline.json
 
 | | |
 |---|---|
-| `pkg/` — the connector-author surface | **real, compiling, documented.** 89 files, 14,074 lines. |
-| `internal/engine`, `internal/ledger`, `internal/metrics` | **real for one shape.** 5,569 lines. `Build` resolves, validates and negotiates; `Run` reads, admits, writes, settles, flushes and commits, routes a fault to retry, dead-letter, drop, stop or stall, and measures all of it. Single worker, no transforms, no buffers. |
-| `cmd/canal` | **real.** `run` and `check`, 483 lines of wiring and no policy. |
-| Durable state store | **real.** [`pkg/store/wal`](pkg/store/wal) is a hand-rolled write-ahead log: CRC32C framing, fsync before return, a torn tail truncated rather than refused, and a flock the kernel drops when the holder dies. |
+| `pkg/` — the connector-author surface | **real, compiling, documented.** 90 files, 14,982 lines. |
+| `internal/engine`, `internal/ledger`, `internal/metrics` | **real for one shape.** 11,153 lines. `Build` resolves, validates and negotiates; `Run` reads, admits, writes, settles, flushes and commits, routes a fault to retry, dead-letter, drop, stop or stall, and measures all of it. The read path drives many lanes per source and follows the assignment as it changes; the multi-worker safety line — leases with epochs, fenced writes and deletes, a revocation fence in the ledger — is built and test-exercised. No transforms, no buffers, and the shipped binary still runs one worker, because no durable `store.Coordinator` exists. |
+| `cmd/canal` | **real.** `run`, `check` and `version`, 822 lines of wiring and no policy. |
+| Durable state store | **real.** [`pkg/store/wal`](pkg/store/wal) is a hand-rolled write-ahead log: CRC32C framing, fsync before return, a torn tail truncated rather than refused, and a flock the kernel drops when the holder dies. It enforces per-key epoch fencing itself — a write below the highest epoch seen for its key is refused — and deletes are fenced the same way. [`pkg/storetest`](pkg/storetest) is the contract's own conformance suite; running it found a live corruption bug in this very log. |
 | Codecs | **three.** `raw` and `json` encoders, a `newline` framer. json+newline is ndjson; raw+newline is a log tail. |
 | Connectors | **two sources, two sinks.** `line_file` and `stdout` were written alongside the core; [`file`](internal/example/filesink) is a real `Flusher`, and [`http_push`](internal/stress/push-source) — one of the deliberately hostile stress connectors — runs end to end unmodified. |
 | Durability points | **three of four.** A sink is settled when `Write` returns cleanly, when `Flusher.Flush` makes an accepted batch durable, or when the two-phase commit publishes a committable. Only `TokenSink` is still refused by [`engine.Executable`](internal/engine/build.go) rather than silently under-delivered. |
 | Checkpoints | **real.** [`engine.Checkpoint`](internal/engine/checkpoint.go) was a declared shape nothing constructed. It is now written on every flush — committables, lane cursors, writer state and header in ONE atomic batch — and read at open, where committables a previous run left in doubt are handed back to the sink that minted them. |
-| `internal/stress` — eight hostile connectors | **real.** 15,670 lines, kept as an interface-shape regression suite; the audit found five of the eight genuinely catch drift today. |
+| `internal/stress` — eight hostile connectors | **real.** 15,674 lines, kept as an interface-shape regression suite; the audit found five of the eight genuinely catch drift today. |
 | Fault routing | **real.** A connector states a `Class`, a fact; the engine computes the behaviour from (class, capabilities, policy). Throttling never spends a retry attempt, an indeterminate write against a non-idempotent sink fails loud rather than guessing, and a dead letter is delivered before the record is abandoned. |
-| Metrics | **real for nineteen of twenty-six names.** [`internal/metrics`](internal/metrics) accumulates and renders Prometheus text; `canal run --metrics :9090` serves it. An unmeasurable quantity is OMITTED rather than reported as zero, which is what makes `canal_checkpoint_age_seconds` usable as the primary alert. The seven absent ones measure things that do not exist yet — buffers, dedupe, lane revocation, restart phases, node utilization and blocking. |
-| Read model | **real.** [`engine.Pipeline.Status`](internal/engine/status.go) builds `telemetry.PipelineStatus` and `canal run --metrics` serves it at `GET /status?stream=&limit=&cursor=`. Lanes page by keyset cursor, a per-stream rollup answers "which of my 900 tables is behind" without downloading 29,000 lanes, and every field the engine cannot measure is a nil pointer rather than a confident zero. |
-| Buffers, transforms, multi-worker, a frontend, an API | **do not exist.** The interfaces do, and the negotiation refuses a pipeline that asks for one. |
+| Metrics | **real for twenty-one of twenty-seven names.** [`internal/metrics`](internal/metrics) accumulates and renders Prometheus text; `canal run --metrics :9090` serves it. An unmeasurable quantity is OMITTED rather than reported as zero, which is what makes `canal_checkpoint_age_seconds` usable as the primary alert. The six absent ones measure things that do not exist yet — buffer depth and refusals, dedupe, restore phases, node utilization and blocking. |
+| Read model | **real.** [`engine.Pipeline.Status`](internal/engine/status.go) builds `telemetry.PipelineStatus` and `canal run --metrics` serves it at `GET /status?stream=&limit=&cursor=`, plus `?config=1` for the redacted config tree — never the raw one. Lanes page by keyset cursor, a per-stream rollup answers "which of my 900 tables is behind" without downloading 29,000 lanes, and every field the engine cannot measure is a nil pointer rather than a confident zero. |
+| Multi-worker | **machinery built, deployment not.** Lanes are claimed under leases, a lost lane is dropped from the read set and fenced in the ledger, and every durable write carries its lane's lease epoch down to the store. All of it runs in tests against [`memstore`](internal/example/memstore)'s in-memory `Coordinator`; no durable coordinator exists, so the binary ships standalone. `StatusStore.Aggregate` — the cross-worker merge — refuses with a named fault rather than answering plausibly. |
+| Buffers, transforms, a frontend | **do not exist.** The interfaces do, and the negotiation refuses a pipeline that asks for one. |
 
-`go build ./...`, `go vet ./...`, `gofmt -l .` and `go test -race ./...` are clean: 243 test
-functions across 27 packages, 111 of them under `pkg/`. **Every published package now has tests.**
+`go build ./...`, `go vet ./...`, `gofmt -l .` and `go test -race ./...` are clean: 388 test
+functions across 28 packages, 113 of them under `pkg/`. **Every published package has tests** —
+`pkg/storetest` is itself a test suite, and both stores run it.
 Writing them found two defects nothing else would have: a retry helper that panics on amd64, and a
 key encoding under which two pipelines in one tenant could overwrite each other's state. [CI](.github/workflows/ci.yml) runs all of that on Linux
 and macOS, cross-compiles for five targets, and verifies the module still has zero third-party
@@ -87,7 +89,8 @@ who finds a gap themselves has no reason to trust anything else in the repositor
 - **Two deployment shapes from one binary:** a standalone dev mode with no external dependencies, and a
   horizontally scaled enterprise mode.
 
-None of these is achieved yet. They are what the interface set is shaped to allow.
+One of these — checkpointing — is achieved and proven by the `kill -9` test. The rest are what the
+interface set is shaped to allow.
 
 ## How the pieces fit
 
@@ -129,8 +132,10 @@ negotiation refuses a pipeline that asks for one.
 
 ### The commit protocol
 
-The one thing worth understanding before reading any code. All three phases run; the epoch fencing
-in phase three is written but has only one worker to fence, so it is not yet load-bearing.
+The one thing worth understanding before reading any code. All three phases run, and the epoch
+fencing is real down to the store: every durable write carries the writing lane's lease epoch,
+`pkg/store/wal` refuses a stale one per key, and the revocation tests exercise all of it. The
+shipped standalone binary still has only one worker to fence.
 
 ```mermaid
 sequenceDiagram
@@ -148,7 +153,7 @@ sequenceDiagram
     Snk-->>Eng: connector.WriteResult — clean means DURABLE
     Eng->>Led: Settle(outcomes)
     Led-->>Eng: Flushable() — last safe Position per lane
-    Eng->>St: phase two — Set(ctx, batch), atomic, then flushed
+    Eng->>St: phase two — Set(ctx, batch), atomic, epoch-fenced per key, then flushed
     St-->>Eng: durable
     Eng->>Src: phase three — Commit(ctx, connector.Ack)
     Note over Eng,St: Phase three must never precede the flush. A source that prunes on commit<br/>would free upstream log canal has no durable record of. See ADR 0006.
@@ -166,14 +171,20 @@ durability by returning a clean `WriteResult`, which is why a new sink cannot ge
 
 ```mermaid
 flowchart TB
+    CANAL["cmd/canal — the composition root"]
+
     subgraph INT["internal/ - not importable from outside the module"]
         ENGINE["internal/engine"]
         LEDGER["internal/ledger"]
+        METRICS["internal/metrics"]
         CONNS["internal/example, internal/stress<br>(connectors, written as a third party would)"]
     end
 
     subgraph PKG["pkg/ - the connector-author surface"]
         CTEST["pkg/connectortest"]
+        STEST["pkg/storetest"]
+        WAL["pkg/store/wal"]
+        CODEC["pkg/codec"]
         STORE["pkg/store"]
         SPEC["pkg/spec"]
         TELEM["pkg/telemetry"]
@@ -185,11 +196,20 @@ flowchart TB
         SCH["pkg/schema"]
     end
 
+    CANAL --> ENGINE
+    CANAL --> WAL
+    CANAL --> CODEC
+    CANAL --> CONNS
     ENGINE --> STORE
     ENGINE --> LEDGER
+    ENGINE --> METRICS
     LEDGER --> CONN
+    METRICS --> TELEM
     CONNS --> REG
     CTEST --> CONN
+    STEST --> STORE
+    WAL --> STORE
+    CODEC --> REG
     STORE --> SPEC
     SPEC --> REG
     SPEC --> TELEM
@@ -206,8 +226,9 @@ transitivity are omitted, so `pkg/spec` also imports `connector`, `fault`, `reco
 `registry`. Reproduce it with `go list -deps -f '{{.ImportPath}} {{.Imports}}' ./...`. Two facts the
 diagram makes visible: **`pkg/spec` imports `pkg/registry`, not the other way round** (`Node.Kind` is a
 `registry.Kind`, [`pkg/spec/node.go:17`](pkg/spec/node.go)), and **`internal/engine` is the only package
-that imports everything, and nothing but two test files imports it** — which is what makes the
-extensibility claim checkable, because a connector cannot reach an engine type even if it wanted to.
+that imports everything, and nothing but `cmd/canal` — the composition root — and test files imports
+it** — which is what makes the extensibility claim checkable, because a connector cannot reach an
+engine type even if it wanted to.
 
 > **Note.** §3 of [`docs/architecture.md`](docs/architecture.md) used to carry a dependency table that was
 > wrong in 5 of its rows, named packages that do not exist, and declared a `registry → spec` edge that
@@ -229,22 +250,33 @@ pkg/                    the connector-author surface — the public contract
   connector/            Source, Sink, Transform, Buffer, codecs, all *Caps, LaneSpec,
                         LaneCtl, StateHandle, the *Runtime interfaces
   registry/             Registry, Default, the *Def structs, Descriptor, Add*, Resolve*
+  codec/                raw and json encoders, the newline framer — held to the same
+                        import boundary as a third-party codec
   telemetry/            metric names, closed label vocabulary, Negotiated, the read model
   spec/                 pipeline Spec, Node, Edge, StreamConfig — topology as data
   store/                StateStore, ConfigStore, StatusStore, Coordinator — deployment seam
+    wal/                the durable StateStore: CRC32C framing, fsync, per-key epoch fencing
   connectortest/        embeddable inert runtimes, so a core that grows a method does not
                         break every connector's test suite
+  storetest/            the StateStore conformance suite; every implementation runs it
 
 internal/               engine machinery and connectors; unreachable from outside the module
   engine/               Build, negotiation, the graph, codec resolution, checkpoint plumbing,
-                        and Run: read, admit, write, settle, flush, commit
-  ledger/               Tracker[P], Ledger, Disposition, LaneStats, the leak reaper
-  example/              linefile and filesink and stdoutsink, memstore StateStore (scaffolding)
+                        leases and fencing, and Run: read (one lane or many), admit, write,
+                        settle, flush, commit
+  ledger/               Tracker[P], Ledger, Disposition, LaneStats, the revocation fence,
+                        the leak reaper
+  metrics/              the connector.Metrics implementation; enforces telemetry's closed sets
+  arch/                 architecture tests: dependency direction, inert fields, unreachable
+                        functions, undeclared skips, doc links — the drift guards
+  example/              linefile, filesink and stdoutsink; memstore implements all four store
+                        interfaces in memory, including the Coordinator the engine's
+                        multi-worker tests lease from
   stress/               eight deliberately hostile connectors, kept as a regression suite
 
 docs/
   design-rules.md       R1–R13, normative, each derived from an observed defect
-  architecture.md       9,505 lines, 30 sections, 57 diagrams, declared normative
+  architecture.md       9,757 lines, 30 sections, 57 diagrams, declared normative
   decisions/            0001–0031, the ADRs
   decisions/proposals/  four whole-architecture proposals that were judged against each other
   decisions/reviews/    twelve reviews of those proposals — correctness, extensibility, Go ergonomics
@@ -361,18 +393,22 @@ and register at `init` from a module outside this repository. The audit file pre
 ```sh
 go build ./...
 go vet ./...
-go test ./...
+go test -race ./...
 gofmt -l .          # prints nothing
 ```
 
-There is no `go run` target: there is no `main` package yet.
+The binary is `./cmd/canal`: `check --spec pipeline.json` builds a pipeline and reports what it
+negotiated, `run --spec pipeline.json --state statedir` moves records (add `--metrics :9090` for
+`/metrics` and `/status`), and `version` prints the build it came from. The exit codes are part of
+the interface — a refused spec (3) is distinguishable from a run that failed and might succeed on
+retry (1), so a supervisor never crash-loops on a spec that will never build.
 
 ## Reading order
 
 1. **[docs/design-rules.md](docs/design-rules.md)** — R1–R13. Short, normative, and every rule was paid
    for by an observed defect in an earlier abandoned attempt at this same project. Everything else assumes
    it.
-2. **[docs/architecture.md](docs/architecture.md)** — 9,505 lines, 30 sections, declared normative. §1 is
+2. **[docs/architecture.md](docs/architecture.md)** — 9,757 lines, 30 sections, declared normative. §1 is
    the spine in one page; §4 the record model; §6 lanes; §7–§8 `Source` and `Sink`; §12 the ledger and the
    commit protocol. Its diagram index is at the top; dotted edges and "NOT BUILT" boxes mark the parts
    that describe an engine which does not run yet.
@@ -471,10 +507,31 @@ into. Fixing it turned up two more: `connector.Runtime.Config` returned nil to e
 ever asked, and the ledger's own per-lane abandoned counter was written in two places and read in
 none.
 
-**Next** is what the single-worker label in
-[`internal/engine/runtime.go`](internal/engine/runtime.go) holds open: a `store.Coordinator`, leases
-and real epoch fencing — which is also the assignment refresh, the one part of the control goroutine
-still unbuilt — plus transforms and buffers.
+**The multi-worker safety line is built** — the thing the single-worker label in
+[`internal/engine/runtime.go`](internal/engine/runtime.go) used to hold open. The read path reads
+every assigned lane and follows the assignment as it changes, one goroutine per concurrency slot
+([`internal/engine/read.go`](internal/engine/read.go)); lanes are claimed and renewed under leases
+whose epochs are fencing tokens ([`internal/engine/lease.go`](internal/engine/lease.go)); a lane
+this worker lost is dropped from the read set, refused by the engine's own write paths, fenced in
+the ledger — `Ledger.Revoke` discards acknowledgements so a deposed worker can never tell an
+upstream to prune — and stopped by the store itself, because every durable write carries its lane's
+lease epoch and `pkg/store/wal` refuses a stale one per key. Deletes are fenced the same way. The
+fences are deliberately redundant, and every fix in that line was confirmed by putting the defect
+back and watching the test fail. All of
+it runs against [`memstore`](internal/example/memstore)'s in-memory `Coordinator`, which is
+scaffolding — honest about being a map — so the shipped binary still runs exactly one worker.
+
+That stretch also named this module's dominant defect class: machinery built correctly, tested in
+isolation, and wired to nothing. Nine of ten consecutive branches found one — `Ledger.Revoke` was a
+complete fence with no callers, `Batch.PutFenced` sat unused while the engine sent one constant
+epoch, `config.Redacted` and the status field documented as holding its output each pointed at the
+other and neither was connected. The [`internal/arch`](internal/arch) guards catch the one-sided
+versions; the matched pair had to be found by treating every doc that names a consumer as a claim
+about call sites.
+
+**Next** is the durable half of coordination: a `store.Coordinator` implementation that outlives a
+process, `StatusStore.Aggregate`'s cross-worker merge semantics — which is a design decision before
+it is code — and then transforms and buffers.
 
 Still open, and tracked where they belong rather than here: the twelve decisions in
 [`_completeness-audit.md`](docs/decisions/_completeness-audit.md) that cost a breaking change if

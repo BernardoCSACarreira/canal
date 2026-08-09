@@ -1,8 +1,7 @@
 # 0032 — The WAL container is versioned, and a build reads one step back
 
-**Status:** proposed. Merging this document to `main` is its acceptance, after which it is
-normative. Drafted with both options argued so the decision is a review, not a blank page; the
-recommendation is the Decision below.
+**Status:** accepted, normative. Accepted 2026-08-10; drafted with both options argued so the
+acceptance was a review rather than a blank page.
 
 ## Context
 

@@ -14,8 +14,9 @@ type Spec struct {
 
 	Fields []Field `json:"fields"`
 
-	// Examples are COMPLETE, VALID configs. The conformance kit parses and validates
-	// every one, so a stale example fails CI (design rule R10).
+	// Examples are COMPLETE, VALID configs. The registration lint parses and validates
+	// every one (pkg/registry, lintExamples), so a stale example fails the author's
+	// own go test at init rather than misleading an operator (design rule R10).
 	Examples []Example `json:"examples,omitempty"`
 
 	// Lints are declarative cross-field rules, evaluated offline with no I/O.
@@ -50,9 +51,9 @@ func (s *Spec) Describe(summary, description string) *Spec {
 }
 
 // Find returns the declared field at path, walking objects, arrays, maps and union
-// variants. It is what the predicate cross-check and the spec-path conformance case
-// use, and it is the reason a mistyped path is a registration-time lint failure
-// rather than a silent zero value in production.
+// variants. It is what the registration lint's predicate and path cross-checks use,
+// and it is the reason a mistyped path is a registration-time lint failure rather
+// than a silent zero value in production.
 func (s *Spec) Find(path ...string) (*Field, bool) {
 	if s == nil || len(path) == 0 {
 		return nil, false
@@ -104,9 +105,9 @@ func findField(fields []Field, path []string) (*Field, bool) {
 // explains when to use it.
 //
 // Scaffolding is labelled and tested against what it stands in for (design rule
-// R10), and an Example is the labelled form: the conformance kit validates every one,
-// so an example that has drifted from the spec fails CI instead of misleading an
-// operator.
+// R10), and an Example is the labelled form: the registration lint validates every
+// one, so an example that has drifted from the spec fails the author's registration
+// instead of misleading an operator.
 type Example struct {
 	Title       string         `json:"title"`
 	Description string         `json:"description,omitempty"`

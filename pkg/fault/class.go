@@ -13,8 +13,9 @@ type Class uint8
 
 const (
 	// Unclassified is the zero value and is always a defect. The engine treats it as
-	// PermanentInternal, increments canal_unclassified_faults_total, and the
-	// conformance kit asserts that counter stays at zero for a compliant connector.
+	// PermanentInternal and increments canal_unclassified_faults_total — today that
+	// counter is the only detector; ADR 0023's conformance kit, when it exists, will
+	// assert it stays at zero for a compliant connector.
 	Unclassified Class = iota
 
 	// TransientUpstream means the remote system is temporarily unable AND the effect

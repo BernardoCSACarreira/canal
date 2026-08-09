@@ -56,7 +56,9 @@ const (
 	// assumption.
 	MRestorePhase = "canal_restore_phase_seconds" // {pipeline,phase}
 
-	// MLedgerLeaks and MUnclassified MUST stay zero. The conformance kit asserts it.
+	// MLedgerLeaks and MUnclassified MUST stay zero. The counters themselves are the
+	// detector today — alert on either — and ADR 0023's conformance kit, when it
+	// exists, will assert zero per connector before one ships.
 	MLedgerLeaks  = "canal_ledger_leaks_total"        // {pipeline,node}
 	MUnclassified = "canal_unclassified_faults_total" // {pipeline,node}
 

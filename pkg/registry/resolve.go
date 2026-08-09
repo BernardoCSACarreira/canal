@@ -9,8 +9,8 @@ import (
 //
 // This answers "an optional interface is hostile to a UI and to a wire". A UI cannot type-assert; a
 // gRPC adapter cannot either. So the core collapses the capability set into a struct, once, and
-// everything downstream — the engine, the API, the frontend, the conformance kit — reads only
-// fields.
+// everything downstream reads only fields — the engine today; the API, the frontend and the
+// conformance kit it anticipates, when they arrive.
 //
 // [ResolveSource] is called in EXACTLY ONE PLACE in the whole codebase. A design that type-asserts
 // at every wrapper pays a hand-written forwarder per capability per wrapper; canal pays one

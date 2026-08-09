@@ -28,8 +28,10 @@ type Config struct {
 	errs []error
 }
 
-// NewConfig wraps an already-validated raw tree against its spec. The engine and the
-// conformance kit call it; [Spec.Validate] is the normal path.
+// NewConfig wraps an already-validated raw tree against its spec. [Spec.Validate] is
+// the normal path and the only caller in the module today; it stays exported for a
+// caller that arrives with a tree validated elsewhere — the connector conformance kit
+// (ADR 0023, not yet built) is the intended one.
 func NewConfig(s *Spec, raw map[string]any) *Config {
 	if raw == nil {
 		raw = map[string]any{}

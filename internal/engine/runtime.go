@@ -136,6 +136,22 @@ type laneCtl struct {
 	ledgerFor func(id record.LaneID, ord connector.Ordering, budget int) error
 	admission func(id record.LaneID) connector.Admission
 
+	// finish asks the ledger whether a finishing lane has already settled everything admitted for
+	// it (Ledger.FinishLane). True means the durable retirement may be written now; false means the
+	// flush loop will write it once the last group drains, through Ledger.Retirable.
+	finish func(id record.LaneID) bool
+
+	// finishPending marks lanes whose finish has been REQUESTED but is not yet durable, because
+	// records admitted for them are still in flight. Assigned stops offering such a lane, but its
+	// durable row keeps Finished false — so a StartAfter gate stays shut and a crash re-reads the
+	// tail rather than skipping it.
+	//
+	// A separate set rather than a field on laneRecord, deliberately: stage marshals the WHOLE
+	// record on every cursor flush, so a pending flag on the record itself would ride the next
+	// cursor write to disk as Finished-without-FinishedAt — a lane Assigned would exclude forever
+	// and nothing would ever retire.
+	finishPending map[record.LaneID]bool
+
 	// afterAnnounce plans and claims the lanes that have just appeared, and it is called from
 	// Announce rather than on a timer for a reason every source in this module demonstrates: a source
 	// announces its lanes inside Open and then immediately asks Assigned. Assigned now answers "the
@@ -162,18 +178,21 @@ type specRefFields struct {
 func newLaneCtl(deps Deps, f specRefFields, node record.NodeID,
 	ledgerFor func(record.LaneID, connector.Ordering, int) error,
 	admission func(record.LaneID) connector.Admission,
+	finish func(record.LaneID) bool,
 	leases *leaseTable,
 ) *laneCtl {
 	return &laneCtl{
-		leases:    leases,
-		deps:      deps,
-		node:      node,
-		fields:    f,
-		lanes:     map[record.LaneID]*laneRecord{},
-		versions:  map[record.LaneID]uint64{},
-		changes:   make(chan struct{}),
-		ledgerFor: ledgerFor,
-		admission: admission,
+		leases:        leases,
+		deps:          deps,
+		node:          node,
+		fields:        f,
+		lanes:         map[record.LaneID]*laneRecord{},
+		versions:      map[record.LaneID]uint64{},
+		finishPending: map[record.LaneID]bool{},
+		changes:       make(chan struct{}),
+		ledgerFor:     ledgerFor,
+		admission:     admission,
+		finish:        finish,
 	}
 }
 
@@ -350,7 +369,9 @@ func (l *laneCtl) Assigned(context.Context) ([]connector.LaneAssignment, error) 
 	out := make([]connector.LaneAssignment, 0, len(l.order))
 	for _, id := range l.order {
 		rec := l.lanes[id]
-		if rec.Finished {
+		// finishPending is the in-memory half of a finish whose durable write is waiting on
+		// settlement: the lane leaves the read set now, the gate it feeds opens later.
+		if rec.Finished || l.finishPending[id] {
 			continue
 		}
 		// A LANE THIS WORKER DOES NOT HOLD IS NOT OFFERED. In a standalone run holds() is true for
@@ -444,7 +465,27 @@ func (l *laneCtl) Seed(ctx context.Context, id record.LaneID, cursor record.Posi
 }
 
 // Finish marks a lane complete and durable.
+// Finish marks a lane complete. THE DURABLE HALF WAITS FOR SETTLEMENT: the row write that opens a
+// StartAfter gate happens only once every group admitted for the lane has settled — immediately
+// when nothing is in flight, and otherwise from the flush loop once the last group drains
+// (Ledger.Retirable). Until then the lane leaves the read set in memory only, so a crash re-reads
+// its tail rather than skipping it, and a successor gated on it cannot start over records a sink
+// has not yet accepted. The wait for the SOURCE's final acknowledgement has always been the
+// ledger's; this is the same rule applied to the lane table.
 func (l *laneCtl) Finish(ctx context.Context, id record.LaneID) error {
+	if l.finish == nil || l.finish(id) {
+		return l.retire(ctx, id)
+	}
+	l.mu.Lock()
+	l.finishPending[id] = true
+	l.mu.Unlock()
+	l.notify() // the lane left the read set; nothing downstream opens yet
+	return nil
+}
+
+// retire makes a finish durable. It is Finish's second half: called inline when the lane had
+// nothing in flight, and from the flush loop for a lane Ledger.Retirable reported drained.
+func (l *laneCtl) retire(ctx context.Context, id record.LaneID) error {
 	err := l.mutate(ctx, id, func(rec *laneRecord) error {
 		rec.Finished = true
 		// Stamped by the core at the moment the write is made durable, so FinishedAt means "this
@@ -453,9 +494,27 @@ func (l *laneCtl) Finish(ctx context.Context, id record.LaneID) error {
 		return nil
 	})
 	if err == nil {
+		l.mu.Lock()
+		delete(l.finishPending, id)
+		l.mu.Unlock()
 		l.notify() // a gate may now be open
+	} else if fault.ClassOf(err) == fault.Fenced {
+		// The lane is not this worker's to retire; its new holder reads it to the end and retires
+		// it itself. Keeping it pending would only leak the entry.
+		l.mu.Lock()
+		delete(l.finishPending, id)
+		l.mu.Unlock()
 	}
 	return err
+}
+
+// has reports whether this node's table knows the lane, so the flush loop can route a retirement
+// to the laneCtl that owns it.
+func (l *laneCtl) has(id record.LaneID) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_, ok := l.lanes[id]
+	return ok
 }
 
 // Forget removes a lane and its durable row.

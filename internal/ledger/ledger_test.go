@@ -673,3 +673,87 @@ func TestRecordsCommittedCountsOnlyWhatAnAcknowledgementCarried(t *testing.T) {
 			"acknowledged them — and again by the acknowledgement that did", got)
 	}
 }
+
+// THE DURABLE HALF OF A FINISH WAITS FOR SETTLEMENT, AND THE PRE-ADMISSION MARK CANNOT CLAIM IT.
+//
+// A lane's finish has two halves with two different waits. FinishLane is the acknowledgement half
+// and is deliberately set BEFORE the final batch is admitted, so the flag cannot lose a race with
+// the flush loop. The durable half — the row write a StartAfter gate opens on — must therefore not
+// key off that flag: at the moment it is set, the lane's last records exist and are not yet in the
+// tracker, so "nothing in flight" is true and means nothing. RequestRetire is the second half's own
+// entry point, and Retirable hands each drained lane to the flush loop exactly once.
+func TestRetirementWaitsForSettlementAndIsHandedOutOnce(t *testing.T) {
+	l := New(Config{Tenant: "acme", Pipeline: "p", DefaultBudget: 16, GroupTTL: time.Minute})
+	defer l.Close()
+	if err := l.Lane("lane-1", connector.OrderingPrefix, 16, connector.WhenFullBlock); err != nil {
+		t.Fatalf("Lane: %v", err)
+	}
+
+	// The engine's order for an EndOfLane batch: mark, THEN admit. Nothing is in flight at the
+	// moment of the mark, and the lane must still not become retirable — the final batch is coming.
+	l.FinishLane("lane-1")
+	if got := l.Retirable(); len(got) != 0 {
+		t.Fatalf("the pre-admission mark alone made %v retirable; the final batch it precedes has "+
+			"not even been admitted, let alone settled", got)
+	}
+
+	pos := record.Position{Order: []byte{1}, Token: record.Blob{Version: 1, Bytes: []byte{1}}, Safe: true}
+	b := batchAt(t, "lane-1", pos, 3)
+	if err := l.Admit(context.Background(), b); err != nil {
+		t.Fatalf("Admit: %v", err)
+	}
+
+	// The batch is admitted and in flight when the retirement is requested: not settled, so the
+	// caller must not write the row yet, and neither may the flush loop.
+	if settled := l.RequestRetire("lane-1"); settled {
+		t.Fatal("RequestRetire reported an unsettled lane as drained; the caller would write the " +
+			"row and open the gate over three in-flight records")
+	}
+	if got := l.Retirable(); len(got) != 0 {
+		t.Fatalf("Retirable returned %v while the lane's final batch is unsettled", got)
+	}
+
+	outs := make([]Outcome, 0, 3)
+	for _, r := range b.Records {
+		outs = append(outs, Outcome{Record: r.Origin().ID, Node: "out", Disposition: Delivered})
+	}
+	l.Settle(outs)
+
+	if got := l.Retirable(); len(got) != 1 || got[0] != "lane-1" {
+		t.Fatalf("Retirable returned %v after the last group settled, want exactly [lane-1]", got)
+	}
+	if got := l.Retirable(); len(got) != 0 {
+		t.Fatalf("Retirable handed the same lane out twice: %v; the flush loop would retire it "+
+			"again every tick", got)
+	}
+}
+
+// A RETIREMENT REQUESTED WITH NOTHING IN FLIGHT IS THE CALLER'S TO WRITE, IMMEDIATELY AND ALONE:
+// RequestRetire returns true, consumes the claim, and Retirable never offers the lane — otherwise
+// the row would be written twice, once inline and once from the flush loop.
+func TestAnAlreadyDrainedRetirementIsClaimedInline(t *testing.T) {
+	l := New(Config{Tenant: "acme", Pipeline: "p", DefaultBudget: 16, GroupTTL: time.Minute})
+	defer l.Close()
+	if err := l.Lane("lane-1", connector.OrderingPrefix, 16, connector.WhenFullBlock); err != nil {
+		t.Fatalf("Lane: %v", err)
+	}
+
+	pos := record.Position{Order: []byte{1}, Token: record.Blob{Version: 1, Bytes: []byte{1}}, Safe: true}
+	b := batchAt(t, "lane-1", pos, 2)
+	if err := l.Admit(context.Background(), b); err != nil {
+		t.Fatalf("Admit: %v", err)
+	}
+	outs := make([]Outcome, 0, 2)
+	for _, r := range b.Records {
+		outs = append(outs, Outcome{Record: r.Origin().ID, Node: "out", Disposition: Delivered})
+	}
+	l.Settle(outs)
+
+	if settled := l.RequestRetire("lane-1"); !settled {
+		t.Fatal("RequestRetire reported a fully settled lane as still draining; nothing else will " +
+			"ever surface it and the row would never be written")
+	}
+	if got := l.Retirable(); len(got) != 0 {
+		t.Fatalf("Retirable offered %v after the inline path already claimed it", got)
+	}
+}

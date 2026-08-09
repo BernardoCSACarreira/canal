@@ -529,7 +529,9 @@ func (r *runner) openSources(ctx context.Context) error {
 					Budget:   int(st.InFlightBudget),
 					Headroom: int(st.InFlightBudget) - int(st.InFlight),
 				}
-			}, r.leases)
+			},
+			r.p.ledger.RequestRetire,
+			r.leases)
 		if err := lc.load(ctx); err != nil {
 			return err
 		}
@@ -995,8 +997,11 @@ func (r *runner) flushOnce(ctx context.Context, reason connector.FlushReason) {
 	flushable := r.p.ledger.Flushable()
 
 	// Nothing to record at all: no cursor moved and no committable was minted. Skipping keeps an
-	// idle pipeline from writing a checkpoint per tick.
+	// idle pipeline from writing a checkpoint per tick. Retirements are still collected first —
+	// a lane whose LAST group settled without moving a safe position has nothing flushable and
+	// must not wait for a busier tick.
 	if len(flushable) == 0 && len(minted) == 0 && !r.checkpointer.hasPending() {
+		r.retireLanes(ctx)
 		return
 	}
 
@@ -1033,6 +1038,44 @@ func (r *runner) flushOnce(ctx context.Context, reason connector.FlushReason) {
 	if len(flushable) > 0 {
 		r.p.ledger.Committed(flushable)
 	}
+
+	r.retireLanes(ctx)
+}
+
+// retireLanes makes durable the finish of every lane whose last in-flight group has settled since
+// the previous flush — the deferred half of laneCtl.Finish. Ordered after the cursor flush so the
+// tick that retires a lane has already persisted its final position, and after Committed so the
+// source's final acknowledgement is not held behind a row write it does not depend on.
+func (r *runner) retireLanes(ctx context.Context) {
+	for _, lane := range r.p.ledger.Retirable() {
+		ctl := r.laneCtlOwning(lane)
+		if ctl == nil {
+			continue
+		}
+		if err := ctl.retire(context.WithoutCancel(ctx), lane); err != nil {
+			// A FENCED RETIREMENT LOSES THE LANE, NOT THE PIPELINE — the same blast radius rule as
+			// finishLane's: the new holder reads the lane to the end and retires it itself.
+			if fault.ClassOf(err) == fault.Fenced {
+				r.deps.Log.Warn("not retiring a lane this worker no longer holds; its new holder will",
+					"lane", lane, "error", err)
+				continue
+			}
+			r.fail(err)
+			return
+		}
+	}
+}
+
+// laneCtlOwning finds the node table that owns a lane, where laneCtlFor answers by node.
+func (r *runner) laneCtlOwning(lane record.LaneID) *laneCtl {
+	r.nodesMu.RLock()
+	defer r.nodesMu.RUnlock()
+	for _, ctl := range r.lanes {
+		if ctl.has(lane) {
+			return ctl
+		}
+	}
+	return nil
 }
 
 // fillLaneStates copies the lane table into the checkpoint envelope.

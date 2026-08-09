@@ -88,6 +88,7 @@ func newFenceFixture(t *testing.T, known []record.LaneID, held map[record.LaneID
 	ctl := newLaneCtl(deps, fields, "in",
 		func(record.LaneID, connector.Ordering, int) error { return nil },
 		func(record.LaneID) connector.Admission { return connector.Admission{} },
+		nil, // finish: nil means retire immediately, which is what these fixtures exercise
 		lt)
 	for _, id := range known {
 		ctl.lanes[id] = &laneRecord{Spec: connector.LaneSpec{Name: string(id)}}

@@ -48,15 +48,18 @@ given at each gate.
 
 ## Track A — known defects in shipped code
 
-No design needed; each is one function plus the injected-defect discipline (fix confirmed by putting
-the defect back). These outrank features because a wrong number or a wrong comment closes questions
-falsely.
+A standing track, not a one-time list: anything the guards, a review or ordinary work turns up
+lands here and outranks features, because a wrong number or a wrong comment closes questions
+falsely. No design needed; each is one function plus the injected-defect discipline (fix confirmed
+by putting the defect back).
 
-| # | Defect | Where |
+**The opening three are done** (PRs #52–#54, merged 2026-08-09), and the track stands empty:
+
+| # | Was | Resolution |
 |---|---|---|
-| A1 | `Ledger.Committed` adds `ackRecords` to `recordsCommitted` **before** the `fenced()` / `finishAcked` guards that suppress the acknowledgement itself, so a fenced lane's counter advertises records the source was never told about; the prefix loop also reaches its discrete-ordering `continue` after the increment and without a reset, so discrete lanes may be counted twice against `emitDiscrete`'s own increment | [ledger.go](../internal/ledger/ledger.go) |
-| A2 | A lane's `FinishedAt` is stamped when the row write is durable — before every group admitted for the lane has settled — while the ledger's own `LaneFinished` acknowledgement deliberately waits. A `StartAfter` gate reads the row, so a successor lane can open against a predecessor whose in-flight records are still unsettled. Recorded during the lease work; confirm the window exists, then close it | [runtime.go](../internal/engine/runtime.go), the gate re-evaluation in [memstore/coordinator.go](../internal/example/memstore/coordinator.go) |
-| A3 | Several comments in `pkg/` refer to a connector conformance kit in the present tense; none exists (the store contract has one, `pkg/storetest`). Under this repo's rules a wrong comment is a defect — either fix the comments now or accept them as IOUs against M6 and say so in each | `pkg/record/origin.go`, `pkg/config/{config,spec}.go`, `pkg/connector/{runtime,transform}.go`, `pkg/registry/resolve.go` |
+| A1 | `Ledger.Committed` incremented `recordsCommitted` above the guards that suppress the acknowledgement itself, so the read model could advertise records the source was never told about — and count a discrete lane's records twice against `emitDiscrete`'s own increment | The counter moves only in the emit arm of both loops, by exactly `Ack.Records`, which also ended a divergence with `canal_records_committed_total` (always ack-coupled). The reachable violation was the discrete double count, via handle-less settlements; the fenced and finish-acked increments added zero in every sequence reachable through the public API and were shape fixes, pinned by tests anyway |
+| A2 | A lane's `FinishedAt` was stamped the moment a source asked, before its admitted groups settled, and a `StartAfter` gate reads exactly that row — so a successor could open over records no sink had accepted | The durable half now waits for settlement: `Ledger.RequestRetire` / `Retirable` hand the row write to the flush loop once the last group drains, the pre-admission acknowledgement mark deliberately cannot trigger it, and until then the lane leaves the read set in memory only. `LaneCtl.Finish`'s contract — "a request, not an assertion" — had promised exactly this all along; the implementation caught up |
+| A3 | Twelve comments across `pkg/` and the engine claimed, in the present tense, that a connector conformance kit enforces things; none exists | Each now names what actually owns the check today — mostly `pkg/registry`'s registration lint, at the author's own first `go test`, which is stronger than the CI the comments promised — or says plainly that nothing does, pointing at [ADR 0023](decisions/0023-conformance-and-chaos.md) for the half that waits on M6 |
 
 ## Track B — the decision queue
 
@@ -196,7 +199,7 @@ shape.
 |---|---|
 | The connector conformance kit | after B7: crash-resume via the `Harness`, fault injection, the B6 envelope round-trip, capability-declaration checks — ADR 0023 made real for third parties |
 | Fuzz targets | position decode, each blob kind, the WAL segment reader, each deframer, config validation — named in §24 so they are owned (there is not one `func Fuzz` in the module today) |
-| Real connectors | the goals name the classes: streaming CDC, batch/full-scan, and the snapshot-then-stream hybrid — whose lane-gating machinery (ADR 0008, `StartAfter`) exists and has never run end to end against a real system; A2 must close first |
+| Real connectors | the goals name the classes: streaming CDC, batch/full-scan, and the snapshot-then-stream hybrid — whose lane-gating machinery (ADR 0008, `StartAfter`) exists and is settlement-gated since Track A's A2, but has never run end to end against a real system |
 | Connector migration | `StateAdopter.AdoptsStateOf` gets its caller (rename/rewrite adopts old cursors); generalises to B4's node-id escape hatch |
 | `engine/remote` | the out-of-process seam, last, exactly as §30 has always said: by construction it touches no file above it |
 

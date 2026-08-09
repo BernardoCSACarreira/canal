@@ -276,7 +276,7 @@ internal/               engine machinery and connectors; unreachable from outsid
 
 docs/
   design-rules.md       R1–R13, normative, each derived from an observed defect
-  architecture.md       9,761 lines, 30 sections, 57 diagrams, declared normative
+  architecture.md       9,762 lines, 30 sections, 57 diagrams, declared normative
   decisions/            0001–0031, the ADRs
   decisions/proposals/  four whole-architecture proposals that were judged against each other
   decisions/reviews/    twelve reviews of those proposals — correctness, extensibility, Go ergonomics
@@ -408,7 +408,7 @@ retry (1), so a supervisor never crash-loops on a spec that will never build.
 1. **[docs/design-rules.md](docs/design-rules.md)** — R1–R13. Short, normative, and every rule was paid
    for by an observed defect in an earlier abandoned attempt at this same project. Everything else assumes
    it.
-2. **[docs/architecture.md](docs/architecture.md)** — 9,761 lines, 30 sections, declared normative. §1 is
+2. **[docs/architecture.md](docs/architecture.md)** — 9,762 lines, 30 sections, declared normative. §1 is
    the spine in one page; §4 the record model; §6 lanes; §7–§8 `Source` and `Sink`; §12 the ledger and the
    commit protocol. Its diagram index is at the top; dotted edges and "NOT BUILT" boxes mark the parts
    that describe an engine which does not run yet.

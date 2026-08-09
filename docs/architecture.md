@@ -9755,3 +9755,7 @@ The order is not negotiable, because R3 exists to prevent breadth before a worki
 14. `store/postgres`, `canal serve`, the coordinated chaos suite.
 15. `ui/`.
 16. `engine/remote` — if and when it is wanted. By construction it touches no file above it.
+
+Milestone one (step 10) is met — `cmd/canal/main_test.go` is that chaos test. The remaining tail of
+this list, reconciled with everything the audits added to it, is elaborated in
+[ROADMAP.md](ROADMAP.md); the order stated here still governs where they overlap.

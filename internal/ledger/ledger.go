@@ -127,6 +127,15 @@ type laneState struct {
 	// and a source that closed its cursor on the first one was called back twice.
 	finishAcked bool
 
+	// retireRequested and retireReported carry the DURABLE half of a finish, distinct from
+	// laneFinished, which carries the acknowledgement half. Requested is set only by RequestRetire —
+	// after the final batch is admitted, never by the pre-admission mark — so the flush loop cannot
+	// retire a lane whose last records exist but are not yet in the tracker. Reported records that
+	// the drained fact was handed to exactly one caller, RequestRetire's immediate path or
+	// Retirable, so the row is written once.
+	retireRequested bool
+	retireReported  bool
+
 	// fencedThrough is the highest epoch whose work must never be acknowledged for this lane.
 	//
 	// A WATERMARK RATHER THAN A FLAG, so the fence can be outlived. Everything admitted at or below
@@ -716,12 +725,66 @@ func (l *Ledger) Committed(m map[record.LaneID]record.Position) {
 // engine set the flag after the last batch was delivered, by which time the flush loop had often
 // already acknowledged that batch's position, so the acknowledgement carrying LaneFinished was
 // never emitted at all. Two lanes in eight learned they had finished.
+//
+// This is only the acknowledgement half. The DURABLE half — the row write a StartAfter gate opens
+// on — is requested separately through [Ledger.RequestRetire], and deliberately not here: this is
+// called before the final batch is admitted, and a retirement claimed at that moment could race the
+// flush loop into opening a gate over records not yet admitted, let alone settled.
 func (l *Ledger) FinishLane(lane record.LaneID) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if st, ok := l.lanes[lane]; ok {
 		st.laneFinished = true
 	}
+}
+
+// RequestRetire marks a lane's retirement as wanted DURABLY — the row write that removes it from
+// the table's live set and opens any StartAfter gate behind it. It also sets the acknowledgement
+// flag FinishLane sets, because every retirement implies it and the ErrEndOfInput path arrives here
+// without a final batch to have pre-marked.
+//
+// It reports whether the lane has ALREADY SETTLED everything admitted for it. True means the caller
+// must write the retirement now — the claim is consumed, and with nothing in flight this ledger
+// will never surface the lane again. False means the last group is still open and the lane will
+// come back through [Ledger.Retirable] once it drains; writing the retirement before then is how a
+// StartAfter gate opens over a predecessor whose records are still in flight.
+func (l *Ledger) RequestRetire(lane record.LaneID) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	st, ok := l.lanes[lane]
+	if !ok {
+		// Never admitted anything, so there is nothing to wait for.
+		return true
+	}
+	st.laneFinished = true
+	st.retireRequested = true
+	if st.pending == 0 {
+		// The immediate path claims the lane so Retirable never hands it out a second time.
+		st.retireReported = true
+		return true
+	}
+	return false
+}
+
+// Retirable returns the lanes whose retirement was requested and whose last in-flight group has
+// settled since the previous call. Each lane is returned exactly once — RequestRetire's immediate
+// path claims a lane that was already drained, and this claims the rest — so the flush loop can
+// make each retirement durable without tracking what it has already written.
+//
+// Consuming rather than idempotent is safe because of what the caller does with a failure: a fenced
+// retirement is dropped (the lane's new holder reads it to the end and retires it itself), and any
+// other store error fails the pipeline the same way a cursor write would.
+func (l *Ledger) Retirable() []record.LaneID {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []record.LaneID
+	for id, st := range l.lanes {
+		if st.retireRequested && st.pending == 0 && !st.retireReported {
+			st.retireReported = true
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // emitDiscrete drains settled handles into acknowledgements for discrete lanes.

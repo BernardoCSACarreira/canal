@@ -454,19 +454,12 @@ func (r *runner) retireFinished(ctx context.Context, rt *sourceRuntime, live []l
 	return kept
 }
 
-// finishLane retires a lane: durably in the lane table, so a gate that depends on it opens exactly
-// once, and in the ledger, so the lane's final acknowledgement carries LaneFinished and the source
-// learns the retirement became durable rather than inferring it from silence.
-//
-// THE WAIT FOR THE LANE'S ADMITTED GROUPS TO SETTLE IS THE LEDGER'S, not this function's. Both
-// Ledger.FinishLane and record.Batch.EndOfLane say the engine must not tell a source its lane has
-// finished while records are still in flight, and the engine cannot see when the last one settles —
-// so the ledger holds the flag until its own in-flight count for the lane reaches zero. Calling
-// this while work is outstanding is therefore correct and is what the EndOfLane path does.
-//
-// The DURABLE half does not wait, and that is a gap this branch does not close: a lane marked
-// finished in the table opens its downstream gate immediately, so a StartAfter tail can begin
-// before the scan it waits behind is fully settled. The ErrEndOfInput path has always done this.
+// finishLane retires a lane through laneCtl.Finish, which owns BOTH waits: the ledger holds the
+// final acknowledgement until every group admitted for the lane settles (Ledger.FinishLane), and
+// the durable row write — the fact a StartAfter gate opens on — waits for the same settlement,
+// happening inline when nothing is in flight and from the flush loop otherwise. Calling this while
+// work is outstanding is therefore correct and is what the EndOfLane path does: the lane leaves the
+// read set now, and everything downstream of its retirement happens when the last record lands.
 func (r *runner) finishLane(ctx context.Context, rt *sourceRuntime, lane record.LaneID) {
 	if err := rt.lanes.Finish(context.WithoutCancel(ctx), lane); err != nil {
 		// A FENCED FINISH LOSES THE LANE, NOT THE PIPELINE, which is the blast radius store.Lease's
@@ -484,7 +477,6 @@ func (r *runner) finishLane(ctx context.Context, rt *sourceRuntime, lane record.
 		}
 		r.fail(err)
 	}
-	r.p.ledger.FinishLane(lane)
 }
 
 // spinner counts consecutive reads that reported nothing at all.

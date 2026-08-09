@@ -18,9 +18,11 @@ import (
 //
 // Records placed in out MUST come from out.Derive(an in-record) or
 // out.Merge(in-records...). A freshly stamped record belongs to no group, and admitting
-// one would break settlement. The core ENFORCES this: a record in out whose group is not
-// one of in's groups fails the conformance kit at build time and is
-// fault.PermanentContract at runtime.
+// one would break settlement — the ledger's Expand is what models a transform's fan-out
+// against the group that entered. Nothing runs a transform yet, so today this rule is
+// contract text: the transform stage enforces it as fault.PermanentContract at runtime
+// when it arrives, and the build-time half belongs to ADR 0023's conformance kit, also
+// unbuilt.
 type Transform interface {
 	Open(ctx context.Context, rt TransformRuntime) error
 

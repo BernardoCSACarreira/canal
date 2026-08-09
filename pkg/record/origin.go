@@ -29,8 +29,9 @@ type Origin struct {
 	//
 	// A source with no natural upstream id MUST derive a deterministic one from
 	// stable fields and document the derivation in its registered Notes (design
-	// rule R5). That documentation obligation is asserted by the conformance kit: a
-	// source declaring StableKeys with empty Notes fails registration lint.
+	// rule R5). That documentation obligation is asserted at registration: a
+	// source declaring StableKeys with empty Notes panics in pkg/registry's
+	// cross-check, on the author's own first go test.
 	Key []byte
 
 	// Upstream is the vendor's own id for this record, when it has one, carried

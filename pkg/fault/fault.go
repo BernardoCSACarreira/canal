@@ -104,8 +104,9 @@ func (f *Fault) Is(target error) bool {
 }
 
 // New constructs a Fault. Connector authors use this or a Class-named helper rather
-// than fmt.Errorf, and the conformance kit fails a connector whose returned errors do
-// not classify.
+// than fmt.Errorf. An error that does not classify is counted against the connector
+// at runtime (canal_unclassified_faults_total, treated as PermanentInternal); ADR
+// 0023's conformance kit, when it exists, will fail such a connector before it ships.
 func New(c Class, op Op, err error) *Fault {
 	return &Fault{Class: c, Op: op, Err: err}
 }

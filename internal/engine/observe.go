@@ -160,9 +160,10 @@ func laneLabel(id record.LaneID) string { return string(id) }
 // fault records one classified failure.
 //
 // The UNCLASSIFIED COUNTER IS INCREMENTED FROM THE RAW CLASS, before routing normalises it to
-// PermanentInternal. pkg/fault says that counter must stay zero for a compliant connector and the
-// conformance kit asserts it — which only works if the normalisation happens after the count. It is
-// the one place in the engine where the pre-normalised class is the interesting one.
+// PermanentInternal. pkg/fault says that counter must stay zero for a compliant connector, and the
+// counter is the detector — for an operator's alert today, for ADR 0023's conformance kit when it
+// exists — which only works if the normalisation happens after the count. It is the one place in
+// the engine where the pre-normalised class is the interesting one.
 func (o *obs) fault(node record.NodeID, err error) {
 	if o == nil || err == nil {
 		return

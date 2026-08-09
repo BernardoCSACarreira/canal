@@ -9044,8 +9044,9 @@ stamps, and retargeting it is refused by the ledger.
     under-declaring is recorded as a `Descriptor` warning and reported as `CapUndeclared`, and the
     capability stays off.
 13. **Test with `pkg/connectortest`**, embedding its runtimes rather than hand-writing fakes. There
-    is no CONNECTOR conformance kit yet — the store contract has one, `pkg/storetest` — and several
-    code comments in `pkg/` still refer to a connector kit in the present tense; they are wrong.
+    is no CONNECTOR conformance kit yet — the store contract has one, `pkg/storetest` — and every
+    comment in `pkg/` that once claimed one in the present tense now names what actually owns the
+    check today (mostly the registration lint) and points at ADR 0023 for the rest.
 
 ### 22.15 What a connector gets, and what it does not get yet
 

@@ -13,9 +13,9 @@ import (
 // canal arrives here.
 //
 // It is an INTERFACE, not a struct, for three reasons: a connector can be unit tested
-// against a fake; the conformance kit can build one; and an out-of-process adapter can
-// implement it over a reverse RPC channel. A concrete struct with unexported state is
-// untestable and un-wireable.
+// against a fake; a conformance kit (ADR 0023, not yet built) can build one; and an
+// out-of-process adapter can implement it over a reverse RPC channel. A concrete
+// struct with unexported state is untestable and un-wireable.
 //
 // THIS IS THE GROWTH PATH. Adding a method here does not break a single connector, because
 // the core implements it and the connector only calls it. Every capability canal adds to

@@ -7,8 +7,9 @@ import (
 	"time"
 )
 
-// RETRY-SAFETY OBLIGATION. Stated here because the compiler cannot enforce it and
-// the conformance kit asserts it:
+// RETRY-SAFETY OBLIGATION. Stated here because the compiler cannot enforce it, and
+// nothing else does yet either — asserting it with injected faults is a named case
+// for ADR 0023's conformance kit, which is not built:
 //
 //	A connector may return TransientUpstream ONLY when it knows the effect did not
 //	land. If the remote MAY have applied the write, the class is Indeterminate,

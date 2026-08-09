@@ -457,6 +457,14 @@ func TestARevokedLaneIsNeitherFlushedNorAcknowledged(t *testing.T) {
 		t.Error("Revoke reported no unsettled records while four were in flight; the overlap the " +
 			"new holder has to absorb is the number this reports and an operator's only sight of it")
 	}
+
+	// The accounting is the fence's third face: a lane whose acknowledgements never left must
+	// report zero records committed, or the read model advertises progress the source was never
+	// told about — a number documented as "reached the source" that nothing reached.
+	if got := l.Stats("lane-1").RecordsCommitted; got != 0 {
+		t.Errorf("a revoked lane reports %d records committed while every acknowledgement was "+
+			"suppressed; the counter's contract is records whose position reached the source", got)
+	}
 }
 
 // A REVOCATION IS SURVIVABLE, AND THE WORK IT FENCED STAYS FENCED.
@@ -586,5 +594,82 @@ func TestALaneRevokedAtOneEpochWorksAgainAtTheNext(t *testing.T) {
 			"  Seven means the four fenced records were counted into the epoch that replaced them, "+
 			"which tells the upstream to discard work this worker delivered while holding nothing",
 			got[0].Records)
+	}
+}
+
+// RECORDSCOMMITTED INCREMENTS EXACTLY WHEN AN ACKNOWLEDGEMENT IS EMITTED, BY EXACTLY Ack.Records.
+// The field's own doc is the contract: records whose position reached the SOURCE — not records
+// whose cursor happened to be in a flushed map.
+//
+// The sequence here is the reachable violation. A discrete lane's settlements accumulate ackRecords
+// with no ordering guard, but when none of the settled records carried a handle, emitDiscrete has
+// nothing to deliver and skips the lane WITHOUT consuming the accumulator. If that lane's cursor
+// then reaches Committed — which Flushable permits, because an empty positioned batch resolves a
+// position on any lane and Flushable has no ordering filter — the prefix loop counted the
+// accumulator into recordsCommitted and continued at its ordering check without resetting it. The
+// next handled settlement emitted an acknowledgement carrying the SAME records and counted them
+// again: the source was told N+M once, the read model said 2N+M.
+func TestRecordsCommittedCountsOnlyWhatAnAcknowledgementCarried(t *testing.T) {
+	l := New(Config{Tenant: "acme", Pipeline: "p", DefaultBudget: 16, GroupTTL: time.Minute})
+	defer l.Close()
+	if err := l.Lane("lane-1", connector.OrderingDiscrete, 16, connector.WhenFullBlock); err != nil {
+		t.Fatalf("Lane: %v", err)
+	}
+
+	// Four records, none with a handle. They settle, the accumulator holds 4, and no
+	// acknowledgement can be emitted for them yet.
+	pos1 := record.Position{Order: []byte{1}, Token: record.Blob{Version: 1, Bytes: []byte{1}}, Safe: true}
+	b1 := batchAt(t, "lane-1", pos1, 4)
+	if err := l.Admit(context.Background(), b1); err != nil {
+		t.Fatalf("Admit: %v", err)
+	}
+	outs := make([]Outcome, 0, 4)
+	for _, r := range b1.Records {
+		outs = append(outs, Outcome{Record: r.Origin().ID, Node: "out", Disposition: Delivered})
+	}
+	l.Settle(outs)
+
+	// The engine flushes this lane's cursor and reports it durable. No acknowledgement has been
+	// produced — there is still nothing to deliver — so the committed count must not move.
+	pos2 := record.Position{Order: []byte{2}, Token: record.Blob{Version: 1, Bytes: []byte{2}}, Safe: true}
+	l.Committed(map[record.LaneID]record.Position{"lane-1": pos2})
+
+	if got := l.Stats("lane-1").RecordsCommitted; got != 0 {
+		t.Errorf("%d records reported committed while no acknowledgement has ever been emitted for "+
+			"this lane; the source has been told nothing", got)
+	}
+
+	// Two more records, with handles. Their settlement emits the lane's first acknowledgement,
+	// which carries everything accumulated so far: all six records, two handles.
+	pos3 := record.Position{Order: []byte{3}, Token: record.Blob{Version: 1, Bytes: []byte{3}}, Safe: true}
+	b2 := batchAt(t, "lane-1", pos3, 2)
+	b2.SetGroup(record.GroupID(99))
+	for i, r := range b2.Records {
+		r.SetHandle([]byte{byte(0x10 + i)})
+	}
+	if err := l.Admit(context.Background(), b2); err != nil {
+		t.Fatalf("Admit: %v", err)
+	}
+	outs = outs[:0]
+	for _, r := range b2.Records {
+		outs = append(outs, Outcome{Record: r.Origin().ID, Node: "out", Disposition: Delivered})
+	}
+	l.Settle(outs)
+
+	var ack connector.Ack
+	select {
+	case ack = <-l.Acks():
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("no acknowledgement after a handled settlement on a discrete lane")
+	}
+	if ack.Records != 6 {
+		t.Fatalf("the acknowledgement carries %d records, want 6: the four handle-less records are "+
+			"reported in the count of the first acknowledgement that can be emitted", ack.Records)
+	}
+
+	if got := l.Stats("lane-1").RecordsCommitted; got != 6 {
+		t.Errorf("RecordsCommitted is %d after an acknowledgement carrying 6, want 6.\n"+
+			"  Ten means the four handle-less records were counted once by Committed — which never "+
+			"acknowledged them — and again by the acknowledgement that did", got)
 	}
 }

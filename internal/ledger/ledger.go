@@ -147,6 +147,12 @@ type laneState struct {
 	// diverge by exactly the phase-two-to-phase-three lag, which is the window the whole commit
 	// design exists to manage, and the read model reported the settled number under the name
 	// "committed" because this one was computed and discarded.
+	//
+	// It moves in exactly one place per ordering — the statement block that appends the
+	// acknowledgement, in Committed's emit arm and in emitDiscrete's — and by exactly Ack.Records.
+	// It used to move at the top of Committed's loop, above the guards that suppress the
+	// acknowledgement itself, which counted records for fenced and already-finished lanes that no
+	// acknowledgement ever carried, and counted a discrete lane's records twice.
 	recordsCommitted uint64
 	// shed counts records dropped at ADMISSION under a non-blocking when_full.
 	//
@@ -651,12 +657,21 @@ func (l *Ledger) Committed(m map[record.LaneID]record.Position) {
 			continue
 		}
 		st.committed, st.committedOK = pos, true
-		st.recordsCommitted += st.ackRecords
 		st.admittedSinceSafe = 0
 
+		if st.ordering != connector.OrderingPrefix {
+			// A discrete lane's cursor still moves — the position genuinely became durable — but its
+			// acknowledgement and every number attached to it belong to emitDiscrete. Counting or
+			// clearing the accumulators here counted records into recordsCommitted that no
+			// acknowledgement had carried yet, and the acknowledgement that finally carried them
+			// counted them a second time.
+			continue
+		}
 		if st.finishAcked {
-			// The lane has already had its final acknowledgement. The cursor still moves — the
-			// numbers above are the read model's — but the source is not told again.
+			// The lane has already had its final acknowledgement. The cursor still moves, but the
+			// source is not told again — and recordsCommitted does not move either, because it
+			// counts records whose position REACHED the source, which after the final
+			// acknowledgement nothing more ever does.
 			st.ackRecords, st.ackAbandoned, st.ackAbandonedBy = 0, 0, nil
 			continue
 		}
@@ -665,9 +680,6 @@ func (l *Ledger) Committed(m map[record.LaneID]record.Position) {
 			// delivered while the lane's epoch is one the fence covers. Letting a fenced worker tell an
 			// upstream to advance is specified data loss.
 			st.ackRecords, st.ackAbandoned, st.ackAbandonedBy = 0, 0, nil
-			continue
-		}
-		if st.ordering != connector.OrderingPrefix {
 			continue
 		}
 		out = append(out, connector.Ack{
@@ -685,6 +697,7 @@ func (l *Ledger) Committed(m map[record.LaneID]record.Position) {
 			LaneFinished: st.laneFinished && st.pending == 0,
 		})
 		st.finishAcked = st.laneFinished && st.pending == 0
+		st.recordsCommitted += st.ackRecords
 		st.ackRecords, st.ackAbandoned, st.ackAbandonedBy = 0, 0, nil
 	}
 	l.mu.Unlock()

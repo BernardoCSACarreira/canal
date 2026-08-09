@@ -32,7 +32,7 @@ flowchart TB
     M5["M5 — control plane and frontend<br/>write API, intent, secrets, audit, UI"]
     M6["M6 — ecosystem<br/>connector conformance kit, real connectors, remote seam"]
 
-    B -->|"B1 WAL policy gates M1's store work"| M1
+    B -->|"B1 decided by ADR 0032 — M1's store work is unblocked"| M1
     B -->|"B2 decode attachment gates M2's decode chain"| M2
     B -->|"B3 intent, B4 impact, B8 secrets gate the write API"| M5
     M1 -->|"Aggregate and serve are what the API fronts"| M5
@@ -70,7 +70,7 @@ block.
 
 | # | Decision | The door it holds open | Source | Blocks |
 |---|---|---|---|---|
-| B1 | **WAL format policy**: self-describing frames (a version byte per frame, migration possible) versus an ADR stating strictness is the price of a redo log (`Open` refuses any version but its own, forever). Today's format has no forward-migration path, and a delete's raised epoch floor is not persisted — the fix needs a new frame shape, so the two decide together | whether `pkg/store/wal` can ever change shape without stranding every existing log | [wal.go](../pkg/store/wal/wal.go), the pinned limit in [runtime.go](../internal/engine/runtime.go) | M1 store work, the delete-floor fix |
+| B1 | **Decided** — [ADR 0032](decisions/0032-wal-format-versioning.md): the WAL container is versioned, a build reads one step back and migrates by rewrite at Open; format version 2 — a delete record carrying its epoch — is the first exercise | the door is held: a format bump no longer strands every existing log | [wal.go](../pkg/store/wal/wal.go), [runtime.go](../internal/engine/runtime.go) | unblocked: M1's store work, and the delete-floor fix is now ordinary work (the V2 change, held to rule 5's upgrade test and fuzz targets) |
 | B2 | **The decode attachment point**: `config.DecodeRef` + `Fields.Decode` + `SourceCaps.Structured`, and the rule that a byte source must not parse its own bytes | centralised decode before the first byte-source connector ships private `parse:` keys | audit G1 | M2's decode chain, M6's connectors |
 | B3 | **Where operator intent lives**: `spec.Intent{DesiredState, Downgrades, Resets}`, and the rule that an intent change bumps `Revision` but not `Generation`. Moves `Downgrade` out of `telemetry` — the refusal table's only escape hatch currently reads a field that cannot exist | pause/resume/drain as durable state the reconciler converges toward, instead of a command protocol | audit G2 | M5 entirely; `PhasePaused` is unreachable until this |
 | B4 | **`Node.ID` is immutable** + an `Impact` enum (`none/reload/restart/state_reset`) on the validate response and `config.Field` | a node rename today silently orphans every cursor — the loss precedes the discovery, which makes this the only *unrecoverable* item in the queue | audit G3 | M5's write API; worth deciding first for that reason |

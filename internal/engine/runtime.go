@@ -56,8 +56,9 @@ import (
 // STILL TO DO: a delete's epoch is not PERSISTED by pkg/store/wal, whose frame carries the key alone.
 // The refusal is real in-process and survives a restart for any key that was ever written, because the
 // floor comes from those writes. What does not survive is a delete that raised the floor above every
-// prior write for its key. Fixing it needs a new frame shape, and Open refuses any version but its
-// own — so this format has no forward-migration path and a bump would strand every existing log.
+// prior write for its key. Fixing it needs a new frame shape, and the path there is decided: ADR 0032
+// versions the WAL container with a one-step read window and migrate-on-open, and names this fix as
+// format version 2 — still to be built.
 
 // singleWorkerEpoch is the epoch a lane is held under when there is no coordinator, and the DEFAULT
 // fence on every batch — the value that applies to keys which are not a single lane's.

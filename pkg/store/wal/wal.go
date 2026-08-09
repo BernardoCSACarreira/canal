@@ -179,12 +179,11 @@ func (s *StateStore) replay() error {
 		// it cannot parse cannot skip it either, and every byte after it is garbage it would apply as a
 		// redo record. There is no "ignore and report" available at this layer.
 		//
-		// So refusing is defensible on its own merits and is not 0020's rule. UNDECIDED, and labelled
-		// rather than implied: no ADR states this policy, so nothing distinguishes a deliberate choice from
-		// an accident, and the cost is real — a format bump strands every existing log, with no migration
-		// path because refusing an OLDER version rules one out. The two ways forward are a self-describing
-		// frame that can skip what it does not know, or an ADR that says strictness is the price of a redo
-		// log and a bump is an operational migration.
+		// So refusing is defensible on its own merits and is not 0020's rule. The policy is DECIDED,
+		// by ADR 0032: the container is versioned through this header, a build reads its own version
+		// and one back, and an old log is migrated by rewrite at Open. Format version 2 — a delete
+		// record carrying its epoch — is the first exercise. None of that is built yet, so this build
+		// reads and writes the only version there is and this refusal is, for now, the whole window.
 		return fmt.Errorf("wal: %s is format version %d, this binary writes %d", path, v, formatVersion)
 	}
 

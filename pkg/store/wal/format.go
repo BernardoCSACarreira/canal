@@ -39,18 +39,27 @@ import (
 // replay is a straight apply with no compare-and-set re-evaluation and no dependence on replay
 // order matching the original concurrency.
 //
+// Version 2 (formatVersion, what this build writes):
+//
 //	u8      op: opBatch
 //	uvarint number of writes
 //	  KEY, bytes value, uvarint version, uvarint epochSeen
 //	uvarint number of deletes
-//	  KEY
+//	  KEY, uvarint epoch
+//
+// Version 1 (formatV1, which this build still reads — ADR 0032's one-step window) differed in one
+// place: a delete carried the KEY alone. The epoch on a version-2 delete is what makes a fence
+// floor outlive its key across a restart; zero means the delete claimed no floor, which is both
+// what StateStore.Delete's unconditional removals write and what every version-1 delete is read
+// as, because that is exactly what those logs meant when they were written.
 //
 // KEY
 //
 //	string tenant, string space, uvarint number of parts, string part...
 const (
 	magic         = "CANALWAL"
-	formatVersion = uint16(1)
+	formatV1      = uint16(1)
+	formatVersion = uint16(2)
 	headerLen     = len(magic) + 2
 	frameHeader   = 8 // 4 length + 4 crc
 
@@ -70,7 +79,7 @@ var errTornTail = errors.New("wal: torn tail")
 // entry is one atomic batch as it was applied.
 type entry struct {
 	writes  []appliedWrite
-	deletes []store.Key
+	deletes []appliedDelete
 }
 
 type appliedWrite struct {
@@ -78,6 +87,13 @@ type appliedWrite struct {
 	value     []byte
 	version   uint64
 	epochSeen uint64
+}
+
+// appliedDelete is one removal plus the fence floor it raised. Zero epoch claims no floor: an
+// unconditional StateStore.Delete, or any delete replayed from a version-1 log.
+type appliedDelete struct {
+	key   store.Key
+	epoch uint64
 }
 
 // --- encoding ---------------------------------------------------------------
@@ -113,8 +129,9 @@ func encode(e entry) []byte {
 		p = appendUvarint(p, w.epochSeen)
 	}
 	p = appendUvarint(p, uint64(len(e.deletes)))
-	for _, k := range e.deletes {
-		p = appendKey(p, k)
+	for _, d := range e.deletes {
+		p = appendKey(p, d.key)
+		p = appendUvarint(p, d.epoch)
 	}
 
 	frame := make([]byte, frameHeader, frameHeader+len(p))
@@ -207,8 +224,13 @@ func (c *cursor) key() store.Key {
 	return k
 }
 
-// decode parses one payload.
-func decode(p []byte) (entry, error) {
+// decode parses one payload written at file-format version v.
+//
+// The version is the FILE header's, threaded per frame because the payload is positional and
+// carries no discriminator of its own — inferring a layout from payload bytes is the sniffing
+// ADR 0032 rejects. The one difference between the two readable versions is the delete record:
+// version 1 carried the key alone, version 2 follows it with the fence epoch.
+func decode(p []byte, v uint16) (entry, error) {
 	c := &cursor{b: p}
 	var e entry
 
@@ -240,9 +262,13 @@ func decode(p []byte) (entry, error) {
 	if nd > uint64(len(p)) {
 		return e, fmt.Errorf("wal: payload claims %d deletes in %d bytes", nd, len(p))
 	}
-	e.deletes = make([]store.Key, 0, nd)
+	e.deletes = make([]appliedDelete, 0, nd)
 	for i := uint64(0); i < nd; i++ {
-		e.deletes = append(e.deletes, c.key())
+		d := appliedDelete{key: c.key()}
+		if v >= formatVersion {
+			d.epoch = c.uvarint()
+		}
+		e.deletes = append(e.deletes, d)
 	}
 	if c.err != nil {
 		return entry{}, c.err

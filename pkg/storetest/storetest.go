@@ -73,6 +73,7 @@ func Run(t *testing.T, s Subject) {
 	t.Run(s.Name+"/range_is_ordered_and_scoped", func(t *testing.T) { testRange(t, s) })
 	t.Run(s.Name+"/reads_are_copies", func(t *testing.T) { testReadsAreCopies(t, s) })
 	t.Run(s.Name+"/deletes_are_fenced", func(t *testing.T) { testFencedDelete(t, s) })
+	t.Run(s.Name+"/delete_floors_survive_reopen", func(t *testing.T) { testDeleteFloorSurvivesReopen(t, s) })
 	t.Run(s.Name+"/declared_capabilities_hold", func(t *testing.T) { testDeclaredCapabilities(t, s) })
 	t.Run(s.Name+"/survives_reopen", func(t *testing.T) { testReopen(t, s) })
 }
@@ -383,6 +384,58 @@ func testFencedDelete(t *testing.T, sub Subject) {
 	if err := s.Set(ctx, *resurrect); err == nil {
 		t.Error("a write at epoch 5 recreated a key deleted at 12; dropping the epoch with the row " +
 			"lets any superseded worker undo the removal")
+	}
+}
+
+// testDeleteFloorSurvivesReopen is testFencedDelete's last assertion carried across a restart: the
+// floor a delete raised must outlive the key DURABLY, not merely in the open store's memory.
+//
+// This is the one case a write-ahead store cannot pass by accident. A write's epoch rides the row,
+// so replaying rows rebuilds every floor a WRITE established — but a deleted key has no row, and a
+// log whose delete records carry no epoch replays the removal while forgetting the fence. The worker
+// that deleted at epoch 12 restarts, and a worker superseded at epoch 5 recreates the key it was
+// fenced away from. ADR 0032's format version 2 exists for exactly this record.
+func testDeleteFloorSurvivesReopen(t *testing.T, sub Subject) {
+	s := sub.New(t)
+	if !s.Capabilities().EpochFencing {
+		t.Skipf("%s does not declare EpochFencing", sub.Name)
+	}
+	if sub.Reopen == nil {
+		t.Skipf("%s has no reopen: see Subject.Reopen for why that is a legitimate answer", sub.Name)
+	}
+	ctx := context.Background()
+	k := laneKey("removed")
+
+	seed := store.NewBatch(1)
+	seed.PutFenced(k, []byte("the holder's"), 0, 5)
+	if err := s.Set(ctx, *seed); err != nil {
+		t.Fatalf("seeding at epoch 5: %v", err)
+	}
+	del := store.NewBatch(1)
+	del.DelFenced(k, 12)
+	if err := s.Set(ctx, *del); err != nil {
+		t.Fatalf("deleting at epoch 12: %v", err)
+	}
+
+	s = sub.Reopen(t, s)
+
+	stale := store.NewBatch(100)
+	stale.PutFenced(k, []byte("stale worker's"), 0, 6)
+	if err := s.Set(ctx, *stale); err == nil {
+		t.Error("after a reopen, a write at epoch 6 recreated a key deleted at 12.\n" +
+			"  The floor the delete raised did not survive the restart, so the fence holds only " +
+			"until the first crash — which is when a superseded worker is most likely to still be " +
+			"writing")
+	} else if !errors.Is(err, fault.ErrFenced) && fault.ClassOf(err) != fault.Fenced {
+		t.Errorf("the refusal was %v, which does not classify as fenced", err)
+	}
+
+	// The successor's own epoch clears the floor, or the durable fence is a permanent tombstone
+	// nobody can ever write past.
+	next := store.NewBatch(1)
+	next.PutFenced(k, []byte("the successor's"), 0, 13)
+	if err := s.Set(ctx, *next); err != nil {
+		t.Fatalf("the epoch-13 holder could not write past a floor of 12: %v", err)
 	}
 }
 

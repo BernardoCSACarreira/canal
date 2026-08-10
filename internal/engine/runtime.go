@@ -53,12 +53,11 @@ import (
 //     an advisory refusal here was the only thing in the way — for the one mutation whose failure mode
 //     is destroying state the new holder is reading rather than merely writing a stale row.
 //
-// STILL TO DO: a delete's epoch is not PERSISTED by pkg/store/wal, whose frame carries the key alone.
-// The refusal is real in-process and survives a restart for any key that was ever written, because the
-// floor comes from those writes. What does not survive is a delete that raised the floor above every
-// prior write for its key. Fixing it needs a new frame shape, and the path there is decided: ADR 0032
-// versions the WAL container with a one-step read window and migrate-on-open, and names this fix as
-// format version 2 — still to be built.
+// The last residual here is CLOSED: a delete's epoch is persisted since pkg/store/wal's format
+// version 2 (ADR 0032's first exercise), so the fenced-delete refusal survives a restart even when
+// the delete raised the floor above every prior write for its key — and survives compaction, which
+// re-emits row-less floors as fenced delete records. The kit's delete_floors_survive_reopen case is
+// what holds every store to it.
 
 // singleWorkerEpoch is the epoch a lane is held under when there is no coordinator, and the DEFAULT
 // fence on every batch — the value that applies to keys which are not a single lane's.

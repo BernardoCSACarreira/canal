@@ -1,6 +1,8 @@
 # canal
 
-A source- and sink-agnostic connector and data-movement tool in Go. No third-party dependencies; Go 1.23.6.
+A source- and sink-agnostic connector and data-movement tool in Go. The core module has zero
+third-party dependencies, enforced in CI; coordinated mode is a separate module
+([`store/postgres`](store/postgres)) that adds exactly one, the Postgres driver (ADR 0033). Go 1.23.6.
 
 The core is deliberately agnostic: no specific system's shape is allowed to leak into it. Adding a source
 or a sink means implementing an interface and registering it — no core changes, no per-connector branches
@@ -30,7 +32,7 @@ go run ./cmd/canal check --spec your-pipeline.json
 | Fault routing | **real.** A connector states a `Class`, a fact; the engine computes the behaviour from (class, capabilities, policy). Throttling never spends a retry attempt, an indeterminate write against a non-idempotent sink fails loud rather than guessing, and a dead letter is delivered before the record is abandoned. |
 | Metrics | **real for twenty-one of twenty-seven names.** [`internal/metrics`](internal/metrics) accumulates and renders Prometheus text; `canal run --metrics :9090` serves it. An unmeasurable quantity is OMITTED rather than reported as zero, which is what makes `canal_checkpoint_age_seconds` usable as the primary alert. The six absent ones measure things that do not exist yet — buffer depth and refusals, dedupe, restore phases, node utilization and blocking. |
 | Read model | **real.** [`engine.Pipeline.Status`](internal/engine/status.go) builds `telemetry.PipelineStatus` and `canal run --metrics` serves it at `GET /status?stream=&limit=&cursor=`, plus `?config=1` for the redacted config tree — never the raw one. Lanes page by keyset cursor, a per-stream rollup answers "which of my 900 tables is behind" without downloading 29,000 lanes, and every field the engine cannot measure is a nil pointer rather than a confident zero. |
-| Multi-worker | **machinery built, deployment not.** Lanes are claimed under leases, a lost lane is dropped from the read set and fenced in the ledger, and every durable write carries its lane's lease epoch down to the store. All of it runs in tests against [`memstore`](internal/example/memstore)'s in-memory `Coordinator`; no durable coordinator exists, so the binary ships standalone. `StatusStore.Aggregate` — the cross-worker merge — refuses with a named fault rather than answering plausibly. |
+| Multi-worker | **machinery built, deployment beginning.** Lanes are claimed under leases, a lost lane is dropped from the read set and fenced in the ledger, and every durable write carries its lane's lease epoch down to the store. All of it runs in tests against [`memstore`](internal/example/memstore)'s in-memory `Coordinator`. The cluster-durable `StateStore` now exists — [`store/postgres`](store/postgres), a nested module (ADR 0033) holding the one accepted dependency, held to `pkg/storetest` against a real database — but its `Coordinator` half does not, so the binary still ships standalone. `StatusStore.Aggregate` — the cross-worker merge — refuses with a named fault rather than answering plausibly. |
 | Buffers, transforms, a frontend | **do not exist.** The interfaces do, and the negotiation refuses a pipeline that asks for one. |
 
 `go build ./...`, `go vet ./...`, `gofmt -l .` and `go test -race ./...` are clean: 388 test
@@ -38,8 +40,8 @@ functions across 28 packages, 113 of them under `pkg/`. **Every published packag
 `pkg/storetest` is itself a test suite, and both stores run it.
 Writing them found two defects nothing else would have: a retry helper that panics on amd64, and a
 key encoding under which two pipelines in one tenant could overwrite each other's state. [CI](.github/workflows/ci.yml) runs all of that on Linux
-and macOS, cross-compiles for five targets, and verifies the module still has zero third-party
-dependencies.
+and macOS, cross-compiles for five targets, verifies the core module still has zero third-party
+dependencies, and runs the Postgres store's suite against a real database in a service container.
 
 Design rule [R3](docs/design-rules.md) — one end-to-end path before any breadth — is **closed**.
 [`cmd/canal/main_test.go`](cmd/canal/main_test.go) starts the real binary against a 300,000-line
@@ -276,7 +278,7 @@ internal/               engine machinery and connectors; unreachable from outsid
 
 docs/
   design-rules.md       R1–R13, normative, each derived from an observed defect
-  architecture.md       9,762 lines, 30 sections, 57 diagrams, declared normative
+  architecture.md       9,765 lines, 30 sections, 57 diagrams, declared normative
   decisions/            0001–0031, the ADRs
   decisions/proposals/  four whole-architecture proposals that were judged against each other
   decisions/reviews/    twelve reviews of those proposals — correctness, extensibility, Go ergonomics
@@ -408,7 +410,7 @@ retry (1), so a supervisor never crash-loops on a spec that will never build.
 1. **[docs/design-rules.md](docs/design-rules.md)** — R1–R13. Short, normative, and every rule was paid
    for by an observed defect in an earlier abandoned attempt at this same project. Everything else assumes
    it.
-2. **[docs/architecture.md](docs/architecture.md)** — 9,762 lines, 30 sections, declared normative. §1 is
+2. **[docs/architecture.md](docs/architecture.md)** — 9,765 lines, 30 sections, declared normative. §1 is
    the spine in one page; §4 the record model; §6 lanes; §7–§8 `Source` and `Sink`; §12 the ledger and the
    commit protocol. Its diagram index is at the top; dotted edges and "NOT BUILT" boxes mark the parts
    that describe an engine which does not run yet.

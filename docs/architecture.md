@@ -412,10 +412,13 @@ wiring, never policy. It imports `internal/engine`, `internal/metrics`, the exam
 `pkg/{codec,config,record,registry,spec,store,store/wal,telemetry,fault}`; `pkg/record` is there
 because parsing wire input into domain types is a composition-root job — `/status?stream=orders`
 becomes a `record.StreamName` inside a `telemetry.StatusQuery`. There is no `api/`, no `ui/`, and
-no `buffers/`, `transforms/` or `connectors/` directory: the two stage libraries are unwritten, the
-HTTP surface is `cmd/canal`'s read-only `/metrics` and `/status`, and `store/` has no bbolt or
-Postgres implementation for the coordinated shape. Everything above compiles, `go vet` is clean,
-and twenty-eight test packages pass including a `kill -9` test that runs the real binary.
+no `buffers/`, `transforms/` or `connectors/` directory: the two stage libraries are unwritten and
+the HTTP surface is `cmd/canal`'s read-only `/metrics` and `/status`. The coordinated shape's store
+has begun: `store/postgres` — a NESTED MODULE carrying the one accepted dependency, per ADR 0033 —
+implements `store.StateStore` over one transaction per `Set`, with a schema versioned from its
+first migration, held to `pkg/storetest` like every other store; its `Coordinator`, `ConfigStore`
+and `StatusStore` halves are not built. Everything above compiles, `go vet` is clean, and
+twenty-eight root test packages pass including a `kill -9` test that runs the real binary.
 
 ### The one statement that matters
 
@@ -7074,9 +7077,9 @@ flowchart TB
     L4["in-process status (not built)"]
   end
 
-  subgraph cluster["canal serve, N workers: NO implementation in the repo"]
+  subgraph cluster["canal serve, N workers: the StateStore half exists (store/postgres, ADR 0033)"]
     C1["Postgres spec rows, LISTEN/NOTIFY watch (not built)"]
-    C2["Postgres rows, version column plus epoch column (not built)"]
+    C2["Postgres rows, version column plus epoch column —<br/>BUILT: store/postgres canal_state, tombstoned floors"]
     C3["pg_try_advisory_lock, leases table, SKIP LOCKED (not built)"]
     C4["worker_status rows with a TTL (not built)"]
   end

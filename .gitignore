@@ -31,3 +31,5 @@ node_modules/
 .DS_Store
 .idea/
 *.swp
+go.work
+go.work.sum

@@ -139,3 +139,54 @@ jobs:
             diff -u go.mod.bak go.mod || true
             exit 1
           fi
+
+  postgres-store:
+    # The coordinated store lives in its own module (ADR 0033) with the one accepted dependency,
+    # so it gets its own job against a real database: the conformance suite is only evidence when
+    # it runs against the thing it claims to hold to.
+    name: postgres store
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: canal
+          POSTGRES_PASSWORD: canal
+          POSTGRES_DB: canal
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U canal"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    defaults:
+      run:
+        working-directory: store/postgres
+    env:
+      CANAL_POSTGRES_TEST_URL: postgres://canal:canal@localhost:5432/canal
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: store/postgres/go.mod
+          check-latest: true
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "::error::gofmt would change:"
+            echo "$out"
+            exit 1
+          fi
+
+      - name: build and vet
+        run: |
+          go build ./...
+          go vet ./...
+
+      - name: tests, then again under the race detector
+        run: |
+          go test ./...
+          go test -race ./...

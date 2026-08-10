@@ -1,7 +1,7 @@
 # 0033 — The coordinated store is a nested module; the core's zero dependencies stay mechanical
 
-**Status:** proposed. Merging this document to `main` is its acceptance, after which it is
-normative. Drafted with the alternatives argued so the acceptance is a review, not a blank page.
+**Status:** accepted, normative. Accepted 2026-08-10; drafted with the alternatives argued so the
+acceptance was a review rather than a blank page.
 
 ## Context
 

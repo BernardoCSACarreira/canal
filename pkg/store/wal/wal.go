@@ -82,6 +82,17 @@ type StateStore struct {
 	data   map[string]store.Versioned
 	epochs map[string]uint64
 
+	// floorKeys carries the structured key for every floor whose row is GONE, because compaction
+	// has to re-emit those floors as fenced delete records and Key.String — the index's map key —
+	// is documented as not being a storage encoding, so it cannot be parsed back. A live row makes
+	// its entry redundant: the row itself carries the floor through compaction, as epochSeen.
+	floorKeys map[string]store.Key
+
+	// readVersion is the format version the log's header carried at replay. Open rewrites anything
+	// older than formatVersion before the first append, so after Open returns it always equals
+	// formatVersion; during replay it is what decode reads frames as.
+	readVersion uint16
+
 	// bytes is the log's size, and live is a running estimate of the bytes belonging to entries not
 	// yet superseded. Their ratio drives compaction.
 	bytes int64
@@ -95,6 +106,10 @@ type StateStore struct {
 // A torn or corrupt tail is TRUNCATED, not an error: the frames before it were fsynced and are real,
 // and the partial one is a write that never completed. Truncating is what makes the next append land
 // on a frame boundary instead of after garbage.
+//
+// A log ONE FORMAT VERSION BACK is readable and is rewritten to the current format before the first
+// append (ADR 0032: a one-step window, migrate by rewrite at Open). Anything outside the window is
+// refused with the way forward named.
 func Open(dir string) (*StateStore, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("wal: creating %s: %w", dir, err)
@@ -106,10 +121,11 @@ func Open(dir string) (*StateStore, error) {
 	}
 
 	s := &StateStore{
-		dir:    dir,
-		lock:   lock,
-		data:   map[string]store.Versioned{},
-		epochs: map[string]uint64{},
+		dir:       dir,
+		lock:      lock,
+		data:      map[string]store.Versioned{},
+		epochs:    map[string]uint64{},
+		floorKeys: map[string]store.Key{},
 	}
 
 	// A compaction that was interrupted leaves a temporary file. It is always discardable: the
@@ -127,6 +143,21 @@ func Open(dir string) (*StateStore, error) {
 		return nil, fmt.Errorf("wal: opening the log for append: %w", err)
 	}
 	s.f = f
+
+	// A LOG ONE VERSION BACK IS REWRITTEN BEFORE THE FIRST APPEND — ADR 0032 rule 3. One version
+	// per file, so a version-1 log must never accumulate version-2 frames; the rewrite is the
+	// compaction pass that already exists, run eagerly, and it is cheap because the whole log was
+	// just replayed into memory anyway. A crash during it leaves the intact old log (the rename is
+	// the commit point), and the next Open simply migrates again.
+	if s.readVersion != formatVersion {
+		if err := s.compactLocked(); err != nil {
+			_ = s.f.Close()
+			_ = lock.Close()
+			return nil, fmt.Errorf("wal: rewriting %s from format %d to %d: %w",
+				dir, s.readVersion, formatVersion, err)
+		}
+		s.readVersion = formatVersion
+	}
 	return s, nil
 }
 
@@ -152,6 +183,7 @@ func (s *StateStore) replay() error {
 			return fmt.Errorf("wal: syncing the header: %w", err)
 		}
 		s.bytes = int64(headerLen)
+		s.readVersion = formatVersion
 		return syncDir(s.dir)
 	}
 
@@ -162,29 +194,32 @@ func (s *StateStore) replay() error {
 	if string(hdr[:len(magic)]) != magic {
 		return fmt.Errorf("wal: %s does not begin with the canal magic; refusing to touch it", path)
 	}
-	if v := uint16(hdr[len(magic)])<<8 | uint16(hdr[len(magic)+1]); v != formatVersion {
-		// THIS LOG REFUSES ANY VERSION BUT ITS OWN, in both directions, and ADR 0020 is NOT the authority
-		// for that however often this comment used to say so.
-		//
-		// 0020 governs two artifacts and names them: canal's Checkpoint envelope and every
-		// connector-authored record.Blob inside it. Not this log. And for the artifacts it does govern it
-		// decides the OPPOSITE of the line below — rule 3 is "NEVER reject state whose version is greater
-		// than the current one", and "rejecting a newer version" is listed under Alternatives rejected,
-		// because it makes every rollback a data migration.
-		//
-		// WHY THE MECHANISM DOES NOT TRANSFER, which is the real reason and was never written down. 0020's
-		// additive-only rule works because its envelope is JSON: a reader ignores a key it does not know,
-		// which is what makes an unknown field cost one cursor's progress instead of the file. A frame here
-		// is POSITIONAL — op, count, then key/value/version/epoch in order — so a reader that meets a field
-		// it cannot parse cannot skip it either, and every byte after it is garbage it would apply as a
-		// redo record. There is no "ignore and report" available at this layer.
-		//
-		// So refusing is defensible on its own merits and is not 0020's rule. The policy is DECIDED,
-		// by ADR 0032: the container is versioned through this header, a build reads its own version
-		// and one back, and an old log is migrated by rewrite at Open. Format version 2 — a delete
-		// record carrying its epoch — is the first exercise. None of that is built yet, so this build
-		// reads and writes the only version there is and this refusal is, for now, the whole window.
-		return fmt.Errorf("wal: %s is format version %d, this binary writes %d", path, v, formatVersion)
+	// THE WINDOW IS ONE STEP WIDE — ADR 0032. This build reads its own format and the one before,
+	// writes only its own, and migrates an old log by rewrite at Open; anything outside the window
+	// is refused loudly, naming the way forward.
+	//
+	// Refusing at all is deliberate and is NOT ADR 0020's rule: 0020 governs the payloads carried
+	// INSIDE this store's values, and its ignore-unknown-keys mechanism works because its envelope
+	// is JSON. A frame here is POSITIONAL — op, count, then key/value/version/epoch in order — so a
+	// reader that meets a field it cannot parse cannot skip it either, and every byte after it is
+	// garbage it would apply as a redo record. The header states the version precisely so nothing is
+	// ever inferred from payload bytes.
+	switch v := uint16(hdr[len(magic)])<<8 | uint16(hdr[len(magic)+1]); {
+	case v == formatVersion:
+		s.readVersion = v
+	case v == formatV1:
+		// Readable, and rewritten to the current format before this store appends anything: one
+		// version per file (ADR 0032 rule 1), so Open compacts eagerly rather than mixing frames.
+		s.readVersion = v
+	case v > formatVersion:
+		return fmt.Errorf("wal: %s is format version %d, written by a newer build; this binary reads "+
+			"versions %d and %d and cannot parse frames from the future — run the newer build, or "+
+			"accept that rolling back past a format bump means restoring this directory from before "+
+			"the upgrade", path, v, formatV1, formatVersion)
+	default:
+		return fmt.Errorf("wal: %s is format version %d; this binary reads versions %d and %d — open "+
+			"the log once with each intermediate build, which rewrites it one step at a time",
+			path, v, formatV1, formatVersion)
 	}
 
 	offset := int64(headerLen)
@@ -207,7 +242,7 @@ func (s *StateStore) replay() error {
 			return err
 		}
 
-		e, derr := decode(p)
+		e, derr := decode(p, s.readVersion)
 		if derr != nil {
 			// A frame whose CRC matched but whose contents do not parse is not a torn write — it is
 			// a real inconsistency, and silently dropping it would lose committed state.
@@ -236,13 +271,29 @@ func (s *StateStore) replay() error {
 // put a row in the index.
 func (s *StateStore) apply(e entry) {
 	for _, w := range e.writes {
-		s.data[w.key.String()] = clone(store.Versioned{Key: w.key, Value: w.value, Version: w.version})
-		if w.epochSeen > s.epochs[w.key.String()] {
-			s.epochs[w.key.String()] = w.epochSeen
+		name := w.key.String()
+		s.data[name] = clone(store.Versioned{Key: w.key, Value: w.value, Version: w.version})
+		if w.epochSeen > s.epochs[name] {
+			s.epochs[name] = w.epochSeen
 		}
+		// The row exists again and carries the floor itself (compaction re-emits it as epochSeen),
+		// so the orphan record is no longer needed.
+		delete(s.floorKeys, name)
 	}
-	for _, k := range e.deletes {
-		delete(s.data, k.String())
+	for _, d := range e.deletes {
+		name := d.key.String()
+		delete(s.data, name)
+		// THE FLOOR OUTLIVES THE KEY, on replay exactly as on the live path: apply owns both since
+		// the frame started carrying the epoch (format version 2). A version-1 delete decodes with
+		// epoch zero and raises nothing, which is all those logs ever promised.
+		if d.epoch > s.epochs[name] {
+			s.epochs[name] = d.epoch
+		}
+		if s.epochs[name] > 0 {
+			// The key just became row-less while fenced — whether this delete raised the floor or
+			// earlier writes did — so remember its structured form for compaction to re-emit.
+			s.floorKeys[name] = d.key
+		}
 	}
 }
 
@@ -344,19 +395,14 @@ func (s *StateStore) Set(_ context.Context, w store.Batch) error {
 	}
 	sort.Strings(names)
 
-	// THE FRAME CARRIES THE KEY AND NOT THE EPOCH, and that is a labelled residual rather than an
-	// oversight. Persisting a delete's epoch means a new frame shape, and Open refuses any version but
-	// its own — for a NEWER file with ADR 0020's reasoning, and for an older one with no reasoning at
-	// all, which together mean this format has no forward-migration path. Bumping it would strand every
-	// existing log.
-	//
-	// What survives is the floor established by the WRITES to that key, which is what makes a stale
-	// write refused after a restart. What does not survive is a delete that RAISED the floor above every
-	// prior write for its key — a delete at a reclaimed epoch with no write in between — after which a
-	// worker holding an epoch between the two could recreate the row. See the note in storetest.
-	dels := make([]store.Key, 0, len(w.Deletes))
+	// THE FRAME CARRIES THE DELETE'S EPOCH — format version 2, ADR 0032's first exercise. It is the
+	// RESOLVED epoch (per-deletion, falling back to the batch's), so replay rebuilds exactly the
+	// floor this process enforced: a delete that raised the floor above every prior write for its
+	// key survives a restart, which is the one case the write-established floors could not cover.
+	// The kit's delete_floors_survive_reopen case is the proof.
+	dels := make([]appliedDelete, 0, len(w.Deletes))
 	for _, d := range w.Deletes {
-		dels = append(dels, d.Key)
+		dels = append(dels, appliedDelete{key: d.Key, epoch: w.EpochForDelete(d)})
 	}
 	e := entry{writes: make([]appliedWrite, 0, len(names)), deletes: dels}
 	for _, name := range names {
@@ -379,13 +425,6 @@ func (s *StateStore) Set(_ context.Context, w store.Batch) error {
 	}
 
 	s.apply(e)
-	// Raised HERE rather than in apply, because apply also runs on replay where the frame has no epoch
-	// to offer. In this process the floor outlives the key, so a stale write cannot resurrect it.
-	for _, d := range w.Deletes {
-		if name, e := d.Key.String(), w.EpochForDelete(d); e > s.epochs[name] {
-			s.epochs[name] = e
-		}
-	}
 	s.bytes += n
 	s.live = s.liveBytes()
 	return s.maybeCompact()
@@ -402,7 +441,13 @@ func (s *StateStore) Delete(_ context.Context, keys []store.Key) error {
 		return errClosed
 	}
 
-	e := entry{deletes: keys}
+	// Unconditional removals claim no floor: epoch zero raises nothing, matching the method's
+	// contract and what a version-1 log's deletes are read as.
+	dels := make([]appliedDelete, 0, len(keys))
+	for _, k := range keys {
+		dels = append(dels, appliedDelete{key: k})
+	}
+	e := entry{deletes: dels}
 	n, err := s.append(encode(e))
 	if err != nil {
 		return err
@@ -555,6 +600,23 @@ func (s *StateStore) compactLocked() error {
 		}}})
 		if _, err := f.Write(frame); err != nil {
 			return fail(fmt.Errorf("wal: writing a compacted frame: %w", err))
+		}
+		written += int64(len(frame))
+	}
+
+	// FLOORS WHOSE ROW IS GONE are re-emitted as fenced delete records, or compaction would
+	// silently lower them: a live key's floor rides its row's epochSeen above, but a deleted key
+	// has no row to ride, and dropping the record re-opens the exact hole format version 2 closed —
+	// after the next Open, a superseded worker could recreate what a current holder removed.
+	orphans := make([]string, 0, len(s.floorKeys))
+	for name := range s.floorKeys {
+		orphans = append(orphans, name)
+	}
+	sort.Strings(orphans)
+	for _, name := range orphans {
+		frame := encode(entry{deletes: []appliedDelete{{key: s.floorKeys[name], epoch: s.epochs[name]}}})
+		if _, err := f.Write(frame); err != nil {
+			return fail(fmt.Errorf("wal: writing a compacted floor record: %w", err))
 		}
 		written += int64(len(frame))
 	}

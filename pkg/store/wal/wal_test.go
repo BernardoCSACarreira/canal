@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -571,4 +573,197 @@ func TestConformance(t *testing.T) {
 			return open(t, dir)
 		},
 	})
+}
+
+// --- format version 2: the ADR 0032 window -----------------------------------------------------
+
+// writeV1Log crafts a version-1 log byte for byte — header, then one frame per entry — because the
+// version-1 WRITER no longer exists in this package. This fixture is it, which is what ADR 0032's
+// rule 5 means by "the N−1 writer fixture": the bytes are pinned here, so a drift in the current
+// encoder cannot silently rewrite history to match itself.
+func writeV1Log(t *testing.T, dir string, entries []entry) {
+	t.Helper()
+	var b []byte
+	b = append(b, magic...)
+	b = append(b, 0x00, 0x01) // formatV1, big-endian
+
+	for _, e := range entries {
+		p := []byte{opBatch}
+		p = appendUvarint(p, uint64(len(e.writes)))
+		for _, w := range e.writes {
+			p = appendKey(p, w.key)
+			p = appendBytes(p, w.value)
+			p = appendUvarint(p, w.version)
+			p = appendUvarint(p, w.epochSeen)
+		}
+		p = appendUvarint(p, uint64(len(e.deletes)))
+		for _, d := range e.deletes {
+			p = appendKey(p, d.key) // VERSION 1: the key alone, no epoch
+		}
+		frame := make([]byte, frameHeader, frameHeader+len(p))
+		frame[0] = byte(len(p) >> 24)
+		frame[1] = byte(len(p) >> 16)
+		frame[2] = byte(len(p) >> 8)
+		frame[3] = byte(len(p))
+		crc := crc32.Checksum(p, castagnoli)
+		frame[4], frame[5], frame[6], frame[7] = byte(crc>>24), byte(crc>>16), byte(crc>>8), byte(crc)
+		b = append(append(b, frame...), p...)
+	}
+	if err := os.WriteFile(filepath.Join(dir, logName), b, 0o644); err != nil {
+		t.Fatalf("writing the v1 fixture: %v", err)
+	}
+}
+
+func headerVersion(t *testing.T, dir string) uint16 {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(dir, logName))
+	if err != nil {
+		t.Fatalf("reading the log back: %v", err)
+	}
+	if len(b) < headerLen || string(b[:len(magic)]) != magic {
+		t.Fatalf("the log has no canal header")
+	}
+	return uint16(b[len(magic)])<<8 | uint16(b[len(magic)+1])
+}
+
+// TestAVersionOneLogUpgrades is ADR 0032 rule 5's mandatory upgrade test: write with the previous
+// format's writer, open with this build, and assert the semantics survived — including the one
+// semantic that must NOT be invented, a floor for a version-1 delete that never recorded any.
+func TestAVersionOneLogUpgrades(t *testing.T) {
+	dir := t.TempDir()
+	kept := store.Key{Tenant: "acme", Space: store.SpaceLane, Parts: []string{"p1", "kept"}}
+	gone := store.Key{Tenant: "acme", Space: store.SpaceLane, Parts: []string{"p1", "gone"}}
+
+	writeV1Log(t, dir, []entry{
+		{writes: []appliedWrite{
+			{key: kept, value: []byte("survives"), version: 1, epochSeen: 5},
+			{key: gone, value: []byte("doomed"), version: 1, epochSeen: 9},
+		}},
+		{deletes: []appliedDelete{{key: gone}}}, // a v1 delete: key alone, no epoch on disk
+	})
+
+	s := open(t, dir)
+
+	// The data replayed under v1 semantics.
+	got, err := s.Get(context.Background(), []store.Key{kept, gone})
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if v, ok := got[kept.String()]; !ok || string(v.Value) != "survives" || v.Version != 1 {
+		t.Fatalf("the kept key read back as %+v", v)
+	}
+	if _, ok := got[gone.String()]; ok {
+		t.Fatal("a deleted key survived the upgrade")
+	}
+
+	// The kept key's WRITE floor survived: a stale write below epoch 5 is refused.
+	stale := store.NewBatch(1)
+	stale.PutFenced(kept, []byte("stale"), 1, 4)
+	if err := s.Set(context.Background(), *stale); err == nil {
+		t.Error("a write below the v1 log's recorded write epoch landed; write floors must survive " +
+			"the upgrade unchanged")
+	}
+
+	// The v1 delete raised NO floor beyond what the key's WRITES had already established — that is
+	// what a v1 log meant, and inventing more would fence out writers the old build would have
+	// accepted. The write floor is 9, so a recreate at exactly 9 passes iff the delete added
+	// nothing on top.
+	recreate := store.NewBatch(1)
+	recreate.PutFenced(gone, []byte("recreated"), 0, 9)
+	if err := s.Set(context.Background(), *recreate); err != nil {
+		t.Errorf("recreating a v1-deleted key at its own write epoch was refused: %v.\n"+
+			"  A version-1 delete recorded no epoch, so reading one in is inventing a fence the log "+
+			"never carried", err)
+	}
+
+	// The file itself is version 2 now: Open rewrote it before the first append, so a v1 log never
+	// accumulates v2 frames.
+	if v := headerVersion(t, dir); v != formatVersion {
+		t.Fatalf("after Open the log's header is version %d, want %d: the migrate-at-Open rewrite "+
+			"did not happen and this file now mixes formats", v, formatVersion)
+	}
+
+	// And everything above survives the NEXT restart, now through the v2 reader.
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	s = open(t, dir)
+	defer s.Close()
+	got, err = s.Get(context.Background(), []store.Key{kept, gone})
+	if err != nil {
+		t.Fatalf("Get after reopen: %v", err)
+	}
+	if v, ok := got[kept.String()]; !ok || string(v.Value) != "survives" {
+		t.Fatalf("the kept key did not survive the post-migration reopen: %+v", v)
+	}
+	if v, ok := got[gone.String()]; !ok || string(v.Value) != "recreated" {
+		t.Fatalf("the recreated key did not survive the post-migration reopen: %+v", v)
+	}
+}
+
+// TestVersionsOutsideTheWindowAreRefusedByName pins ADR 0032 rule 4: both refusals name the
+// version found and the versions this binary reads, because the error message is the operator's
+// only map at exactly the moment they have no other.
+func TestVersionsOutsideTheWindowAreRefusedByName(t *testing.T) {
+	for _, tc := range []struct {
+		version uint16
+		want    []string
+	}{
+		{0, []string{"format version 0", "reads versions 1 and 2", "intermediate build"}},
+		{3, []string{"format version 3", "newer build", "reads versions 1 and 2"}},
+	} {
+		dir := t.TempDir()
+		hdr := append([]byte(magic), byte(tc.version>>8), byte(tc.version))
+		if err := os.WriteFile(filepath.Join(dir, logName), hdr, 0o644); err != nil {
+			t.Fatalf("writing the fixture: %v", err)
+		}
+		_, err := Open(dir)
+		if err == nil {
+			t.Fatalf("a version-%d log opened; the window is 1..2", tc.version)
+		}
+		for _, want := range tc.want {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("version %d: the refusal %q does not say %q", tc.version, err, want)
+			}
+		}
+	}
+}
+
+// TestCompactionPreservesOrphanedFloors: a live key's floor rides its row through compaction as
+// epochSeen; a DELETED key has no row, so its floor must be re-emitted as a fenced delete record or
+// the rewrite silently lowers it — re-opening the exact hole format version 2 closed, one
+// compaction later.
+func TestCompactionPreservesOrphanedFloors(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	k := store.Key{Tenant: "acme", Space: store.SpaceLane, Parts: []string{"p1", "removed"}}
+
+	seed := store.NewBatch(1)
+	seed.PutFenced(k, []byte("v"), 0, 5)
+	if err := s.Set(context.Background(), *seed); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	del := store.NewBatch(1)
+	del.DelFenced(k, 12)
+	if err := s.Set(context.Background(), *del); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	if err := s.compactLocked(); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	s = open(t, dir)
+	defer s.Close()
+	stale := store.NewBatch(100)
+	stale.PutFenced(k, []byte("stale"), 0, 6)
+	if err := s.Set(context.Background(), *stale); err == nil {
+		t.Error("after a compaction and a reopen, a write at epoch 6 recreated a key deleted at 12; " +
+			"compaction dropped the orphaned floor")
+	} else if !errors.Is(err, fault.ErrFenced) && fault.ClassOf(err) != fault.Fenced {
+		t.Errorf("the refusal was %v, which does not classify as fenced", err)
+	}
 }

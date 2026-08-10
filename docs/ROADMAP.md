@@ -108,7 +108,7 @@ by the engine's revocation tests; `pkg/storetest` to hold a new store to the con
 
 | Item | Notes |
 |---|---|
-| A durable `store.Coordinator` | Postgres per the sketch in architecture §23 (`pg_try_advisory_lock` planner, `SKIP LOCKED` claims); needs the store-schema versioning and migration story the audit's G11 flags, and B11's pool column from day one |
+| A durable `store.Coordinator` | Postgres per the sketch in architecture §23 (`pg_try_advisory_lock` planner, `SKIP LOCKED` claims). Its home is decided by [ADR 0033](decisions/0033-coordinated-store-is-a-nested-module.md): a nested `store/postgres` module carrying the one accepted dependency, so the core's zero-dependency guard keeps meaning what it says. Needs the schema versioned from its first migration (0032's shape, audit G11) and B11's pool column from day one |
 | A durable `ConfigStore` + `StatusStore` | same backing store; the file-projected `ConfigStore` in `cmd/canal` stays as the standalone shape |
 | `StatusStore.Aggregate` | the cross-worker merge — per-field semantics (max for ages, sum for counts, `Complete`/`Missing` with `StaleAfterSeconds` as the threshold), gated on B5's additive-only declaration; the O(workers × lanes) cost needs the per-group rollup |
 | `canal serve` | the long-running worker: joins membership, campaigns, claims, hosts **N pipelines** (the supervisor/reconciler §23.4 specifies and nothing implements), consumes the config watch it already has |

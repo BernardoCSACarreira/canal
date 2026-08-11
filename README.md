@@ -35,9 +35,10 @@ go run ./cmd/canal check --spec your-pipeline.json
 | Multi-worker | **machinery built, deployment beginning.** Lanes are claimed under leases, a lost lane is dropped from the read set and fenced in the ledger, and every durable write carries its lane's lease epoch down to the store. All of it runs in tests against [`memstore`](internal/example/memstore)'s in-memory `Coordinator`. The cluster-durable `StateStore` now exists — [`store/postgres`](store/postgres), a nested module (ADR 0033) holding the one accepted dependency, held to `pkg/storetest` against a real database — but its `Coordinator` half does not, so the binary still ships standalone. `StatusStore.Aggregate` — the cross-worker merge — refuses with a named fault rather than answering plausibly. |
 | Buffers, transforms, a frontend | **do not exist.** The interfaces do, and the negotiation refuses a pipeline that asks for one. |
 
-`go build ./...`, `go vet ./...`, `gofmt -l .` and `go test -race ./...` are clean: 388 test
-functions across 28 packages, 113 of them under `pkg/`. **Every published package has tests** —
-`pkg/storetest` is itself a test suite, and both stores run it.
+`go build ./...`, `go vet ./...`, `gofmt -l .` and `go test -race ./...` are clean: 380 test
+functions across 28 packages, 116 of them under `pkg/`. **Every published package has tests** —
+`pkg/storetest` and `pkg/coordtest` are themselves test suites, run by the implementations they
+hold to account.
 Writing them found two defects nothing else would have: a retry helper that panics on amd64, and a
 key encoding under which two pipelines in one tenant could overwrite each other's state. [CI](.github/workflows/ci.yml) runs all of that on Linux
 and macOS, cross-compiles for five targets, verifies the core module still has zero third-party
@@ -185,6 +186,7 @@ flowchart TB
     subgraph PKG["pkg/ - the connector-author surface"]
         CTEST["pkg/connectortest"]
         STEST["pkg/storetest"]
+        COTEST["pkg/coordtest"]
         WAL["pkg/store/wal"]
         CODEC["pkg/codec"]
         STORE["pkg/store"]
@@ -210,6 +212,7 @@ flowchart TB
     CONNS --> REG
     CTEST --> CONN
     STEST --> STORE
+    COTEST --> STORE
     WAL --> STORE
     CODEC --> REG
     STORE --> SPEC
@@ -261,6 +264,8 @@ pkg/                    the connector-author surface — the public contract
   connectortest/        embeddable inert runtimes, so a core that grows a method does not
                         break every connector's test suite
   storetest/            the StateStore conformance suite; every implementation runs it
+  coordtest/            the Coordinator conformance suite — the placement protocol's rules,
+                        promoted from the in-memory coordinator's own tests
 
 internal/               engine machinery and connectors; unreachable from outside the module
   engine/               Build, negotiation, the graph, codec resolution, checkpoint plumbing,
@@ -278,7 +283,7 @@ internal/               engine machinery and connectors; unreachable from outsid
 
 docs/
   design-rules.md       R1–R13, normative, each derived from an observed defect
-  architecture.md       9,765 lines, 30 sections, 57 diagrams, declared normative
+  architecture.md       9,771 lines, 30 sections, 57 diagrams, declared normative
   decisions/            0001–0031, the ADRs
   decisions/proposals/  four whole-architecture proposals that were judged against each other
   decisions/reviews/    twelve reviews of those proposals — correctness, extensibility, Go ergonomics
@@ -410,7 +415,7 @@ retry (1), so a supervisor never crash-loops on a spec that will never build.
 1. **[docs/design-rules.md](docs/design-rules.md)** — R1–R13. Short, normative, and every rule was paid
    for by an observed defect in an earlier abandoned attempt at this same project. Everything else assumes
    it.
-2. **[docs/architecture.md](docs/architecture.md)** — 9,765 lines, 30 sections, declared normative. §1 is
+2. **[docs/architecture.md](docs/architecture.md)** — 9,771 lines, 30 sections, declared normative. §1 is
    the spine in one page; §4 the record model; §6 lanes; §7–§8 `Source` and `Sink`; §12 the ledger and the
    commit protocol. Its diagram index is at the top; dotted edges and "NOT BUILT" boxes mark the parts
    that describe an engine which does not run yet.

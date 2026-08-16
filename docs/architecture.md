@@ -342,7 +342,8 @@ flowchart TB
 Every arrow is a direct import verified with `go list ./pkg/... ./internal/...`: `pkg/schema` is the
 only leaf, nothing under `pkg/` imports anything under `internal/`, and `internal/engine` imports all
 nine packages in the box plus `internal/ledger` and `internal/metrics` — edges that all carry
-records at runtime now. `pkg/codec`, `pkg/store/wal`, `pkg/connectortest` and `pkg/storetest` are
+records at runtime now. `pkg/codec`, `pkg/store/wal`, `pkg/connectortest`, `pkg/storetest` and
+`pkg/coordtest` are
 omitted here; the first two appear in the tree below, the two test kits in the connector-boundary
 diagram after it. The whole graph is enforced by `TestDependencyDirection` in `internal/arch`,
 which fails in both directions.
@@ -382,9 +383,13 @@ github.com/BernardoCSACarreira/canal
 │   ├── connectortest/   Base, and inert embeddable stubs for the three runtimes, LaneCtl and StateHandle,
 │   │                    so adding a runtime method does not break every connector's tests
 │   │                    imports: config, connector, fault, record, schema
-│   └── storetest/       the conformance suite for StateStore: Subject, Run. Every implementation runs
-│                        it, because a contract two stores each prove separately gets proved wrong twice
-│                        imports: fault, record, store
+│   ├── storetest/       the conformance suite for StateStore: Subject, Run. Every implementation runs
+│   │                    it, because a contract two stores each prove separately gets proved wrong twice
+│   │                    imports: fault, record, store
+│   └── coordtest/       the same move for store.Coordinator: the placement protocol's rules — the
+│                        epoch fences, the lease expires, the delay reserves, the gate holds —
+│                        promoted from the in-memory coordinator's own suite, with the clock a
+│                        Subject-wired seam. imports: fault, record, store
 └── internal/            not importable from any other module (Go's internal rule)
     ├── ledger/          Tracker[P], Ticket, Ledger, Disposition, Outcome, LaneStats, Leak, the leak reaper
     │                    imports: connector, fault, record
@@ -438,6 +443,7 @@ flowchart TB
   subgraph TESTKIT["test files only"]
     CT["pkg/connectortest<br/>inert SourceRuntime, LaneCtl, StateHandle stubs"]
     ST["pkg/storetest<br/>StateStore conformance suite"]
+    CO["pkg/coordtest<br/>Coordinator conformance suite"]
   end
 
   subgraph CORESIDE["also under pkg/ — core-facing, imported by zero connectors"]

@@ -50,6 +50,9 @@ var declared = map[string][]string{
 	// pkg/connectortest for the same reason: a contract is only real if something INDEPENDENT of
 	// the implementation can check it. Its imports are the contract's own surface and nothing else.
 	"pkg/storetest": {"pkg/fault", "pkg/record", "pkg/store"},
+	// pkg/coordtest is the same move for store.Coordinator: the placement protocol's rules,
+	// promoted from the in-memory coordinator's own suite when a second implementation arrived.
+	"pkg/coordtest": {"pkg/fault", "pkg/record", "pkg/store"},
 
 	// internal/ — engine machinery. Nothing under pkg/ may import any of it.
 	"internal/ledger": {"pkg/connector", "pkg/fault", "pkg/record"},
